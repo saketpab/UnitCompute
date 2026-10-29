@@ -1,0 +1,42 @@
+# Secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+
+# Python virtual environments and build artifacts
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local tooling and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local runtime data, logs, and generated output
+logs/
+data/
+outputs/
+*.log
