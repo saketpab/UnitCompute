@@ -1,0 +1,138 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyEc2InApprovedRegion",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceCreditSpecifications",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+    },
+    {
+      "Sid": "LaunchOnlyTaggedSmallImdsV2Instances",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1:${account_id}:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "unitcompute",
+          "ec2:InstanceType": "t3.micro",
+          "ec2:MetadataHttpTokens": "required"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchOnlyEncryptedGp3RootVolumes",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1:${account_id}:volume/*",
+      "Condition": {
+        "Bool": {"ec2:Encrypted": "true"},
+        "StringEquals": {"ec2:VolumeType": "gp3", "aws:RequestTag/ManagedBy": "unitcompute"},
+        "NumericLessThanEquals": {"ec2:VolumeSize": "30"}
+      }
+    },
+    {
+      "Sid": "LaunchOnlyFromAmazonImagesIntoApprovedSubnet",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-1::image/*",
+        "arn:aws:ec2:us-east-1:${account_id}:subnet/${subnet_id}",
+        "arn:aws:ec2:us-east-1:${account_id}:network-interface/*",
+        "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
+      ],
+      "Condition": {
+        "StringEqualsIfExists": {
+          "ec2:Owner": "amazon",
+          "ec2:Subnet": "arn:aws:ec2:us-east-1:${account_id}:subnet/${subnet_id}",
+          "ec2:ResourceTag/ManagedBy": "unitcompute"
+        }
+      }
+    },
+    {
+      "Sid": "CreateDedicatedSecurityGroupsInApprovedVpc",
+      "Effect": "Allow",
+      "Action": "ec2:CreateSecurityGroup",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:${account_id}:vpc/${vpc_id}",
+        "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
+      ],
+      "Condition": {"StringEqualsIfExists": {"aws:RequestTag/ManagedBy": "unitcompute"}}
+    },
+    {
+      "Sid": "TagOnlyAtCreation",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:${account_id}:instance/*",
+        "arn:aws:ec2:us-east-1:${account_id}:volume/*",
+        "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
+      ],
+      "Condition": {"StringEquals": {"ec2:CreateAction": ["RunInstances", "CreateSecurityGroup"]}}
+    },
+    {
+      "Sid": "ManageOnlyUnitComputeResources",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:DeleteSecurityGroup",
+        "ec2:TerminateInstances",
+        "ec2:ModifyInstanceCreditSpecification",
+        "ec2:ModifyInstanceMetadataOptions"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-east-1:${account_id}:instance/*",
+        "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
+      ],
+      "Condition": {"StringEquals": {"ec2:ResourceTag/ManagedBy": "unitcompute"}}
+    },
+    {
+      "Sid": "PassOnlyTheSsmInstanceRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "${ssm_instance_role_arn}",
+      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+    },
+    {
+      "Sid": "ListDeploymentStatePrefixOnly",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${state_bucket}",
+      "Condition": {"StringLike": {"s3:prefix": ["deployments/*"]}}
+    },
+    {
+      "Sid": "DeploymentStateAndLockFiles",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*"
+    },
+    {
+      "Sid": "NeverTouchBootstrapState",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::${state_bucket}/bootstrap/*"
+    },
+    {
+      "Sid": "NoIamChanges",
+      "Effect": "Deny",
+      "NotAction": ["iam:PassRole"],
+      "Resource": "arn:aws:iam::*:*"
+    }
+  ]
+}
