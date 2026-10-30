@@ -471,7 +471,7 @@ def create_app(settings: Settings, container: Container | None = None) -> FastAP
             CORSMiddleware,
             allow_origins=list(settings.cors_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PATCH"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
             expose_headers=["X-Request-ID"],
             max_age=600,

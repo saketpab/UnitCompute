@@ -44,11 +44,13 @@ from unitcompute.logging_setup import configure_logging, redact, secure_process_
 from unitcompute.pricing import estimate_monthly_cost
 from unitcompute.provisioning.base import (
     DeploymentSpec,
+    NotStarted,
     OwnedResource,
     PlanKind,
     Provisioner,
     ProvisioningError,
     Readiness,
+    dispatch_guard,
     owner_tag,
     sha256_file,
 )
@@ -74,6 +76,7 @@ from unitcompute.services.deployments import (
     plan_expiry,
     plan_versions,
     record_audit,
+    unresolved_create_obligation,
 )
 
 log = logging.getLogger(__name__)
@@ -421,7 +424,7 @@ class Worker:
     def _spec(deployment: Row) -> DeploymentSpec:
         return DeploymentSpec(
             deployment_id=deployment["id"],
-            owner_tag=owner_tag(deployment["owner_id"]),
+            owner_tag=owner_tag(deployment["cloud_owner_id"]),
             name=deployment["name"],
             disk_gib=deployment["disk_gib"],
             region=deployment["region"],
@@ -500,7 +503,8 @@ class Worker:
                 raise JobFailure("plan_superseded", "A newer plan replaced this one.")
             spec = self._spec(deployment)
             self._retry_uncaptured(deployment["id"])
-            self._require_no_uncaptured(deployment["id"])
+            owner = deployment["owner_id"] if kind == "create" else None
+            self._require_no_uncaptured(deployment["id"], owner)
             frozen_ami = deployment["ami_id"] if deployment["apply_attempted"] else None
             result = self.provisioner.plan(
                 spec, kind, self.workdir(spec.deployment_id, plan["id"]), frozen_ami
@@ -733,7 +737,8 @@ class Worker:
             raise JobFailure(
                 "evidence_unavailable", "Identity evidence could not be read; retry later."
             ) from exc
-        self._require_no_uncaptured(deployment["id"])
+        owner = deployment["owner_id"] if plan["kind"] == "create" else None
+        self._require_no_uncaptured(deployment["id"], owner)
         return plan_path
 
     def _require_unexpired(self, plan: Row) -> None:
@@ -743,6 +748,14 @@ class Worker:
                 "The approved plan expired before it could run; "
                 "request a fresh preview and approve it.",
             )
+
+    def _refuse_expired_dispatch(self, plan: Row) -> None:
+        """Installed as the dispatch guard: called by the provisioner immediately before a
+        mutating process is spawned, after its own blocking preparation."""
+        try:
+            self._require_unexpired(plan)
+        except JobFailure as exc:
+            raise NotStarted(exc.code, exc.message) from exc
 
     def process_apply(self, job: Row) -> None:
         deployment, plan = self._load(job)
@@ -780,7 +793,8 @@ class Worker:
             return
 
         try:
-            outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)
+            with dispatch_guard(lambda: self._refuse_expired_dispatch(plan)):
+                outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)
             # Persist returned identities before anything else can fail. The root output is
             # launch evidence only if this apply created the instance.
             instance_output = outcome.outputs.get("instance_id")
@@ -802,6 +816,11 @@ class Worker:
                 spec.deployment_id,
                 [identity(r.resource_id, "tag_inventory") for r in inventory],
             )
+        except NotStarted as exc:
+            # Refused at the dispatch boundary: no process ran, so there is nothing to recover.
+            with self._tx() as conn:
+                self._finish_plan_failure(conn, job, exc.code, exc.safe_message)
+            return
         except ProvisioningError as exc:
             # Whatever the exit (error, signal, timeout), the outcome is established only by
             # bound evidence; see _capture_apply_evidence.
@@ -1050,8 +1069,16 @@ class Worker:
                 (deployment_id, job_id, plan_id, reason, evidence, to_db_time(self.clock())),
             )
 
-    def _require_no_uncaptured(self, deployment_id: str) -> None:
-        if self._uncaptured_obligations(deployment_id):
+    def _require_no_uncaptured(self, deployment_id: str, owner_id: str | None = None) -> None:
+        """Own obligations block everything for the deployment. With ``owner_id`` (work that
+        creates or repairs) an unproven apply of any of the owner's deployments blocks too,
+        including a newer deployment that was reserved before the obligation existed.
+        Cleanup (deletion) passes no owner, so it is never blocked by someone else's."""
+        blocked = bool(self._uncaptured_obligations(deployment_id))
+        if not blocked and owner_id is not None:
+            with self.db.read() as conn:
+                blocked = unresolved_create_obligation(conn, owner_id) is not None
+        if blocked:
             raise JobFailure(
                 "recovery_evidence_missing",
                 "An earlier apply may have changed AWS, and what it did could not be "

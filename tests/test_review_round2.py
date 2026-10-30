@@ -194,6 +194,8 @@ def test_s2_2_assume_role_passes_scoped_policy_and_tag(tmp_path: Path) -> None:
     aws.credentials("apply", "uc-apply-alice", ALICE_DEP)
     aws.credentials("plan", "uc-inventory")
     scoped, unscoped = recorded
+    assert "Policy" in scoped
+    assert "Tags" in scoped
     assert scoped["Tags"] == [{"Key": "UnitComputeDeployment", "Value": ALICE_DEP}]
     assert len(scoped["Policy"]) <= 2048
     assert ALICE_DEP in scoped["Policy"]
@@ -713,7 +715,7 @@ def _schema_v1_deployment(
             "%s, %s)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4, 5, 6, 7, 8]
+    assert db.migrate() == [2, 3, 4, 5, 6, 7, 8, 9]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = %s WHERE id = %s", (volume, dep))
@@ -746,7 +748,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', %s, %s)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4, 5, 6, 7, 8]
+    assert db.migrate() == [3, 4, 5, 6, 7, 8, 9]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}

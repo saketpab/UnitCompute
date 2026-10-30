@@ -453,6 +453,8 @@ def test_r3_5_short_writes_are_completed(harness: Harness, monkeypatch: pytest.M
     )
     monkeypatch.undo()
     lines = (harness.settings.workdir_root / d["id"] / "identities.jsonl").read_text()
+    assert len(lines.splitlines()) == 2
+    assert lines.endswith("\n")
     assert [json.loads(line)["id"] for line in lines.splitlines()] == [
         "i-0ddddddddddddddd4",
         "vol-0ddddddddddddddd4",

@@ -743,7 +743,7 @@ def test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance(
         replacement,
         [("1", "apply_failed", "recovery_required", _LAUNCH), ("2", "applied", "succeeded", [])],
     )
-    assert db.migrate() == [5, 6, 7, 8]
+    assert db.migrate() == [5, 6, 7, 8, 9]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -782,7 +782,7 @@ def test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance(
         replacement,
         [("1", "applied", "succeeded", _LAUNCH), ("2", "apply_failed", "recovery_required", [])],
     )
-    assert db.migrate() == [5, 6, 7, 8]
+    assert db.migrate() == [5, 6, 7, 8, 9]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:

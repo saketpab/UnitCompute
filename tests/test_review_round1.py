@@ -12,6 +12,8 @@ import json
 import shutil
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -692,12 +694,28 @@ def test_r2_transient_contention_is_retried(
     d = create_and_plan(harness)
     accepted = approve_current(harness, d)
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 30)
-    worker, blocker = _contended(harness, hold_seconds=0.1)
+    worker, blocker = _contended(harness, hold_seconds=None)
+    transaction = harness.db.transaction
+    timeouts: list[str] = []
+
+    @contextmanager
+    def release_after_real_timeout(owner_id: str | None = None) -> Iterator[Connection]:
+        try:
+            with transaction(owner_id) as conn:
+                yield conn
+        except ServiceUnavailable as exc:
+            timeouts.append(exc.code)
+            blocker.execute("ROLLBACK")
+            raise
+
+    # File fsync can exceed a timer under load. Release only after PostgreSQL actually
+    # refuses the first acquisition, so removing the retry always exercises the guard.
+    monkeypatch.setattr(harness.db, "transaction", release_after_real_timeout)
     try:
         assert worker.run_once()
     finally:
-        time.sleep(0.2)
         blocker.close()
+    assert timeouts == ["database_busy"]
     job = harness.client.get(f"/jobs/{accepted['job_id']}", headers=auth()).json()
     assert job["status"] == "succeeded"
     detail = harness.client.get(f"/deployments/{d['id']}", headers=auth()).json()

@@ -25,6 +25,7 @@ from unitcompute.provisioning.base import (
     ProvisioningError,
     Readiness,
     RuntimeVersions,
+    check_dispatch,
     sha256_file,
     template_hash,
 )
@@ -323,6 +324,7 @@ class SimulatedProvisioner:
         )
 
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult:
+        check_dispatch()
         intent = json.loads(plan_path.read_bytes())
         if intent.get("deployment_id") != spec.deployment_id or not intent.get("simulated"):
             raise ProvisioningError("plan_invalid", "Simulated plan does not match deployment.")

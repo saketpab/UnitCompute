@@ -10,7 +10,7 @@ from psycopg import sql
 from unitcompute.auth import Principal
 from unitcompute.db.database import Database, Row, to_db_time, utcnow
 from unitcompute.errors import InvalidInput, NotFound
-from unitcompute.logging_setup import redact
+from unitcompute.logging_setup import redact, redact_structured
 from unitcompute.pagination import cursor_scope, decode_cursor, encode_cursor
 from unitcompute.services.deployments import new_id
 
@@ -23,7 +23,7 @@ def product_row(row: Row) -> dict[str, Any]:
         result["content"] = redact(result["content"])
     for key in ("provider_config", "approved_config"):
         if result.get(key) is not None:
-            result[key] = json.loads(result[key])
+            result[key] = redact_structured(json.loads(result[key]))
     return result
 
 

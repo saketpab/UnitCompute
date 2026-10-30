@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -104,6 +107,31 @@ class ProvisioningError(Exception):
 
 class ProvisioningTimeout(ProvisioningError):
     pass
+
+
+class NotStarted(ProvisioningError):
+    """Refused before any Terraform process was started: the outcome is known, nothing ran."""
+
+
+# The worker installs a check that must pass immediately before a mutating process is
+# started, after every blocking preparation step (credential exchange, directory setup). A
+# provisioner calls ``check_dispatch`` at that boundary; the check raises ``NotStarted``.
+_dispatch_check: ContextVar[Callable[[], None] | None] = ContextVar("dispatch_check", default=None)
+
+
+@contextmanager
+def dispatch_guard(check: Callable[[], None]) -> Iterator[None]:
+    token = _dispatch_check.set(check)
+    try:
+        yield
+    finally:
+        _dispatch_check.reset(token)
+
+
+def check_dispatch() -> None:
+    check = _dispatch_check.get()
+    if check is not None:
+        check()
 
 
 class Provisioner(Protocol):

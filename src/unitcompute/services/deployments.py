@@ -21,7 +21,7 @@ from unitcompute.auth import Principal
 from unitcompute.config import INSTANCE_TYPE, ProvisionerKind, Settings
 from unitcompute.db.database import Connection, Database, Row, from_db_time, to_db_time, utcnow
 from unitcompute.errors import Conflict, NotFound, ServiceUnavailable
-from unitcompute.logging_setup import redact
+from unitcompute.logging_setup import redact, redact_structured
 from unitcompute.pagination import cursor_scope, decode_cursor, encode_cursor
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
@@ -175,6 +175,19 @@ def record_audit(
 
 def _dt(value: str | None) -> datetime | None:
     return from_db_time(value) if value else None
+
+
+def unresolved_create_obligation(conn: Connection, owner_id: str) -> str | None:
+    """The deployment (of any status, including 'deleted') whose earlier apply's effects were
+    never established, if the owner has one. While it exists nothing may create or repair
+    infrastructure for this owner; deleting what exists stays possible."""
+    row = conn.execute(
+        "SELECT o.deployment_id FROM recovery_obligations o "
+        "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = %s "
+        "AND o.discharged_at IS NULL AND o.evidence = 'uncaptured' ORDER BY o.id LIMIT 1",
+        (owner_id,),
+    ).fetchone()
+    return None if row is None else str(row["deployment_id"])
 
 
 class DeploymentService:
@@ -355,12 +368,7 @@ class DeploymentService:
                     code="quota_exceeded",
                     details={"deployment_id": live["id"]},
                 )
-            unproven = conn.execute(
-                "SELECT o.deployment_id FROM recovery_obligations o "
-                "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = %s "
-                "AND o.discharged_at IS NULL AND o.evidence = 'uncaptured' ORDER BY o.id LIMIT 1",
-                (principal.owner_id,),
-            ).fetchone()
+            unproven = unresolved_create_obligation(conn, principal.owner_id)
             if unproven is not None:
                 # An earlier apply's effects were never established, even if that deployment
                 # is recorded as deleted: its AWS resources may exist and be billable.
@@ -368,7 +376,7 @@ class DeploymentService:
                     "An earlier deployment may still hold AWS resources that could not be "
                     "verified; it needs a support decision before you can create another.",
                     code="recovery_required",
-                    details={"deployment_id": unproven["deployment_id"]},
+                    details={"deployment_id": unproven},
                 )
             if (
                 request.chat_id is not None
@@ -526,6 +534,18 @@ class DeploymentService:
                     f"The plan is {plan['status']} and cannot be approved.",
                     code="plan_not_approvable",
                 )
+            if plan["kind"] == "create":
+                # Cleanup stays approvable; creating or repairing does not while any of the
+                # owner's earlier applies is unproven.
+                unproven = unresolved_create_obligation(conn, principal.owner_id)
+                if unproven is not None:
+                    raise Conflict(
+                        "An earlier deployment may still hold AWS resources that could not be "
+                        "verified; it needs a support decision before anything can be created "
+                        "or repaired. You can still delete this deployment.",
+                        code="recovery_required",
+                        details={"deployment_id": unproven},
+                    )
             if from_db_time(plan["expires_at"]) <= now_dt:
                 conn.execute("UPDATE plans SET status = 'expired' WHERE id = %s", (plan["id"],))
                 record_audit(
@@ -674,7 +694,9 @@ class DeploymentService:
             heartbeat_at=_dt(row["heartbeat_at"]),
             finished_at=_dt(row["finished_at"]),
             error=error,
-            result=json.loads(row["result_json"]) if row["result_json"] else None,
+            result=redact_structured(json.loads(row["result_json"]))
+            if row["result_json"]
+            else None,
         )
 
     def _plan_preview(self, plan: Row) -> PlanPreview:
@@ -715,7 +737,8 @@ class DeploymentService:
         plan = None
         if row["current_plan_id"]:
             plan_row = conn.execute(
-                "SELECT * FROM plans WHERE id = %s", (row["current_plan_id"],)
+                "SELECT * FROM plans WHERE id = %s AND deployment_id = %s AND owner_id = %s",
+                (row["current_plan_id"], row["id"], row["owner_id"]),
             ).fetchone()
             plan = self._plan_preview(plan_row) if plan_row else None
         job_row = conn.execute(

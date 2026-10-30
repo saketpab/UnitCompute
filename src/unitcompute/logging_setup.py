@@ -59,6 +59,20 @@ def redact(text: str, secrets: Iterable[str] = ()) -> str:
     return text
 
 
+def redact_structured(value: Any) -> Any:
+    """Redact decoded keys and values, including JSON escape-normalized credentials."""
+    if isinstance(value, dict):
+        return {
+            key: REDACTED
+            if re.fullmatch(_CREDENTIAL_FIELD_NAMES, key, re.IGNORECASE)
+            else redact_structured(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_structured(item) for item in value]
+    return redact(value) if isinstance(value, str) else value
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {

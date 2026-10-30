@@ -21,7 +21,7 @@ def test_fresh_repeated_concurrent_migrations(tmp_path: Path) -> None:
     db = Database(settings.database_url, settings.database_schema)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda _: db.migrate(), range(4)))
-    assert sorted(len(r) for r in results) == [0, 0, 0, 8]
+    assert sorted(len(r) for r in results) == [0, 0, 0, 9]
     assert db.migrate() == []
 
 
@@ -32,13 +32,13 @@ def test_failed_migration_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         database,
         "_migration_files",
-        lambda: [*files, (9, "CREATE TABLE rollback_probe (id int); SELECT nonexistent_column;")],
+        lambda: [*files, (10, "CREATE TABLE rollback_probe (id int); SELECT nonexistent_column;")],
     )
     with pytest.raises(psycopg.errors.UndefinedColumn):
         db.migrate()
     assert db.schema_version() is None
     monkeypatch.setattr(database, "_migration_files", lambda: files)
-    assert db.migrate() == list(range(1, 9))
+    assert db.migrate() == list(range(1, 10))
 
 
 def test_migration_checksum_rejects_rewrite(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:

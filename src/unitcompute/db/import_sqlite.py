@@ -19,7 +19,7 @@ from psycopg import sql
 from unitcompute.auth import Principal
 from unitcompute.config import load_settings
 from unitcompute.db.database import Database
-from unitcompute.logging_setup import redact
+from unitcompute.logging_setup import redact, redact_structured
 
 TABLES = (
     "deployments",
@@ -208,13 +208,32 @@ SOURCE_OBJECTS = (
 )
 
 
-def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int]:
+def validate_source_json(value: Any) -> None:
+    if redact_structured(value) != value:
+        raise ValueError("unredacted sensitive JSON")
+    if isinstance(value, dict):
+        if (
+            "format_version" in value and {"planned_values", "resource_changes"} & value.keys()
+        ) or {"lineage", "serial", "terraform_version"} <= value.keys():
+            raise ValueError("raw Terraform plan/state is not ordinary database data")
+        for item in value.values():
+            validate_source_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            validate_source_json(item)
+
+
+def import_snapshot(
+    db: Database, source: Path, *, issuer: str, source_auth: str = "jwt"
+) -> dict[str, int]:
     """Import a quiescent v7 source once, or return the receipt for the same snapshot.
 
     The complete source schema and content fingerprint is committed with all rows. A
     failed import rolls everything back; an uncertain client result can be safely retried.
     Other source fingerprints require a new empty target, not a merge into live data.
     """
+    if source_auth not in {"jwt", "development"}:
+        raise ValueError("source_auth must be jwt or development")
     db.require_current_schema()
     with sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as legacy:
         legacy.row_factory = sqlite3.Row
@@ -261,7 +280,7 @@ def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int
             map(tuple, legacy.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"))
         )
         fingerprint = hashlib.sha256(
-            json.dumps([schema, data, issuer], sort_keys=True).encode()
+            json.dumps([schema, data, issuer, source_auth], sort_keys=True).encode()
         ).hexdigest()
         counts = {table: len(rows) for table, rows in data.items()}
         with db.transaction() as conn:
@@ -295,7 +314,7 @@ def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int
             for owner in sorted(owners):
                 principal = (
                     Principal(owner, "dev")
-                    if owner.startswith("dev:")
+                    if source_auth == "development"
                     else Principal(owner, "jwt", issuer)
                 )
                 db.ensure_user(conn, principal)
@@ -315,6 +334,7 @@ def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int
                         # Account provenance lives in plan history, imported later in this
                         # same transaction. Restore the native identity only after it exists.
                         row["instance_id"] = None
+                        row["current_plan_id"] = None
                     if "owner_id" in row:
                         row["owner_id"] = mapping[row["owner_id"]]
                     if table == "plans" and row.get("approved_by") in mapping:
@@ -328,9 +348,13 @@ def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int
                                 raise ValueError(f"timestamp lacks timezone: {table}.{name}")
                             row[name] = parsed.astimezone(UTC)
                         if value is not None and name.endswith("_json"):
-                            json.loads(
-                                value
-                            )  # Fail before PostgreSQL conversion on malformed JSON.
+                            parsed_json = json.loads(value)
+                            try:
+                                validate_source_json(parsed_json)
+                            except ValueError as exc:
+                                raise ValueError(
+                                    f"unredacted sensitive source data: {table}.{name}: {exc}"
+                                ) from exc
                     names = list(row)
                     conn.execute(
                         sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
@@ -370,8 +394,8 @@ def import_snapshot(db: Database, source: Path, *, issuer: str) -> dict[str, int
             # Native IDs and approval metadata become visible atomically with their history.
             for deployment in data["deployments"]:
                 conn.execute(
-                    "UPDATE deployments SET instance_id=%s WHERE id=%s",
-                    (deployment["instance_id"], deployment["id"]),
+                    "UPDATE deployments SET instance_id=%s,current_plan_id=%s WHERE id=%s",
+                    (deployment["instance_id"], deployment["current_plan_id"], deployment["id"]),
                 )
             conn.execute(
                 "INSERT INTO offline_imports (fingerprint,counts) VALUES (%s,%s)",
@@ -384,12 +408,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument(
-        "--issuer", required=True, help="verified issuer of historical non-development subjects"
+        "--issuer", required=True, help="verified issuer of historical JWT subjects"
+    )
+    parser.add_argument(
+        "--source-auth",
+        choices=("jwt", "development"),
+        default="jwt",
+        help="explicit authentication provenance of every source owner",
     )
     args = parser.parse_args()
     settings = load_settings()
     result = import_snapshot(
-        Database(settings.database_url, settings.database_schema), args.source, issuer=args.issuer
+        Database(settings.database_url, settings.database_schema),
+        args.source,
+        issuer=args.issuer,
+        source_auth=args.source_auth,
     )
     print(json.dumps(result, sort_keys=True))
 

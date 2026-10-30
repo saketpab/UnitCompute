@@ -7,13 +7,17 @@ that still passes ("SURVIVED") means the guard is not actually tested. A failing
 counts as KILLED when it fails for the intended reason: if the output shows an error that a
 broken mutant would cause (invalid SQL, a syntax or name error, a type error) the mutant is
 reported as "BROKEN-MUTANT" unless the mutation lists that error in ``allow``, and a mutation
-may require a pattern in the output with ``expect``. Exit status is non-zero if any
+may require a pattern in the output with ``expect``. A call-phase assertion in a named
+guard test is required by default; other exception outcomes need an explicit error type
+and expected diagnostic. Setup failures, skipped tests and unrelated runtime errors never
+count. Each run retains the raw pytest output and structured failure reports. Exit status is non-zero if any
 mutation survives, is broken or no longer applies.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -33,6 +37,7 @@ class Mutation:
     tests: tuple[str, ...]
     expect: str = ""  # regex that must appear in the failing output (the intended reason)
     allow: tuple[str, ...] = ()  # error names that this mutation legitimately produces
+    logged_timeout_failure: str = ""  # expected failure when the test deliberately logs a timeout
 
 
 # Errors a mutant produces when the edit itself is invalid rather than the guard missing.
@@ -287,6 +292,7 @@ MUTATIONS = [
         "r2-stranded-recovery",
         (("worker.py", "        if self._has_stranded_jobs():", "        if False:"),),
         ("tests/test_review_round1.py::test_r2_persistent_contention_recovers_without_replay",),
+        logged_timeout_failure="assert 'running' == 'recovery_required'",
     ),
     Mutation(
         "r2-write-retry",
@@ -298,6 +304,7 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round1.py::test_r2_transient_contention_is_retried",),
+        logged_timeout_failure="assert 'recovery_required' == 'succeeded'",
     ),
     Mutation(
         "r4-ready-needs-worker",
@@ -398,11 +405,16 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round2.py::test_s2_3_completed_replay_does_not_need_provider",),
+        expect="ServiceUnavailable: provider unavailable",
+        allow=("ServiceUnavailable",),
     ),
     Mutation(
         "r2-4-reservation-lease",
         (("agent/service.py", "if expires > utcnow():", "if True:"),),
         ("tests/test_review_round2.py::test_r2_4_stranded_reservation_expires_after_its_lease",),
+        expect="Conflict: A request with this Idempotency-Key is still in progress[.]",
+        allow=("Conflict",),
+        logged_timeout_failure="Conflict: A request with this Idempotency-Key is still in progress[.]",
     ),
     Mutation(
         "r2-4-mark-failed-retry",
@@ -414,6 +426,7 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round2.py::test_r2_4_failure_marking_retries_through_contention",),
+        logged_timeout_failure="assert \\('reserved', 'key-12345'\\) == \\('failed', None\\)",
     ),
     Mutation(
         "r2-1-reconcile-known-ids",
@@ -436,6 +449,7 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round2.py::test_r2_2_evidence_file_survives_database_contention",),
+        logged_timeout_failure="AssertionError: assert .* <= set\\(\\)",
     ),
     Mutation(
         "r2-3-root-disk-completeness",
@@ -575,6 +589,8 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round4.py::test_r4_4_later_sources_are_kept_for_the_same_volume",),
+        expect="RuntimeError: identity evidence not present after import: vol-0123456789abcdef0/root_device",
+        allow=("RuntimeError",),
     ),
     Mutation(
         "r4-evidence-presence-check",
@@ -843,8 +859,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '            self._retry_uncaptured(deployment["id"])\n            self._require_no_uncaptured(deployment["id"])\n',
-                '            self._retry_uncaptured(deployment["id"])\n',
+                '            self._require_no_uncaptured(deployment["id"], owner)\n            frozen_ami',
+                "            frozen_ami",
             ),
         ),
         (
@@ -856,8 +872,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '        if self._uncaptured_obligations(deployment_id):\n            raise JobFailure(\n                "recovery_evidence_missing",',
-                '        if False:\n            raise JobFailure(\n                "recovery_evidence_missing",',
+                "        blocked = bool(self._uncaptured_obligations(deployment_id))",
+                "        blocked = False",
             ),
         ),
         (
@@ -881,7 +897,7 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '        self._require_no_uncaptured(deployment["id"])\n        return plan_path',
+                '        self._require_no_uncaptured(deployment["id"], owner)\n        return plan_path',
                 "        return plan_path",
             ),
         ),
@@ -1083,7 +1099,7 @@ MUTATIONS = [
             (
                 "db/migrations/0006_obligation_revalidation.sql",
                 "UPDATE recovery_obligations SET evidence = 'not_needed' WHERE",
-                "UPDATE recovery_obligations SET evidence = 'uncaptured' WHERE",
+                "UPDATE recovery_obligations SET evidence = 'not_needed' WHERE FALSE AND",
             ),
         ),
         ("tests/test_review_round6.py::test_r6_2_failed_destroy_needs_no_capture_after_upgrade",),
@@ -1192,8 +1208,8 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                'return _stored_reply(prior["response_json"])',
-                'return AgentReply.model_validate_json(prior["response_json"])',
+                "    return sanitize_reply(reply)\n\n\ndef build_tools",
+                "    return reply\n\n\ndef build_tools",
             ),
         ),
         (
@@ -1312,8 +1328,8 @@ MUTATIONS = [
         (
             (
                 "services/deployments.py",
-                "            if unproven is not None:",
-                "            if False:",
+                "            if unproven is not None:\n                # An earlier apply's effects",
+                "            if False:\n                # An earlier apply's effects",
             ),
         ),
         (
@@ -1347,6 +1363,7 @@ MUTATIONS = [
             "tests/test_review_round7.py::test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_visible",
         ),
         expect="UniqueViolation:.*deployments_one_live_per_owner",
+        allow=("UniqueViolation",),
     ),
     Mutation(
         "r7-admin-lists-deleted",
@@ -1392,6 +1409,173 @@ MUTATIONS = [
             "tests/test_review_round7.py::test_r7_3_a_lingering_grandchild_holding_the_pipes_is_a_timeout",
         ),
         expect="DID NOT RAISE",
+    ),
+    Mutation(
+        "r8-owner-wide-plan-gate",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if kind == "create" else None',
+                "owner = None",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_queued_reservation_cannot_plan_while_an_older_create_is_unproven",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+            "tests/test_review_round8.py::test_r8_1_schema4_upgrade_with_a_preexisting_reservation",
+        ),
+    ),
+    Mutation(
+        "r8-owner-wide-apply-gate",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if plan["kind"] == "create" else None',
+                "owner = None",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_an_approved_and_queued_apply_is_refused_by_the_worker",
+        ),
+    ),
+    Mutation(
+        "r8-owner-wide-helper",
+        (
+            (
+                "worker.py",
+                "if not blocked and owner_id is not None:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_queued_reservation_cannot_plan_while_an_older_create_is_unproven",
+            "tests/test_review_round8.py::test_r8_1_an_approved_and_queued_apply_is_refused_by_the_worker",
+        ),
+    ),
+    Mutation(
+        "r8-cleanup-plan-not-blocked",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if kind == "create" else None',
+                'owner = deployment["owner_id"]',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+            "tests/test_review_round8.py::test_r8_1_schema4_upgrade_with_a_preexisting_reservation",
+        ),
+    ),
+    Mutation(
+        "r8-cleanup-apply-not-blocked",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if plan["kind"] == "create" else None',
+                'owner = deployment["owner_id"]',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+        ),
+    ),
+    Mutation(
+        "r8-approval-gate",
+        (
+            (
+                "services/deployments.py",
+                'if plan["kind"] == "create":\n                # Cleanup stays approvable',
+                "if False:\n                # Cleanup stays approvable",
+            ),
+        ),
+        ("tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",),
+    ),
+    Mutation(
+        "r8-approval-gate-blocks-cleanup",
+        (
+            (
+                "services/deployments.py",
+                'if plan["kind"] == "create":\n                # Cleanup stays approvable',
+                "if True:\n                # Cleanup stays approvable",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+        ),
+    ),
+    Mutation(
+        "r8-dispatch-check-at-boundary",
+        (
+            (
+                "provisioning/terraform.py",
+                "            check_dispatch()\n        result = self._runner.run(",
+                "            pass\n        result = self._runner.run(",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_the_provisioner_checks_after_the_credential_exchange",
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+        ),
+    ),
+    Mutation(
+        "r8-dispatch-check-before-credentials",
+        (
+            (
+                "provisioning/terraform.py",
+                "            check_dispatch()\n        result = self._runner.run(",
+                "            pass\n        result = self._runner.run(",
+            ),
+            (
+                "provisioning/terraform.py",
+                '        creds = self._aws.credentials(\n            "apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id\n        )',
+                '        check_dispatch()\n        creds = self._aws.credentials(\n            "apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id\n        )',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_the_provisioner_checks_after_the_credential_exchange",
+            "tests/test_review_round8.py::test_r8_2_the_check_comes_after_preparation_and_before_the_spawn",
+        ),
+    ),
+    Mutation(
+        "r8-not-started-is-a-plain-failure",
+        (
+            (
+                "worker.py",
+                "        except NotStarted as exc:",
+                "        except KeyError as exc:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+        ),
+    ),
+    Mutation(
+        "r8-simulator-honours-guard",
+        (
+            (
+                "provisioning/simulated.py",
+                "        check_dispatch()\n        intent = json.loads",
+                "        intent = json.loads",
+            ),
+        ),
+        ("tests/test_review_round8.py::test_r8_2_the_simulator_honours_the_guard",),
+    ),
+    Mutation(
+        "r8-guard-installed-by-worker",
+        (
+            (
+                "worker.py",
+                "with dispatch_guard(lambda: self._refuse_expired_dispatch(plan)):",
+                "if True:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+            "tests/test_review_round8.py::test_r8_2_a_real_binary_is_never_spawned_for_an_expired_plan",
+        ),
     ),
     Mutation(
         "policy-imdsv2",
@@ -1486,10 +1670,14 @@ def broken_errors(output: str) -> set[str]:
     diagnostics = "\n".join(
         line for line in output.splitlines() if line.startswith("E ") or re.match(r"^[\w.]+:", line)
     )
-    return {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(diagnostics)}
+    return {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(diagnostics)} | set(
+        re.findall(r"psycopg(?:\.errors)?\.([A-Za-z]+):", diagnostics)
+    )
 
 
-def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
+def run(
+    mutation: Mutation, workspace: Path, verbose: bool = False, evidence_root: Path | None = None
+) -> str:
     src = workspace / "src"
     shutil.rmtree(src, ignore_errors=True)
     shutil.copytree(ROOT / "src", src)
@@ -1499,9 +1687,39 @@ def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
         if text.count(old) != 1:
             return "NOT-APPLICABLE"
         path.write_text(text.replace(old, new))
-    env = {**os.environ, "PYTHONPATH": str(src), "PYTHONDONTWRITEBYTECODE": "1"}
+    evidence = (evidence_root or workspace) / mutation.name
+    evidence.mkdir(exist_ok=True)
+    reports = evidence / "reports.jsonl"
+    reports.unlink(missing_ok=True)
+    plugin = workspace / "guard_reports.py"
+    plugin.write_text(
+        "import json, os\n"
+        "def pytest_runtest_logreport(report):\n"
+        "    crash = getattr(report.longrepr, 'reprcrash', None)\n"
+        "    with open(os.environ['GUARD_REPORTS'], 'a') as f:\n"
+        "        f.write(json.dumps({'nodeid': report.nodeid, 'when': report.when, "
+        "'outcome': report.outcome, 'message': getattr(crash, 'message', ''), "
+        "'path': str(getattr(crash, 'path', ''))}) + '\\n')\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(src), str(workspace))),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GUARD_REPORTS": str(reports),
+    }
     result = subprocess.run(  # noqa: S603 - fixed argv
-        [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *mutation.tests],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-x",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "guard_reports",
+            *mutation.tests,
+        ],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -1509,20 +1727,57 @@ def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
         timeout=600,
         check=False,
     )
-    # pytest exits 1 when tests ran and failed. Any other non-zero code (collection error,
-    # unknown test ID, no tests collected) proves nothing about the guard.
+    output = result.stdout + result.stderr
+    (evidence / "pytest.log").write_text(output)
     if result.returncode == 0:
         return "SURVIVED"
     if result.returncode != 1:
         return f"BROKEN({result.returncode})"
-    output = result.stdout + result.stderr
-    errors = broken_errors(output) - set(mutation.allow)
+    outcomes = (
+        [json.loads(line) for line in reports.read_text().splitlines()] if reports.exists() else []
+    )
+    if any(r["outcome"] == "skipped" for r in outcomes):
+        return "SKIPPED-TEST"
+    failed = [r for r in outcomes if r["outcome"] == "failed"]
+    if not failed or any(r["when"] != "call" for r in failed):
+        return "BROKEN-TEST-SETUP"
+    diagnostics = output
+    if mutation.logged_timeout_failure:
+        if any(not re.search(mutation.logged_timeout_failure, r["message"]) for r in failed):
+            return "WRONG-REASON"
+        # These tests deliberately exhaust the advisory-lock timeout. A direct timeout
+        # still cannot qualify: the structured failure must be the behavioral assertion.
+        diagnostics = "\n".join(
+            line
+            for line in output.splitlines()
+            if not re.fullmatch(
+                r"(?:E\s+)?psycopg\.errors\.LockNotAvailable: canceling statement due to lock timeout",
+                line,
+            )
+        )
+    errors = broken_errors(diagnostics) - set(mutation.allow)
     if errors:
         if verbose:
-            for line in output.splitlines():
-                if BROKEN_MUTANT_ERRORS.search(line) and not line.lstrip().startswith("def "):
-                    print(f"      | {line.strip()[:200]}")
+            print("      " + ", ".join(sorted(errors)))
         return "BROKEN-MUTANT(" + ",".join(sorted(errors)) + ")"
+    for report in failed:
+        if not any(
+            report["nodeid"] == node or report["nodeid"].startswith(node + "[")
+            for node in mutation.tests
+        ):
+            return "WRONG-TEST"
+        message = report["message"]
+        assertion = message.startswith(
+            ("assert ", "AssertionError", "Failed: DID NOT RAISE")
+        ) and Path(report["path"]).resolve().is_relative_to(ROOT / "tests")
+        explicit = bool(
+            mutation.expect
+            and mutation.allow
+            and any(name in message for name in mutation.allow)
+            and re.search(mutation.expect, message)
+        )
+        if not assertion and not explicit:
+            return "BROKEN-RUNTIME"
     if mutation.expect and not re.search(mutation.expect, output):
         return "WRONG-REASON"
     return "KILLED"
@@ -1534,10 +1789,19 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true", help="print the error lines of broken mutants"
     )
+    parser.add_argument(
+        "--output-dir", type=Path, help="retain per-mutant pytest and report evidence"
+    )
     args = parser.parse_args()
-    selected = [m for m in MUTATIONS if not args.only or m.name in args.only]
+    names = {m.name for m in MUTATIONS}
+    if args.only is not None and (not args.only or set(args.only) - names):
+        parser.error("--only requires one or more known mutation names")
+    selected = [m for m in MUTATIONS if args.only is None or m.name in args.only]
     failures = 0
-    with tempfile.TemporaryDirectory(prefix="unitcompute-mutants-") as tmp:
+    output_dir = args.output_dir or Path(tempfile.mkdtemp(prefix="unitcompute-mutants-"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Mutation evidence: {output_dir.resolve()}")
+    with tempfile.TemporaryDirectory(prefix="unitcompute-mutant-source-") as tmp:
         shutil.copytree(ROOT / "src", Path(tmp) / "src")
         probe = subprocess.run(
             [sys.executable, "-c", "import unitcompute; print(unitcompute.__file__)"],
@@ -1550,7 +1814,8 @@ def main() -> int:
             print(f"mutants would not be imported (got {probe.stdout.strip()})")
             return 2
         for mutation in selected:
-            outcome = run(mutation, Path(tmp), args.verbose)
+            # The source copy is disposable; test diagnostics remain in the evidence directory.
+            outcome = run(mutation, Path(tmp), args.verbose, output_dir)
             failures += outcome != "KILLED"
             print(f"{outcome:15} {mutation.name}")
     print(f"{len(selected) - failures}/{len(selected)} guards proven by a failing test")
