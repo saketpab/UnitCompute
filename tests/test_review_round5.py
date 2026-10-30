@@ -11,12 +11,12 @@ import asyncio
 import json
 import os
 import shutil
-import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
@@ -55,7 +55,7 @@ def _obligations(h: Any, dep: str) -> list[tuple[str, str, bool]]:
         return [
             (r["reason"], r["evidence"], r["discharged_at"] is not None)
             for r in conn.execute(
-                "SELECT * FROM recovery_obligations WHERE deployment_id = ? ORDER BY id", (dep,)
+                "SELECT * FROM recovery_obligations WHERE deployment_id = %s ORDER BY id", (dep,)
             )
         ]
 
@@ -147,7 +147,7 @@ def test_r5_1_repair_outputs_of_existing_instance_are_not_launch_evidence(
     with h.db.read() as conn:
         known = IdentityLedger.known(conn, d["id"])
         row_root = conn.execute(
-            "SELECT root_volume_id FROM deployments WHERE id = ?", (d["id"],)
+            "SELECT root_volume_id FROM deployments WHERE id = %s", (d["id"],)
         ).fetchone()[0]
     instance = d["resources"]["instance_id"]
     assert known.launch_roots[instance] == {launch_root}
@@ -167,12 +167,12 @@ def test_r5_1_legacy_root_ids_need_single_create_history(harness: Harness) -> No
         assert "vol-0aaaaaaaaaaaaaaa7" in IdentityLedger.known(conn, dep).launch_roots[iid]
     with harness.db.transaction() as conn:  # model a second successful create apply
         job = conn.execute(
-            "SELECT * FROM jobs WHERE deployment_id = ? AND kind = 'apply'", (dep,)
+            "SELECT * FROM jobs WHERE deployment_id = %s AND kind = 'apply'", (dep,)
         ).fetchone()
         conn.execute(
             "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-            "payload_hash, created_at) VALUES ('job_second', ?, ?, ?, 'apply', 'succeeded', "
-            "'h', 'now')",
+            "payload_hash, created_at) VALUES ('job_second', %s, %s, %s, 'apply', 'succeeded', "
+            "'h', '2026-10-30T00:00:00Z')",
             (job["owner_id"], dep, job["plan_id"]),
         )
     with harness.db.read() as conn:
@@ -286,7 +286,8 @@ def test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged(
     assert _quota_held(h.client)
     with h.db.transaction() as conn:  # a later "success" cannot discharge it either
         conn.execute(
-            "UPDATE recovery_obligations SET discharged_at = 'now' WHERE deployment_id = ? "
+            "UPDATE recovery_obligations SET discharged_at = "
+            "'2026-10-30T00:00:00Z' WHERE deployment_id = %s "
             "AND evidence IN ('captured', 'not_needed')",
             (dep,),
         )
@@ -333,8 +334,8 @@ def _crash_mid_create_apply(h: Harness, write_errored: bool) -> tuple[dict[str, 
     job = h.worker().claim()
     assert job is not None
     with h.db.read() as conn:
-        row = conn.execute("SELECT * FROM deployments WHERE id = ?", (d["id"],)).fetchone()
-        plan = conn.execute("SELECT * FROM plans WHERE id = ?", (job["plan_id"],)).fetchone()
+        row = conn.execute("SELECT * FROM deployments WHERE id = %s", (d["id"],)).fetchone()
+        plan = conn.execute("SELECT * FROM plans WHERE id = %s", (job["plan_id"],)).fetchone()
     plan_path = Path(plan["plan_path"])
     outputs = h.provisioner.apply(Worker._spec(row), plan_path.parent, plan_path).outputs
     if write_errored:
@@ -415,30 +416,34 @@ def test_r5_2_obligation_rows_only_move_forward(harness: Harness) -> None:
         for evidence in ("uncaptured", "captured"):
             conn.execute(
                 "INSERT INTO recovery_obligations (deployment_id, reason, evidence, created_at) "
-                "VALUES (?, 'test', ?, 'now')",
+                "VALUES (%s, 'test', %s, '2026-10-30T00:00:00Z')",
                 (d["id"], evidence),
             )
     for statement in (
         "DELETE FROM recovery_obligations",
-        "UPDATE recovery_obligations SET discharged_at = 'now' WHERE evidence = 'uncaptured'",
+        (
+            "UPDATE recovery_obligations SET discharged_at = "
+            "'2026-10-30T00:00:00Z' WHERE evidence = 'uncaptured'"
+        ),
         "UPDATE recovery_obligations SET evidence = 'not_needed' WHERE evidence = 'uncaptured'",
         "UPDATE recovery_obligations SET evidence = 'uncaptured' WHERE evidence = 'captured'",
     ):
         conn = harness.db.connect()
         try:
-            with pytest.raises(sqlite3.IntegrityError, match="recovery obligations"):
+            with pytest.raises(psycopg.IntegrityError, match="recovery obligations"):
                 conn.execute(statement)
         finally:
             conn.close()
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE recovery_obligations SET discharged_at = 'now' WHERE evidence = 'captured'"
+            "UPDATE recovery_obligations SET discharged_at = "
+            "'2026-10-30T00:00:00Z' WHERE evidence = 'captured'"
         )
     conn = harness.db.connect()
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(psycopg.IntegrityError):
             conn.execute(
-                "UPDATE recovery_obligations SET discharged_at = 'later' "
+                "UPDATE recovery_obligations SET discharged_at = '2026-10-31T00:00:00Z' "
                 "WHERE evidence = 'captured'"
             )
     finally:
@@ -451,7 +456,7 @@ def test_r5_2_migration_backfills_obligations_for_earlier_failures(
     from conftest import make_settings
 
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:4])
@@ -459,41 +464,42 @@ def test_r5_2_migration_backfills_obligations_for_earlier_failures(
     now = "2026-10-30T00:00:00+00:00"
     with db.transaction() as conn:
         for dep, later_success in (("dep_" + "1" * 32, False), ("dep_" + "2" * 32, True)):
+            owner = "dev:a" if dep[4] == "1" else "dev:b"
             conn.execute(
                 "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
-                "provisioner, status, created_at, updated_at) VALUES (?, ?, 'demo', 8, "
-                "'us-east-1', 't3.micro', 'simulated', 'recovery_required', ?, ?)",
-                (dep, "dev:" + dep[4:8], now, now),
+                "provisioner, status, created_at, updated_at) VALUES (%s, %s, 'demo', 8, "
+                "'us-east-1', 't3.micro', 'simulated', 'recovery_required', %s, %s)",
+                (dep, owner, now, now),
             )
             plan = "plan_" + dep[4:]
             conn.execute(
                 "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
                 "config_hash, region, state_key, template_version, created_at) VALUES "
-                "(?, ?, 'dev:a', 'create', 'apply_failed', 'simulated', 'h', 'us-east-1', 'k', "
-                "'v', ?)",
-                (plan, dep, now),
+                "(%s, %s, %s, 'create', 'apply_failed', 'simulated', 'h', 'us-east-1', 'k', "
+                "'v', %s)",
+                (plan, dep, owner, now),
             )
             conn.execute(
                 "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-                "payload_hash, created_at) VALUES (?, 'dev:a', ?, ?, 'apply', "
-                "'recovery_required', 'h', ?)",
-                ("job_" + dep[4:], dep, plan, now),
+                "payload_hash, created_at) VALUES (%s, %s, %s, %s, 'apply', "
+                "'recovery_required', 'h', %s)",
+                ("job_" + dep[4:], owner, dep, plan, now),
             )
             if later_success:
                 conn.execute(
                     "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
                     "config_hash, region, state_key, template_version, created_at) VALUES "
-                    "(?, ?, 'dev:a', 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
-                    "'v', ?)",
-                    ("plan_ok" + dep[4:], dep, now),
+                    "(%s, %s, %s, 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
+                    "'v', %s)",
+                    ("plan_ok" + dep[4:], dep, owner, now),
                 )
                 conn.execute(
                     "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-                    "payload_hash, created_at) VALUES (?, 'dev:a', ?, ?, 'apply', "
-                    "'succeeded', 'h', ?)",
-                    ("job_ok" + dep[4:], dep, "plan_ok" + dep[4:], now),
+                    "payload_hash, created_at) VALUES (%s, %s, %s, %s, 'apply', "
+                    "'succeeded', 'h', %s)",
+                    ("job_ok" + dep[4:], owner, dep, "plan_ok" + dep[4:], now),
                 )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.read() as conn:
         rows = sorted(
             (r["deployment_id"], r["reason"], r["evidence"], r["discharged_at"] is not None)
@@ -687,18 +693,22 @@ def test_r5_4_worker_created_evidence_ancestors_are_synced(
     d = create_and_plan(h)
     approve_current(h, d)
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 10)
-    blocker = sqlite3.connect(h.settings.database_path, isolation_level=None)
+    blocker = h.db.connect()
 
     class LockAfterApply(SimulatedProvisioner):
         def apply(self, *args: Any) -> ApplyResult:
             result = super().apply(*args)
-            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("BEGIN")
+            blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (h.settings.database_schema + ":writes",),
+            )
             return result
 
     worker = Worker(h.settings, h.db, LockAfterApply(h.settings.data_dir), clock=h.clock)
     worker.write_retry_delays = ()
     try:
-        with pytest.raises((ServiceUnavailable, sqlite3.OperationalError)):
+        with pytest.raises((ServiceUnavailable, psycopg.OperationalError)):
             worker.run_once()
     finally:
         blocker.execute("ROLLBACK")

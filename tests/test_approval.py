@@ -93,7 +93,9 @@ def test_stale_template_version_rejected(harness: Harness) -> None:
     detail = create_and_plan(harness)
     plan = detail["current_plan"]
     with harness.db.transaction() as conn:
-        conn.execute("UPDATE plans SET template_hash = ? WHERE id = ?", ("f" * 64, plan["plan_id"]))
+        conn.execute(
+            "UPDATE plans SET template_hash = %s WHERE id = %s", ("f" * 64, plan["plan_id"])
+        )
     response = _approve(harness, detail["id"], plan["plan_id"], plan["plan_hash"])
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "plan_stale"
@@ -109,7 +111,7 @@ def test_destroy_plan_cannot_be_approved_as_create(harness: Harness) -> None:
     pending = harness.client.get(f"/deployments/{detail['id']}", headers=auth()).json()
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE deployments SET status = 'awaiting_approval' WHERE id = ?", (detail["id"],)
+            "UPDATE deployments SET status = 'awaiting_approval' WHERE id = %s", (detail["id"],)
         )
     plan = pending["current_plan"]
     response = _approve(harness, detail["id"], plan["plan_id"], plan["plan_hash"])
@@ -120,7 +122,7 @@ def test_destroy_plan_cannot_be_approved_as_create(harness: Harness) -> None:
 def _plan_file(h: Harness, plan_id: str) -> Path:
     with h.db.read() as conn:
         return Path(
-            conn.execute("SELECT plan_path FROM plans WHERE id = ?", (plan_id,)).fetchone()[
+            conn.execute("SELECT plan_path FROM plans WHERE id = %s", (plan_id,)).fetchone()[
                 "plan_path"
             ]
         )
@@ -155,7 +157,7 @@ def test_worker_rejects_approval_by_someone_else(harness: Harness) -> None:
     approve_current(harness, detail)
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE plans SET approved_by = 'dev:mallory' WHERE id = ?",
+            "UPDATE plans SET approved_by = 'dev:mallory' WHERE id = %s",
             (detail["current_plan"]["plan_id"],),
         )
     harness.drain()
@@ -172,7 +174,7 @@ def test_worker_rejects_plan_file_outside_workdir(harness: Harness, tmp_path: Pa
     elsewhere.write_bytes(original.read_bytes())
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE plans SET plan_path = ? WHERE id = ?",
+            "UPDATE plans SET plan_path = %s WHERE id = %s",
             (str(elsewhere), detail["current_plan"]["plan_id"]),
         )
     harness.drain()

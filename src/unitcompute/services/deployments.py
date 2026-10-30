@@ -10,17 +10,19 @@ import hashlib
 import hmac
 import json
 import re
-import sqlite3
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from psycopg import IntegrityError
+
 from unitcompute.auth import Principal
 from unitcompute.config import INSTANCE_TYPE, ProvisionerKind, Settings
-from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
+from unitcompute.db.database import Connection, Database, Row, from_db_time, to_db_time, utcnow
 from unitcompute.errors import Conflict, NotFound, ServiceUnavailable
 from unitcompute.logging_setup import redact
+from unitcompute.pagination import cursor_scope, decode_cursor, encode_cursor
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     PlanKind,
@@ -96,7 +98,7 @@ def execution_binding(settings: Settings, deployment_id: str) -> str:
     )
 
 
-def binding_problem(settings: Settings, plan: sqlite3.Row) -> str | None:
+def binding_problem(settings: Settings, plan: Row) -> str | None:
     if not plan["execution_hash"] or not hmac.compare_digest(
         plan["execution_hash"], execution_binding(settings, plan["deployment_id"])
     ):
@@ -127,7 +129,7 @@ def expected_versions(provisioner: str) -> dict[str, Any]:
     }
 
 
-def plan_versions(plan: sqlite3.Row) -> dict[str, Any]:
+def plan_versions(plan: Row) -> dict[str, Any]:
     return {
         "template_version": plan["template_version"],
         "template_hash": plan["template_hash"],
@@ -137,7 +139,7 @@ def plan_versions(plan: sqlite3.Row) -> dict[str, Any]:
 
 
 def record_audit(
-    conn: sqlite3.Connection,
+    conn: Connection,
     *,
     actor: str,
     action: str,
@@ -157,7 +159,7 @@ def record_audit(
             safe[key] = cleaned if _SAFE_DETAIL.fullmatch(cleaned) else "[omitted]"
     conn.execute(
         "INSERT INTO audit_events (occurred_at, actor, action, deployment_id, plan_id, job_id, "
-        "request_id, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "request_id, detail_json) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
         (
             to_db_time(now or utcnow()),
             actor,
@@ -194,12 +196,10 @@ class DeploymentService:
         return kind.value
 
     @staticmethod
-    def _owned_deployment(
-        conn: sqlite3.Connection, principal: Principal, deployment_id: str
-    ) -> sqlite3.Row:
-        row: sqlite3.Row | None = conn.execute(
-            "SELECT * FROM deployments WHERE id = ? AND owner_id = ?",
-            (deployment_id, principal.subject),
+    def _owned_deployment(conn: Connection, principal: Principal, deployment_id: str) -> Row:
+        row: Row | None = conn.execute(
+            "SELECT * FROM deployments WHERE id = %s AND owner_id = %s",
+            (deployment_id, principal.owner_id),
         ).fetchone()
         if row is None:
             raise NotFound("Deployment not found.")
@@ -207,7 +207,7 @@ class DeploymentService:
 
     @staticmethod
     def _idempotent_replay(
-        conn: sqlite3.Connection,
+        conn: Connection,
         principal: Principal,
         scope: str,
         key: str | None,
@@ -217,8 +217,8 @@ class DeploymentService:
             return None
         row = conn.execute(
             "SELECT payload_hash, status_code, response_json FROM idempotency_records "
-            "WHERE owner_id = ? AND scope = ? AND idempotency_key = ?",
-            (principal.subject, scope, key),
+            "WHERE owner_id = %s AND scope = %s AND idempotency_key = %s",
+            (principal.owner_id, scope, key),
         ).fetchone()
         if row is None:
             return None
@@ -231,7 +231,7 @@ class DeploymentService:
 
     def _store_idempotency(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         principal: Principal,
         scope: str,
         key: str | None,
@@ -243,9 +243,9 @@ class DeploymentService:
             return
         conn.execute(
             "INSERT INTO idempotency_records (owner_id, scope, idempotency_key, payload_hash, "
-            "status_code, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "status_code, response_json, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (
-                principal.subject,
+                principal.owner_id,
                 scope,
                 key,
                 payload_hash,
@@ -257,8 +257,8 @@ class DeploymentService:
 
     def _enqueue_plan(
         self,
-        conn: sqlite3.Connection,
-        deployment: sqlite3.Row,
+        conn: Connection,
+        deployment: Row,
         kind: PlanKind,
         provisioner: str,
         payload_hash: str,
@@ -266,7 +266,7 @@ class DeploymentService:
     ) -> tuple[str, str]:
         now = to_db_time(self._clock())
         conn.execute(
-            "UPDATE plans SET status = 'superseded' WHERE deployment_id = ? "
+            "UPDATE plans SET status = 'superseded' WHERE deployment_id = %s "
             "AND status IN ('pending', 'ready')",
             (deployment["id"],),
         )
@@ -283,7 +283,7 @@ class DeploymentService:
         conn.execute(
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
             "config_hash, region, state_key, template_version, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s)",
             (
                 plan_id,
                 deployment["id"],
@@ -301,7 +301,7 @@ class DeploymentService:
             conn.execute(
                 "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
                 "idempotency_scope, idempotency_key, payload_hash, created_at) "
-                "VALUES (?, ?, ?, ?, 'plan', 'queued', ?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s, 'plan', 'queued', %s, %s, %s, %s)",
                 (
                     job_id,
                     deployment["owner_id"],
@@ -313,14 +313,14 @@ class DeploymentService:
                     now,
                 ),
             )
-        except sqlite3.IntegrityError as exc:
+        except IntegrityError as exc:
             raise Conflict(
                 "Another job is already running for this deployment.", code="job_in_progress"
             ) from exc
         status = "planning" if kind == "create" else "deletion_planning"
         conn.execute(
-            "UPDATE deployments SET status = ?, status_reason = NULL, current_plan_id = ?, "
-            "updated_at = ? WHERE id = ?",
+            "UPDATE deployments SET status = %s, status_reason = NULL, current_plan_id = %s, "
+            "updated_at = %s WHERE id = %s",
             (status, plan_id, now, deployment["id"]),
         )
         return plan_id, job_id
@@ -336,14 +336,17 @@ class DeploymentService:
     ) -> tuple[int, dict[str, Any]]:
         provisioner = self._require_provisioning()
         scope = "POST /deployments"
-        payload_hash = canonical_hash({"scope": scope, "body": request.model_dump()})
-        with self._db.transaction() as conn:
+        payload_hash = canonical_hash(
+            {"scope": scope, "body": request.model_dump(exclude_none=True)}
+        )
+        with self._db.transaction(principal.owner_id) as conn:
+            self._db.ensure_user(conn, principal)
             replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)
             if replay:
                 return replay
             live = conn.execute(
-                "SELECT id FROM deployments WHERE owner_id = ? AND status <> 'deleted'",
-                (principal.subject,),
+                "SELECT id FROM deployments WHERE owner_id = %s AND status <> 'deleted'",
+                (principal.owner_id,),
             ).fetchone()
             if live is not None:
                 raise Conflict(
@@ -354,9 +357,9 @@ class DeploymentService:
                 )
             unproven = conn.execute(
                 "SELECT o.deployment_id FROM recovery_obligations o "
-                "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = ? "
+                "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = %s "
                 "AND o.discharged_at IS NULL AND o.evidence = 'uncaptured' ORDER BY o.id LIMIT 1",
-                (principal.subject,),
+                (principal.owner_id,),
             ).fetchone()
             if unproven is not None:
                 # An earlier apply's effects were never established, even if that deployment
@@ -367,16 +370,25 @@ class DeploymentService:
                     code="recovery_required",
                     details={"deployment_id": unproven["deployment_id"]},
                 )
+            if (
+                request.chat_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM chat_sessions WHERE id=%s AND owner_id=%s",
+                    (request.chat_id, principal.owner_id),
+                ).fetchone()
+                is None
+            ):
+                raise NotFound("Chat not found.")
             deployment_id = new_id("dep")
             now = to_db_time(self._clock())
             try:
                 conn.execute(
                     "INSERT INTO deployments (id, owner_id, name, disk_gib, region, "
                     "instance_type, provisioner, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'planning', ?, ?)",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, 'planning', %s, %s)",
                     (
                         deployment_id,
-                        principal.subject,
+                        principal.owner_id,
                         request.name,
                         request.disk_gib,
                         self._settings.aws_region,
@@ -386,11 +398,16 @@ class DeploymentService:
                         now,
                     ),
                 )
-            except sqlite3.IntegrityError as exc:
+            except IntegrityError as exc:
                 raise Conflict("You already have a VM.", code="quota_exceeded") from exc
+            conn.execute(
+                "UPDATE deployments SET chat_id=%s WHERE id=%s", (request.chat_id, deployment_id)
+            )
             deployment = conn.execute(
-                "SELECT * FROM deployments WHERE id = ?", (deployment_id,)
+                "SELECT * FROM deployments WHERE id = %s", (deployment_id,)
             ).fetchone()
+            if deployment is None:
+                raise RuntimeError("created deployment missing")
             plan_id, job_id = self._enqueue_plan(
                 conn,
                 deployment,
@@ -401,7 +418,7 @@ class DeploymentService:
             )
             record_audit(
                 conn,
-                actor=principal.subject,
+                actor=principal.owner_id,
                 action="deployment.requested",
                 deployment_id=deployment_id,
                 plan_id=plan_id,
@@ -429,7 +446,8 @@ class DeploymentService:
         route = "plan" if kind == "create" else "deletion-plan"
         scope = f"POST /deployments/{deployment_id}/{route}"
         payload_hash = canonical_hash({"scope": scope})
-        with self._db.transaction() as conn:
+        with self._db.transaction(principal.owner_id) as conn:
+            self._db.ensure_user(conn, principal)
             replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)
             if replay:
                 return replay
@@ -445,6 +463,8 @@ class DeploymentService:
                     "This deployment belongs to a different provisioner.",
                     code="provisioner_mismatch",
                 )
+            if deployment is None:
+                raise RuntimeError("created deployment missing")
             plan_id, job_id = self._enqueue_plan(
                 conn,
                 deployment,
@@ -455,7 +475,7 @@ class DeploymentService:
             )
             record_audit(
                 conn,
-                actor=principal.subject,
+                actor=principal.owner_id,
                 action="plan.requested" if kind == "create" else "deletion_plan.requested",
                 deployment_id=deployment_id,
                 plan_id=plan_id,
@@ -482,7 +502,8 @@ class DeploymentService:
         provisioner = self._require_provisioning()
         scope = f"POST /deployments/{deployment_id}/approve"
         payload_hash = canonical_hash({"scope": scope, "body": approval.model_dump()})
-        with self._db.transaction() as conn:
+        with self._db.transaction(principal.owner_id) as conn:
+            self._db.ensure_user(conn, principal)
             # Sampled only after the write lock is held: acquiring it can wait for seconds, and
             # approval must be judged at the moment it is recorded, not when it was requested.
             now_dt = self._clock()
@@ -492,8 +513,8 @@ class DeploymentService:
                 return replay
             deployment = self._owned_deployment(conn, principal, deployment_id)
             plan = conn.execute(
-                "SELECT * FROM plans WHERE id = ? AND deployment_id = ? AND owner_id = ?",
-                (approval.plan_id, deployment_id, principal.subject),
+                "SELECT * FROM plans WHERE id = %s AND deployment_id = %s AND owner_id = %s",
+                (approval.plan_id, deployment_id, principal.owner_id),
             ).fetchone()
             if plan is None or deployment["current_plan_id"] != plan["id"]:
                 raise Conflict(
@@ -506,10 +527,10 @@ class DeploymentService:
                     code="plan_not_approvable",
                 )
             if from_db_time(plan["expires_at"]) <= now_dt:
-                conn.execute("UPDATE plans SET status = 'expired' WHERE id = ?", (plan["id"],))
+                conn.execute("UPDATE plans SET status = 'expired' WHERE id = %s", (plan["id"],))
                 record_audit(
                     conn,
-                    actor=principal.subject,
+                    actor=principal.owner_id,
                     action="plan.approval_rejected",
                     deployment_id=deployment_id,
                     plan_id=plan["id"],
@@ -546,10 +567,10 @@ class DeploymentService:
                     conn.execute(
                         "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
                         "idempotency_scope, idempotency_key, payload_hash, created_at) "
-                        "VALUES (?, ?, ?, ?, 'apply', 'queued', ?, ?, ?, ?)",
+                        "VALUES (%s, %s, %s, %s, 'apply', 'queued', %s, %s, %s, %s)",
                         (
                             job_id,
-                            principal.subject,
+                            principal.owner_id,
                             deployment_id,
                             plan["id"],
                             scope if idempotency_key else None,
@@ -558,25 +579,25 @@ class DeploymentService:
                             now,
                         ),
                     )
-                except sqlite3.IntegrityError as exc:
+                except IntegrityError as exc:
                     raise Conflict(
                         "Another job is already running for this deployment.",
                         code="job_in_progress",
                     ) from exc
                 conn.execute(
-                    "UPDATE plans SET status = 'approved', approved_by = ?, approved_at = ? "
-                    "WHERE id = ? AND status = 'ready'",
-                    (principal.subject, now, plan["id"]),
+                    "UPDATE plans SET status = 'approved', approved_by = %s, approved_at = %s "
+                    "WHERE id = %s AND status = 'ready'",
+                    (principal.owner_id, now, plan["id"]),
                 )
                 status = "applying" if plan["kind"] == "create" else "deleting"
                 conn.execute(
-                    "UPDATE deployments SET status = ?, status_reason = NULL, updated_at = ? "
-                    "WHERE id = ?",
+                    "UPDATE deployments SET status = %s, status_reason = NULL, updated_at = %s "
+                    "WHERE id = %s",
                     (status, now, deployment_id),
                 )
                 record_audit(
                     conn,
-                    actor=principal.subject,
+                    actor=principal.owner_id,
                     action="plan.approved",
                     deployment_id=deployment_id,
                     plan_id=plan["id"],
@@ -602,12 +623,22 @@ class DeploymentService:
     # ------------------------------------------------------------------- reads
 
     def list_deployments(self, principal: Principal) -> list[DeploymentDetail]:
+        return self.deployment_page(principal, 50, None)[0]
+
+    def deployment_page(
+        self, principal: Principal, limit: int, cursor: str | None
+    ) -> tuple[list[DeploymentDetail], str | None]:
+        scope = cursor_scope(principal, "deployments")
         with self._db.read() as conn:
             rows = conn.execute(
-                "SELECT * FROM deployments WHERE owner_id = ? ORDER BY rowid DESC LIMIT 50",
-                (principal.subject,),
+                "SELECT * FROM deployments WHERE owner_id=%s AND sequence<%s "
+                "ORDER BY sequence DESC LIMIT %s",
+                (principal.owner_id, decode_cursor(cursor, scope), limit + 1),
             ).fetchall()
-            return [self._detail(conn, row) for row in rows]
+            items = rows[:limit]
+            return [self._detail(conn, row) for row in items], encode_cursor(
+                scope, items[-1]["sequence"]
+            ) if len(rows) > limit else None
 
     def get_deployment(self, principal: Principal, deployment_id: str) -> DeploymentDetail:
         with self._db.read() as conn:
@@ -617,15 +648,15 @@ class DeploymentService:
         with self._db.read() as conn:
             row = conn.execute(
                 "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
-                "ON plans.id = jobs.plan_id WHERE jobs.id = ? AND jobs.owner_id = ?",
-                (job_id, principal.subject),
+                "ON plans.id = jobs.plan_id WHERE jobs.id = %s AND jobs.owner_id = %s",
+                (job_id, principal.owner_id),
             ).fetchone()
             if row is None:
                 raise NotFound("Job not found.")
             return self._job(row)
 
     @staticmethod
-    def _job(row: sqlite3.Row) -> JobSummary:
+    def _job(row: Row) -> JobSummary:
         error = (
             {"code": row["error_code"], "message": row["error_message"]}
             if row["error_code"]
@@ -646,7 +677,7 @@ class DeploymentService:
             result=json.loads(row["result_json"]) if row["result_json"] else None,
         )
 
-    def _plan_preview(self, plan: sqlite3.Row) -> PlanPreview:
+    def _plan_preview(self, plan: Row) -> PlanPreview:
         status = plan["status"]
         expires_at = _dt(plan["expires_at"])
         if status == "ready" and expires_at is not None and expires_at <= self._clock():
@@ -680,17 +711,17 @@ class DeploymentService:
             },
         )
 
-    def _detail(self, conn: sqlite3.Connection, row: sqlite3.Row) -> DeploymentDetail:
+    def _detail(self, conn: Connection, row: Row) -> DeploymentDetail:
         plan = None
         if row["current_plan_id"]:
             plan_row = conn.execute(
-                "SELECT * FROM plans WHERE id = ?", (row["current_plan_id"],)
+                "SELECT * FROM plans WHERE id = %s", (row["current_plan_id"],)
             ).fetchone()
             plan = self._plan_preview(plan_row) if plan_row else None
         job_row = conn.execute(
             "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
-            "ON plans.id = jobs.plan_id WHERE jobs.deployment_id = ? "
-            "ORDER BY jobs.rowid DESC LIMIT 1",
+            "ON plans.id = jobs.plan_id WHERE jobs.deployment_id = %s "
+            "ORDER BY jobs.sequence DESC LIMIT 1",
             (row["id"],),
         ).fetchone()
         resources = None

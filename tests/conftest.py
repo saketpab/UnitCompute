@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from psycopg import sql
 
 from unitcompute.api.app import Container, build_container, create_app
+from unitcompute.auth import Principal
 from unitcompute.config import Settings
 from unitcompute.db.database import Database
 from unitcompute.provisioning.simulated import SimulatedProvisioner
@@ -19,13 +23,32 @@ from unitcompute.worker import Worker
 
 
 @pytest.fixture(autouse=True)
-def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for key in list(os.environ):
         if key.startswith(
             ("UNITCOMPUTE_", "AWS_", "ANTHROPIC_", "OPENAI_", "LANGSMITH_", "LANGCHAIN_")
         ):
             monkeypatch.delenv(key)
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    dsn = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/unitcompute_test")
+    schema = "test_" + uuid.uuid4().hex
+    monkeypatch.setenv("UNITCOMPUTE_DATABASE_URL", dsn)
+    monkeypatch.setenv("UNITCOMPUTE_DATABASE_SCHEMA", schema)
+    original = Database.migrate
+
+    def migrate_seeded(db: Database) -> list[int]:
+        versions = original(db)
+        # Legacy regression fixtures insert historical rows directly. Seed their owners,
+        # keeping production migrations free of fixture identities.
+        with db.transaction() as conn:
+            for owner in ("dev:a", "dev:b", "dev:alice", "dev:bob", "dev:mallory", "alice", "bob"):
+                db.ensure_user(conn, Principal(owner, "dev"))
+        return versions
+
+    monkeypatch.setattr(Database, "migrate", migrate_seeded)
+    yield
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
 
 
 # Shaped like an AWS access key ID so redaction is exercised; assembled at runtime so secret
@@ -67,7 +90,7 @@ def settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def db(settings: Settings) -> Database:
-    database = Database(settings.database_path)
+    database = Database(settings.database_url, settings.database_schema)
     database.migrate()
     return database
 

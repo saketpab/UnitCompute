@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from unitcompute.auth import Principal
 from unitcompute.config import AGENT_PROVIDERS, INSTANCE_TYPE, Settings
-from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
+from unitcompute.db.database import Connection, Database, from_db_time, to_db_time, utcnow
 from unitcompute.errors import (
     AppError,
     Conflict,
@@ -393,7 +392,7 @@ class AgentService:
 
     def _reserve(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         principal: Principal,
         request: AgentMessageRequest,
         idempotency_key: str | None,
@@ -401,7 +400,7 @@ class AgentService:
     ) -> tuple[str, int] | AgentReply:
         """Atomically admit one model invocation, or replay an earlier idempotent result.
 
-        Runs under BEGIN IMMEDIATE, so concurrent requests are serialised. The attempt and
+        Runs under the owner's PostgreSQL lock, serialising concurrent requests. The attempt and
         the session turn are counted here, before the provider is called, and stay counted
         whatever happens to the call."""
         now = to_db_time(utcnow())
@@ -412,10 +411,11 @@ class AgentService:
             if replay is not None:
                 return replay
         since = to_db_time(utcnow() - timedelta(days=1))
-        attempts = conn.execute(
-            "SELECT COUNT(*) FROM agent_attempts WHERE owner_id = ? AND created_at > ?",
-            (principal.subject, since),
-        ).fetchone()[0]
+        attempt_count = conn.execute(
+            "SELECT COUNT(*) FROM agent_attempts WHERE owner_id = %s AND created_at > %s",
+            (principal.owner_id, since),
+        ).fetchone()
+        attempts = int(attempt_count[0]) if attempt_count else 0
         if attempts >= self._settings.agent_max_messages_per_day:
             raise RateLimited(
                 "You reached the assistant's daily message limit; the REST workflow remains "
@@ -426,13 +426,13 @@ class AgentService:
             session_id = new_id("chat")
             conn.execute(
                 "INSERT INTO chat_sessions (id, owner_id, turns, created_at, updated_at) "
-                "VALUES (?, ?, 0, ?, ?)",
-                (session_id, principal.subject, now, now),
+                "VALUES (%s, %s, 0, %s, %s)",
+                (session_id, principal.owner_id, now, now),
             )
         else:
             row = conn.execute(
-                "SELECT turns FROM chat_sessions WHERE id = ? AND owner_id = ?",
-                (session_id, principal.subject),
+                "SELECT turns FROM chat_sessions WHERE id = %s AND owner_id = %s",
+                (session_id, principal.owner_id),
             ).fetchone()
             if row is None:
                 raise NotFound("Chat session not found.")
@@ -442,14 +442,17 @@ class AgentService:
                     code="session_turn_limit",
                 )
         conn.execute(
-            "UPDATE chat_sessions SET turns = turns + 1, updated_at = ? WHERE id = ?",
+            "UPDATE chat_sessions SET turns = turns + 1, updated_at = %s WHERE id = %s",
             (now, session_id),
         )
         cursor = conn.execute(
-            "INSERT INTO agent_attempts (owner_id, session_id, status, idempotency_key, "
-            "payload_hash, created_at, lease_expires_at) VALUES (?, ?, 'reserved', ?, ?, ?, ?)",
             (
-                principal.subject,
+                "INSERT INTO agent_attempts (owner_id, session_id, status, idempotency_key, "
+                "payload_hash, created_at, lease_expires_at) VALUES (%s, %s, 'reserved', %s, "
+                "%s, %s, %s) RETURNING id"
+            ),
+            (
+                principal.owner_id,
                 session_id,
                 idempotency_key,
                 payload_hash,
@@ -457,7 +460,10 @@ class AgentService:
                 to_db_time(utcnow() + self._lease()),
             ),
         )
-        return session_id, int(cursor.lastrowid or 0)
+        inserted = cursor.fetchone()
+        if inserted is None:
+            raise RuntimeError("attempt reservation returned no row")
+        return session_id, int(inserted["id"])
 
     def _history(self, session_id: str) -> list[BaseMessage]:
         limit = self._settings.agent_history_messages
@@ -465,8 +471,8 @@ class AgentService:
             return []
         with self._db.read() as conn:
             rows = conn.execute(
-                "SELECT role, content FROM chat_messages WHERE session_id = ? "
-                "ORDER BY id DESC LIMIT ?",
+                "SELECT role, content FROM chat_messages WHERE session_id = %s "
+                "ORDER BY id DESC LIMIT %s",
                 (session_id, limit),
             ).fetchall()
         # Redact again on the way out so history stored before redaction existed (or by an
@@ -484,7 +490,7 @@ class AgentService:
 
     def _prior_attempt(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         principal: Principal,
         idempotency_key: str,
         payload_hash: str,
@@ -497,8 +503,8 @@ class AgentService:
         is closed as failed so the key can be reused; it stays counted."""
         prior = conn.execute(
             "SELECT id, status, payload_hash, response_json, created_at, lease_expires_at "
-            "FROM agent_attempts WHERE owner_id = ? AND idempotency_key = ?",
-            (principal.subject, idempotency_key),
+            "FROM agent_attempts WHERE owner_id = %s AND idempotency_key = %s",
+            (principal.owner_id, idempotency_key),
         ).fetchone()
         if prior is None:
             return None
@@ -522,7 +528,7 @@ class AgentService:
             return None  # the reservation transaction closes it
         conn.execute(
             "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
-            "finished_at = ? WHERE id = ? AND status = 'reserved'",
+            "finished_at = %s WHERE id = %s AND status = 'reserved'",
             (to_db_time(utcnow()), prior["id"]),
         )
         return None
@@ -535,7 +541,7 @@ class AgentService:
                 with self._db.transaction() as conn:
                     conn.execute(
                         "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
-                        "finished_at = ? WHERE id = ? AND status = 'reserved'",
+                        "finished_at = %s WHERE id = %s AND status = 'reserved'",
                         (to_db_time(utcnow()), attempt_id),
                     )
                 return
@@ -579,7 +585,8 @@ class AgentService:
                 code="agent_unavailable",
             )
         model = self._model_factory()
-        with self._db.transaction() as conn:
+        with self._db.transaction(principal.owner_id) as conn:
+            self._db.ensure_user(conn, principal)
             reserved = self._reserve(conn, principal, request, idempotency_key, payload_hash)
         if isinstance(reserved, AgentReply):
             return reserved
@@ -675,13 +682,14 @@ class AgentService:
             )
         )
         reply = response.reply
-        with self._db.transaction() as conn:
+        with self._db.transaction(principal.owner_id) as conn:
+            self._db.ensure_user(conn, principal)
             now = to_db_time(utcnow())
             # Fence: publish only while this attempt still owns its reservation. If its lease
             # expired and a retry took over the key, nothing from this run is published.
             owned = conn.execute(
-                "UPDATE agent_attempts SET status = 'succeeded', response_json = ?, "
-                "finished_at = ? WHERE id = ? AND status = 'reserved'",
+                "UPDATE agent_attempts SET status = 'succeeded', response_json = %s, "
+                "finished_at = %s WHERE id = %s AND status = 'reserved'",
                 (response.model_dump_json(), now, attempt_id),
             ).rowcount
             if owned != 1:
@@ -690,14 +698,14 @@ class AgentService:
                     "discarded. Retry to get the current result.",
                     code="attempt_superseded",
                 )
-            conn.executemany(
+            conn.cursor().executemany(
                 "INSERT INTO chat_messages (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (%s, %s, %s, %s)",
                 [(session_id, "user", request.message, now), (session_id, "assistant", reply, now)],
             )
             record_audit(
                 conn,
-                actor=principal.subject,
+                actor=principal.owner_id,
                 action="agent.message",
                 request_id=request_id,
                 detail={

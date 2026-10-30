@@ -298,8 +298,11 @@ def test_r3_2_legacy_acknowledgements_are_not_a_waiver(
     iid, _vid, db, dep, client, h = _legacy_retained_root(tmp_path, monkeypatch, moto_env)
     with db.transaction() as conn:  # a row left by the removed round-2 command
         conn.execute(
-            "INSERT INTO identity_acknowledgements (deployment_id, instance_id, operator, "
-            "reason, recorded_at) VALUES (?, ?, 'review-operator', 'unverified', 'now')",
+            (
+                "INSERT INTO identity_acknowledgements (deployment_id, instan"
+                "ce_id, operator, reason, recorded_at) VALUES (%s, %s, 'revie"
+                "w-operator', 'unverified', '2026-10-30T00:00:00Z')"
+            ),
             (dep, iid),
         )
     with client:
@@ -380,17 +383,17 @@ def test_r3_2_root_device_observation_is_distinct_from_launch_root(
         assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
         with db.read() as conn:
             known = IdentityLedger.known(conn, dep)
-            sources = set(
+            sources = list(
                 conn.execute(
-                    "SELECT resource_id, source FROM deployment_resources WHERE deployment_id = ?",
+                    "SELECT resource_id, source FROM deployment_resources WHERE deployment_id = %s",
                     (dep,),
                 ).fetchall()
             )
     assert known.observed_roots == {iid: {root}}
     assert known.launch_roots == {}
     assert known.instances_without_root_disk() == [iid]
-    assert (root, "root_device") in {tuple(r) for r in sources}
-    assert (data, "attached_device") in {tuple(r) for r in sources}
+    assert (root, "root_device") in {tuple(r.values()) for r in sources}
+    assert (data, "attached_device") in {tuple(r.values()) for r in sources}
 
 
 def test_r3_2_operator_root_claims_no_longer_exist() -> None:
@@ -510,7 +513,7 @@ def test_r3_6_expired_attempt_cannot_publish_after_retry(
     assert replay == second
     with harness.db.read() as conn:
         statuses = [
-            tuple(r)
+            tuple(r.values())
             for r in conn.execute("SELECT status, idempotency_key FROM agent_attempts ORDER BY id")
         ]
         messages = conn.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0]
@@ -572,10 +575,14 @@ def test_r3_7_legacy_history_is_redacted_before_the_provider(harness: Harness) -
     sid = "chat_" + "d" * 32
     now = to_db_time(utcnow())
     with harness.db.transaction() as conn:  # history written before redaction existed
-        conn.execute("INSERT INTO chat_sessions VALUES (?, 'dev:alice', 1, ?, ?)", (sid, now, now))
+        conn.execute(
+            "INSERT INTO chat_sessions (id,owner_id,turns,created_at,updated_at) "
+            "VALUES (%s, 'dev:alice', 1, %s, %s)",
+            (sid, now, now),
+        )
         conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, created_at) "
-            "VALUES (?, 'user', ?, ?)",
+            "VALUES (%s, 'user', %s, %s)",
             (sid, f"aws_secret_access_key={SECRET}", now),
         )
     seen: list[str] = []
@@ -625,9 +632,9 @@ def test_r3_3_deletion_verification_independently_requires_root_identity(
     ledger.append_evidence(d["id"], [identity("i-0fffffffffffffff1", "tag_inventory")])
     worker = Worker(harness.settings, harness.db, harness.provisioner, clock=harness.clock)
     with harness.db.read() as conn:
-        deployment = conn.execute("SELECT * FROM deployments WHERE id = ?", (d["id"],)).fetchone()
+        deployment = conn.execute("SELECT * FROM deployments WHERE id = %s", (d["id"],)).fetchone()
         plan = conn.execute(
-            "SELECT * FROM plans WHERE id = ?", (d["current_plan"]["plan_id"],)
+            "SELECT * FROM plans WHERE id = %s", (d["current_plan"]["plan_id"],)
         ).fetchone()
     outcome = worker._remaining_after_delete(deployment, plan, [])
     assert isinstance(outcome, JobFailure)

@@ -206,7 +206,7 @@ def test_production_app_rejects_dev_tokens(tmp_path: Path) -> None:
     from unitcompute.db.database import Database
 
     settings: Settings = make_settings(tmp_path, environment="production", **TERRAFORM_SETTINGS)
-    Database(settings.database_path).migrate()
+    Database(settings.database_url, settings.database_schema).migrate()
     with TestClient(create_app(settings)) as client:
         response = client.get("/deployments", headers={"Authorization": "Bearer dev:alice"})
     assert response.status_code == 401

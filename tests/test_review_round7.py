@@ -53,7 +53,7 @@ ALICE = Principal(subject="dev:alice", auth_method="dev")
 
 def _schema4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Database]:
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:4])
@@ -72,7 +72,7 @@ def _failed_create_then_empty_delete(
         c.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
             "provisioner, status, apply_attempted, created_at, updated_at) VALUES "
-            "(?, ?, 'demo', 8, 'us-east-1', 't3.micro', 'simulated', ?, 1, ?, ?)",
+            "(%s, %s, 'demo', 8, 'us-east-1', 't3.micro', 'simulated', %s, 1, %s, %s)",
             (dep, owner, status, day, day),
         )
         if status != "deleted":
@@ -85,21 +85,24 @@ def _failed_create_then_empty_delete(
         ):
             plan = f"plan_{suffix}{n}" + "0" * (31 - len(suffix))
             c.execute(
-                "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
-                "config_hash, region, state_key, template_version, preview_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'simulated', 'h', 'us-east-1', 'k', 'ec2-vm/v1', ?, ?)",
+                (
+                    "INSERT INTO plans (id, deployment_id, owner_id, kind, status"
+                    ", provisioner, config_hash, region, state_key, template_vers"
+                    "ion, preview_json, created_at) VALUES (%s, %s, %s, %s, %s, '"
+                    "simulated', 'h', 'us-east-1', 'k', 'ec2-vm/v1', %s, %s)"
+                ),
                 (plan, dep, owner, kind, plan_status, preview, day),
             )
             c.execute(
                 "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-                "payload_hash, created_at) VALUES (?, ?, ?, ?, 'apply', ?, 'h', ?)",
+                "payload_hash, created_at) VALUES (%s, %s, %s, %s, 'apply', %s, 'h', %s)",
                 (f"job_{suffix}{n}" + "0" * (31 - len(suffix)), owner, dep, plan, job_status, day),
             )
 
 
 def _status(db: Database, dep: str) -> str:
     with db.read() as c:
-        return str(c.execute("SELECT status FROM deployments WHERE id = ?", (dep,)).fetchone()[0])
+        return str(c.execute("SELECT status FROM deployments WHERE id = %s", (dep,)).fetchone()[0])
 
 
 def _open_uncaptured(db: Database) -> list[str]:
@@ -121,7 +124,7 @@ def test_r7_1_deleted_deployment_with_unproven_obligation_becomes_recovery_requi
     settings, db = _schema4(tmp_path, monkeypatch)
     dep = "dep_" + "a" * 32
     _failed_create_then_empty_delete(db, dep, "dev:alice", "deleted", "2026-10-01", "1")
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     assert _status(db, dep) == "recovery_required"
     assert _open_uncaptured(db) == [dep]
     service = DeploymentService(db, settings)
@@ -146,7 +149,7 @@ def test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_v
     old, new = "dep_" + "a" * 32, "dep_" + "b" * 32
     _failed_create_then_empty_delete(db, old, "dev:alice", "deleted", "2026-10-01", "1")
     _failed_create_then_empty_delete(db, new, "dev:alice", "active", "2026-10-02", "2")
-    assert db.migrate() == [5, 6, 7]  # no unique-index violation
+    assert db.migrate() == [5, 6, 7, 8]  # no unique-index violation
     assert _status(db, old) == "deleted" and _status(db, new) == "active"
     assert _open_uncaptured(db) == [old]
     from unitcompute import admin
@@ -158,7 +161,7 @@ def test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_v
     assert [r["id"] for r in reported] == [old]
     assert reported[0]["open_recovery_obligations"][0]["evidence"] == "uncaptured"
     with db.transaction() as c:  # the newer VM is later deleted
-        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = ?", (new,))
+        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = %s", (new,))
     service = DeploymentService(db, settings)
     with pytest.raises(Conflict) as exc:
         service.create_deployment(ALICE, DeploymentRequest(name="third", disk_gib=8), None, None)
@@ -173,7 +176,7 @@ def test_r7_1_only_one_row_per_owner_is_reopened(
     first, second = "dep_" + "a" * 32, "dep_" + "b" * 32
     _failed_create_then_empty_delete(db, first, "dev:alice", "deleted", "2026-10-01", "1")
     _failed_create_then_empty_delete(db, second, "dev:alice", "deleted", "2026-10-02", "2")
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     assert {_status(db, first), _status(db, second)} == {"deleted", "recovery_required"}
     assert _status(db, second) == "recovery_required"  # the newest holds the slot
     assert sorted(_open_uncaptured(db)) == [first, second]
@@ -189,7 +192,7 @@ def test_r7_1_owners_without_unproven_obligations_are_unaffected(
     with db.transaction() as c:  # bob: a clean deleted deployment, no history at all
         c.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
-            "provisioner, status, created_at, updated_at) VALUES (?, 'dev:bob', 'demo', 8, "
+            "provisioner, status, created_at, updated_at) VALUES (%s, 'dev:bob', 'demo', 8, "
             "'us-east-1', 't3.micro', 'simulated', 'deleted', '2026-10-01', '2026-10-01')",
             ("dep_" + "c" * 32,),
         )
@@ -211,10 +214,10 @@ def test_r7_1_runtime_guard_does_not_depend_on_the_migration(harness: Harness) -
     h = harness
     d = create_and_plan(h)
     with h.db.transaction() as c:
-        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = ?", (d["id"],))
+        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = %s", (d["id"],))
         c.execute(
             "INSERT INTO recovery_obligations (deployment_id, reason, evidence, created_at) "
-            "VALUES (?, 'x', 'captured', 'now')",
+            "VALUES (%s, 'x', 'captured', '2026-10-30T00:00:00Z')",
             (d["id"],),
         )
     assert (
@@ -229,10 +232,10 @@ def test_r7_1_runtime_open_uncaptured_obligation_blocks_reservation(harness: Har
     h = harness
     d = create_and_plan(h)
     with h.db.transaction() as c:
-        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = ?", (d["id"],))
+        c.execute("UPDATE deployments SET status = 'deleted' WHERE id = %s", (d["id"],))
         c.execute(
             "INSERT INTO recovery_obligations (deployment_id, reason, evidence, created_at) "
-            "VALUES (?, 'x', 'uncaptured', 'now')",
+            "VALUES (%s, 'x', 'uncaptured', '2026-10-30T00:00:00Z')",
             (d["id"],),
         )
     response = h.client.post("/deployments", json={"name": "next", "disk_gib": 8}, headers=auth())
@@ -331,7 +334,7 @@ def test_r7_2_worker_rejects_a_plan_that_expired_while_waiting_for_the_write_loc
     _no_apply_and_expired(h, d["id"])
     with h.db.read() as c:
         started = c.execute(
-            "SELECT apply_attempted FROM deployments WHERE id = ?", (d["id"],)
+            "SELECT apply_attempted FROM deployments WHERE id = %s", (d["id"],)
         ).fetchone()[0]
         audited = c.execute(
             "SELECT COUNT(*) FROM audit_events WHERE action = 'apply.started'"
@@ -385,9 +388,9 @@ def test_r7_2_approval_time_is_sampled_after_the_transaction_wait(
     original = h.db.transaction
 
     @contextlib.contextmanager
-    def waited() -> Iterator[Any]:
-        h.clock.advance(seconds=2)  # BEGIN IMMEDIATE can wait up to 5 s
-        with original() as conn:
+    def waited(owner_id: str | None = None) -> Iterator[Any]:
+        h.clock.advance(seconds=2)  # the PostgreSQL advisory lock can wait up to 5 s
+        with original(owner_id) as conn:
             yield conn
 
     monkeypatch.setattr(h.db, "transaction", waited)
@@ -401,7 +404,7 @@ def test_r7_2_approval_time_is_sampled_after_the_transaction_wait(
     assert h.client.get(f"/deployments/{d['id']}", headers=auth()).json()["status"] != "applying"
 
 
-def test_r7_2_approval_with_a_real_sqlite_lock_wait(harness: Harness) -> None:
+def test_r7_2_approval_with_a_real_postgresql_lock_wait(harness: Harness) -> None:
     h = harness
     d = create_and_plan(h)
     expiry = h.clock() + timedelta(minutes=15)
@@ -556,7 +559,7 @@ def _guards() -> Any:
 
 _OLD = (
     "                        \"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"\n"  # noqa: E501
-    "                        \"finished_at = ? WHERE id = ? AND status = 'reserved'\",\n"
+    "                        \"finished_at = %s WHERE id = %s AND status = 'reserved'\",\n"
     "                        (to_db_time(utcnow()), attempt_id),\n"
 )
 _TEST = ("tests/test_review_round1.py::test_r3_failed_attempts_stay_counted",)
@@ -578,7 +581,7 @@ def test_r7_4_an_invalid_sql_mutant_is_not_counted_as_killed(tmp_path: Path) -> 
         _TEST,
     )
     outcome = guards.run(broken, tmp_path)
-    assert outcome.startswith("BROKEN-MUTANT") and "OperationalError" in outcome
+    assert outcome.startswith("BROKEN-MUTANT") and "SyntaxError" in outcome
 
 
 def test_r7_4_the_valid_deletion_mutant_is_killed_by_the_rate_limit_assertion(
@@ -608,3 +611,16 @@ def test_r7_4_every_mutation_edit_is_syntactically_valid_python_or_sql() -> None
                 except SyntaxError as exc:
                     failures.append((mutation.name, str(exc)))
     assert failures == []
+
+
+def test_mutant_classifier_uses_actual_exception_diagnostics() -> None:
+    guards = _guards()
+    traceback = "    raise TypeError(\nE   AssertionError: expected 404, got 200\n"
+    assert guards.broken_errors(traceback) == set()
+    assert guards.broken_errors("E   psycopg.errors.IndeterminateDatatype: unknown parameter") == {
+        "IndeterminateDatatype"
+    }
+    assert guards.broken_errors("E   psycopg.errors.DatatypeMismatch: boolean required") == {
+        "DatatypeMismatch"
+    }
+    assert guards.broken_errors("TypeError: invalid call") == {"TypeError"}

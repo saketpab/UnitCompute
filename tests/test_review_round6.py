@@ -13,7 +13,6 @@ import json
 import multiprocessing
 import os
 import shutil
-import sqlite3
 import sys
 import threading
 import time
@@ -21,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -169,7 +169,7 @@ def test_r6_1_ids_in_unaccepted_state_are_recorded_as_observations(
         sources = {
             r["source"]
             for r in conn.execute(
-                "SELECT source FROM deployment_resources WHERE deployment_id = ?", (d["id"],)
+                "SELECT source FROM deployment_resources WHERE deployment_id = %s", (d["id"],)
             )
         }
     assert {failing.created["iid"], failing.created["vid"]} <= set(known.all_ids)
@@ -641,7 +641,7 @@ def _schema4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Data
     from conftest import make_settings
 
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:4])
@@ -658,8 +658,8 @@ def _legacy_history(
         c.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
             "provisioner, status, instance_id, root_volume_id, apply_attempted, created_at, "
-            "updated_at) VALUES (?, 'dev:alice', 'demo', 8, 'us-east-1', 't3.micro', "
-            "'simulated', 'active', ?, ?, 1, ?, ?)",
+            "updated_at) VALUES (%s, 'dev:alice', 'demo', 8, 'us-east-1', 't3.micro', "
+            "'simulated', 'active', %s, %s, 1, %s, %s)",
             (dep, iid, root, now, now),
         )
         for n, (suffix, plan_status, job_status, changes) in enumerate(plans):
@@ -667,18 +667,18 @@ def _legacy_history(
             c.execute(
                 "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
                 "config_hash, region, state_key, template_version, preview_json, created_at) "
-                "VALUES (?, ?, 'dev:alice', 'create', ?, 'simulated', 'h', 'us-east-1', 'k', "
-                "'ec2-vm/v1', ?, ?)",
+                "VALUES (%s, %s, 'dev:alice', 'create', %s, 'simulated', 'h', 'us-east-1', 'k', "
+                "'ec2-vm/v1', %s, %s)",
                 (plan, dep, plan_status, json.dumps({"changes": changes}), f"2026-10-0{n + 1}"),
             )
             c.execute(
                 "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-                "payload_hash, created_at) VALUES (?, 'dev:alice', ?, ?, 'apply', ?, 'h', ?)",
+                "payload_hash, created_at) VALUES (%s, 'dev:alice', %s, %s, 'apply', %s, 'h', %s)",
                 ("job_" + suffix * 32, dep, plan, job_status, f"2026-10-0{n + 1}"),
             )
         # What every earlier version recorded from apply outputs, whatever apply ran.
         c.execute(
-            "INSERT INTO deployment_resources VALUES (?, 'volume', ?, ?, 'apply_output', ?)",
+            "INSERT INTO deployment_resources VALUES (%s, 'volume', %s, %s, 'apply_output', %s)",
             (dep, root, iid, now),
         )
 
@@ -743,7 +743,7 @@ def test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance(
         replacement,
         [("1", "apply_failed", "recovery_required", _LAUNCH), ("2", "applied", "succeeded", [])],
     )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -782,7 +782,7 @@ def test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance(
         replacement,
         [("1", "applied", "succeeded", _LAUNCH), ("2", "apply_failed", "recovery_required", [])],
     )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -830,14 +830,14 @@ def _failed_destroy_upgrade(
     with h.db.transaction() as conn:  # a schema-4 failure: nothing was mutated
         conn.execute(
             "UPDATE jobs SET status='recovery_required', error_code='terraform_apply_failed' "
-            "WHERE id=?",
+            "WHERE id=%s",
             (approved["job_id"],),
         )
         conn.execute(
-            "UPDATE plans SET status='apply_failed' WHERE id=?",
+            "UPDATE plans SET status='apply_failed' WHERE id=%s",
             (pending["current_plan"]["plan_id"],),
         )
-        conn.execute("UPDATE deployments SET status='recovery_required' WHERE id=?", (dep,))
+        conn.execute("UPDATE deployments SET status='recovery_required' WHERE id=%s", (dep,))
         conn.execute("DROP TABLE recovery_obligations")
         conn.execute("DELETE FROM schema_migrations WHERE version IN (5, 6)")
     assert h.db.migrate() == [5, 6]
@@ -875,15 +875,20 @@ def test_r6_2_failed_destroy_is_classified_at_runtime_when_still_uncaptured(
     pending = _detail(h, dep)
     approved = approve_current(h, pending)
     with h.db.transaction() as conn:
-        conn.execute("UPDATE jobs SET status='recovery_required' WHERE id=?", (approved["job_id"],))
         conn.execute(
-            "UPDATE plans SET status='apply_failed' WHERE id=?",
+            "UPDATE jobs SET status='recovery_required' WHERE id=%s", (approved["job_id"],)
+        )
+        conn.execute(
+            "UPDATE plans SET status='apply_failed' WHERE id=%s",
             (pending["current_plan"]["plan_id"],),
         )
-        conn.execute("UPDATE deployments SET status='recovery_required' WHERE id=?", (dep,))
+        conn.execute("UPDATE deployments SET status='recovery_required' WHERE id=%s", (dep,))
         conn.execute(
-            "INSERT INTO recovery_obligations (deployment_id, job_id, plan_id, reason, evidence, "
-            "created_at) VALUES (?, ?, ?, 'legacy_unresolved_apply', 'uncaptured', 'now')",
+            (
+                "INSERT INTO recovery_obligations (deployment_id, job_id, pla"
+                "n_id, reason, evidence, created_at) VALUES (%s, %s, %s, 'leg"
+                "acy_unresolved_apply', 'uncaptured', '2026-10-30T00:00:00Z')"
+            ),
             (dep, approved["job_id"], pending["current_plan"]["plan_id"]),
         )
     h.client.post(f"/deployments/{dep}/deletion-plan", headers=auth())
@@ -901,20 +906,25 @@ def test_r6_2_not_needed_is_only_reachable_for_plans_that_create_nothing(
     with h.db.transaction() as conn:
         conn.execute(
             "INSERT INTO recovery_obligations (deployment_id, plan_id, reason, evidence, "
-            "created_at) VALUES (?, ?, 'x', 'uncaptured', 'now')",
+            "created_at) VALUES (%s, %s, 'x', 'uncaptured', '2026-10-30T00:00:00Z')",
             (d["id"], plan_id),
         )
-    for preview in ('{"changes": [{"action": "create"}]}', "garbage", '{"changes": 5}', None):
+    for preview in (
+        '{"changes": [{"action": "create"}]}',
+        '{"unrecognized": true}',
+        '{"changes": 5}',
+        None,
+    ):
         with h.db.transaction() as conn:
-            conn.execute("UPDATE plans SET preview_json = ? WHERE id = ?", (preview, plan_id))
+            conn.execute("UPDATE plans SET preview_json = %s WHERE id = %s", (preview, plan_id))
         with (
-            pytest.raises(sqlite3.IntegrityError, match="only move forward"),
+            pytest.raises(psycopg.IntegrityError, match="only move forward"),
             h.db.transaction() as conn,
         ):
             conn.execute("UPDATE recovery_obligations SET evidence = 'not_needed'")
     with h.db.transaction() as conn:
         conn.execute(
-            "UPDATE plans SET preview_json = ? WHERE id = ?",
+            "UPDATE plans SET preview_json = %s WHERE id = %s",
             ('{"changes": [{"action": "delete"}]}', plan_id),
         )
         conn.execute("UPDATE recovery_obligations SET evidence = 'not_needed'")
@@ -1114,11 +1124,9 @@ def test_r6_3_initial_storage_ancestors_are_fsynced(
 
     monkeypatch.setattr(os, "fsync", trace)
     settings = Settings(data_dir=tmp_path / "new-parent" / "new-data", provisioner="simulated")
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     db.migrate()
-    assert tmp_path in synced  # new-parent's entry
-    assert tmp_path / "new-parent" in synced  # new-data's entry
-    assert settings.data_dir in synced  # the database file's entry
+    # PostgreSQL owns database fsync; this regression now verifies only local artifacts.
     lock = WorkerLock(settings.worker_lock_path)
     lock.acquire()
     try:
@@ -1129,6 +1137,8 @@ def test_r6_3_initial_storage_ancestors_are_fsynced(
     finally:
         lock.release()
     for directory in (
+        tmp_path,
+        tmp_path / "new-parent",
         settings.data_dir,
         settings.workdir_root,
         settings.workdir_root / dep,
@@ -1247,7 +1257,7 @@ def test_r6_4_legacy_cached_replies_are_redacted_and_validated_on_replay(harness
             },
         )
         c.execute(
-            "UPDATE agent_attempts SET response_json=? WHERE id=?",
+            "UPDATE agent_attempts SET response_json=%s WHERE id=%s",
             (json.dumps(response), row["id"]),
         )
     service._model_factory = None
@@ -1347,8 +1357,8 @@ def test_r6_4_legacy_credential_shaped_deployment_name_does_not_reach_the_model(
     with h.db.transaction() as c:
         c.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
-            "provisioner, status, created_at, updated_at) VALUES (?, 'dev:alice', ?, 8, "
-            "'us-east-1', 't3.micro', 'simulated', 'plan_failed', ?, ?)",
+            "provisioner, status, created_at, updated_at) VALUES (%s, 'dev:alice', %s, 8, "
+            "'us-east-1', 't3.micro', 'simulated', 'plan_failed', %s, %s)",
             ("dep_" + "d" * 32, SK, now, now),
         )
     seen: list[str] = []

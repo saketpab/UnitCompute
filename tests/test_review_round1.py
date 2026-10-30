@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -33,7 +32,7 @@ from unitcompute.agent.service import AgentService
 from unitcompute.auth import Principal
 from unitcompute.config import Settings
 from unitcompute.db import database
-from unitcompute.db.database import Database
+from unitcompute.db.database import Connection, Database
 from unitcompute.errors import Conflict, RateLimited, ServiceUnavailable
 from unitcompute.provisioning.aws import AwsEnvironment, TemporaryCredentials
 from unitcompute.provisioning.base import OwnedResource, ProvisioningError, Readiness
@@ -74,7 +73,7 @@ def test_s1_forged_dev_identity_cannot_queue_real_deployment(tmp_path: Path) -> 
     with pytest.raises(ValidationError):
         Settings(data_dir=tmp_path / "data", auth_mode="dev", **AWS_TERRAFORM)
     settings = make_settings(tmp_path, **TERRAFORM_SETTINGS)
-    Database(settings.database_path).migrate()
+    Database(settings.database_url, settings.database_schema).migrate()
     from unitcompute.api.app import create_app
 
     with TestClient(create_app(settings)) as client:
@@ -129,14 +128,18 @@ def test_r3_concurrent_requests_cannot_exceed_session_turns(harness: Harness) ->
     sid = "chat_" + "a" * 32
     now = database.to_db_time(database.utcnow())
     with harness.db.transaction() as conn:
-        conn.execute("INSERT INTO chat_sessions VALUES (?, 'dev:alice', 0, ?, ?)", (sid, now, now))
+        conn.execute(
+            "INSERT INTO chat_sessions (id,owner_id,turns,created_at,updated_at) "
+            "VALUES (%s, 'dev:alice', 0, %s, %s)",
+            (sid, now, now),
+        )
     service = _service(harness, Slow, agent_max_session_turns=1)
     results = asyncio.run(_gather(service, [AgentMessageRequest(session_id=sid, message="hi")] * 6))
     assert sum(not isinstance(r, Exception) for r in results) == 1
     assert all(r.code == "session_turn_limit" for r in results if isinstance(r, Conflict))
     with harness.db.read() as conn:
         assert (
-            conn.execute("SELECT turns FROM chat_sessions WHERE id = ?", (sid,)).fetchone()[0] == 1
+            conn.execute("SELECT turns FROM chat_sessions WHERE id = %s", (sid,)).fetchone()[0] == 1
         )
 
 
@@ -321,7 +324,7 @@ def test_s3_terraform_plan_bound_to_account_network_backend_and_roles(tmp_path: 
             return super().run(args, workdir=workdir, **kwargs)
 
     settings = make_settings(tmp_path, **TERRAFORM_SETTINGS)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     db.migrate()
     service = DeploymentService(db, settings)
     principal = Principal(subject="user-1", auth_method="jwt")
@@ -531,7 +534,7 @@ def test_r1_untagged_vm_with_lost_state_blocks_deletion(
         "InstanceId"
     ]
     with harness.db.transaction() as conn:
-        conn.execute("UPDATE deployments SET instance_id = ? WHERE id = ?", (iid, d["id"]))
+        conn.execute("UPDATE deployments SET instance_id = %s WHERE id = %s", (iid, d["id"]))
     harness.provisioner._state_path(d["id"]).unlink()  # state lost, tag never present
     provisioner = _AwsBacked(harness.settings.data_dir)
     provisioner.aws = AwsEnvironment(harness.settings)
@@ -577,7 +580,7 @@ def test_r1_retained_untagged_root_volume_blocks_deletion(
     path.write_text(json.dumps(state))
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE deployments SET instance_id = ?, root_volume_id = ? WHERE id = ?",
+            "UPDATE deployments SET instance_id = %s, root_volume_id = %s WHERE id = %s",
             (iid, vid, d["id"]),
         )
 
@@ -663,15 +666,17 @@ def test_r1_find_resources_by_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 # --------------------------------------------- R2: contention cannot strand an apply
 
 
-def _contended(h: Harness, hold_seconds: float | None) -> tuple[Worker, sqlite3.Connection]:
-    blocker = sqlite3.connect(
-        h.settings.database_path, isolation_level=None, timeout=10, check_same_thread=False
-    )
+def _contended(h: Harness, hold_seconds: float | None) -> tuple[Worker, Connection]:
+    blocker = h.db.connect()
 
     class Contended(SimulatedProvisioner):
         def apply(self, *args: Any) -> Any:
             result = super().apply(*args)
-            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("BEGIN")
+            blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (h.settings.database_schema + ":writes",),
+            )
             if hold_seconds is not None:
                 threading.Timer(hold_seconds, lambda: blocker.execute("ROLLBACK")).start()
             return result
@@ -777,7 +782,7 @@ def test_r4_disabled_provisioning_does_not_need_worker(tmp_path: Path) -> None:
     from unitcompute.api.app import create_app
 
     settings = make_settings(tmp_path, provisioner="disabled")
-    Database(settings.database_path).migrate()
+    Database(settings.database_url, settings.database_schema).migrate()
     with TestClient(create_app(settings)) as client:
         assert client.get("/readyz").status_code == 200
 

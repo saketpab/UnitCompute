@@ -12,13 +12,12 @@ import fcntl
 import json
 import os
 import re
-import sqlite3
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from unitcompute.db.database import to_db_time, utcnow
+from unitcompute.db.database import Connection, to_db_time, utcnow
 from unitcompute.durable import ensure_directory, fsync_chain
 
 EVIDENCE_FILE = "identities.jsonl"
@@ -142,10 +141,10 @@ class KnownIdentities:
         return sorted(i for i in self.instances if not self.launch_roots.get(i))
 
 
-def _legacy_outputs_have_provenance(conn: sqlite3.Connection, deployment_id: str) -> bool:
+def _legacy_outputs_have_provenance(conn: Connection, deployment_id: str) -> bool:
     ran = conn.execute(
         "SELECT jobs.status, plans.preview_json FROM jobs JOIN plans ON plans.id = jobs.plan_id "
-        "WHERE jobs.deployment_id = ? AND jobs.kind = 'apply' AND plans.kind = 'create' "
+        "WHERE jobs.deployment_id = %s AND jobs.kind = 'apply' AND plans.kind = 'create' "
         # Jobs that reached Terraform: 'failed' apply jobs failed their pre-apply checks in
         # every version, so never ran it; 'queued' ones have not run yet.
         "AND jobs.status IN ('succeeded', 'recovery_required', 'running')",
@@ -216,7 +215,7 @@ class IdentityLedger:
 
     @staticmethod
     def missing(
-        conn: sqlite3.Connection, deployment_id: str, identities: Iterable[Identity | None]
+        conn: Connection, deployment_id: str, identities: Iterable[Identity | None]
     ) -> list[Identity]:
         """Identities not (yet) present in the table, exactly as recorded (ID, parent, source)."""
         absent = []
@@ -224,15 +223,15 @@ class IdentityLedger:
             if item is None:
                 continue
             row = conn.execute(
-                "SELECT 1 FROM deployment_resources WHERE deployment_id = ? AND resource_id = ? "
-                "AND IFNULL(parent_id, '') = ? AND source = ?",
+                "SELECT 1 FROM deployment_resources WHERE deployment_id = %s AND resource_id = %s "
+                "AND COALESCE(parent_id, '') = %s AND source = %s",
                 (deployment_id, item.resource_id, item.parent_id or "", item.source),
             ).fetchone()
             if row is None:
                 absent.append(item)
         return absent
 
-    def import_evidence(self, conn: sqlite3.Connection, deployment_id: str) -> Imported:
+    def import_evidence(self, conn: Connection, deployment_id: str) -> Imported:
         """Import every valid record. Invalid records (torn writes, corruption, wrong shapes)
         are counted, never guessed at; the caller treats any as missing evidence for this
         deployment only."""
@@ -247,8 +246,11 @@ class IdentityLedger:
                 corrupt += 1
                 continue
             rows += conn.execute(
-                "INSERT OR IGNORE INTO deployment_resources (deployment_id, resource_type, "
-                "resource_id, parent_id, source, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "INSERT INTO deployment_resources (deployment_id, resource_type, "
+                    "resource_id, parent_id, source, recorded_at) VALUES (%s, %s, %s, %s, %s, "
+                    "%s) ON CONFLICT DO NOTHING"
+                ),
                 (
                     deployment_id,
                     item.resource_type,
@@ -261,11 +263,11 @@ class IdentityLedger:
         return Imported(rows, corrupt)
 
     @staticmethod
-    def _import_deployment_record(conn: sqlite3.Connection, deployment_id: str) -> int:
+    def _import_deployment_record(conn: Connection, deployment_id: str) -> int:
         """IDs held on the deployment row are evidence too; never ignore them."""
         row = conn.execute(
             "SELECT instance_id, security_group_id, root_volume_id, updated_at "
-            "FROM deployments WHERE id = ?",
+            "FROM deployments WHERE id = %s",
             (deployment_id,),
         ).fetchone()
         if row is None:
@@ -278,8 +280,11 @@ class IdentityLedger:
         ):
             if item is not None:
                 imported += conn.execute(
-                    "INSERT OR IGNORE INTO deployment_resources (deployment_id, resource_type, "
-                    "resource_id, parent_id, source, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "INSERT INTO deployment_resources (deployment_id, resource_type, "
+                        "resource_id, parent_id, source, recorded_at) VALUES (%s, %s, %s, %s, %s, "
+                        "%s) ON CONFLICT DO NOTHING"
+                    ),
                     (
                         deployment_id,
                         item.resource_type,
@@ -292,10 +297,10 @@ class IdentityLedger:
         return imported
 
     @staticmethod
-    def known(conn: sqlite3.Connection, deployment_id: str) -> KnownIdentities:
+    def known(conn: Connection, deployment_id: str) -> KnownIdentities:
         rows = conn.execute(
             "SELECT resource_type, resource_id, parent_id, source FROM deployment_resources "
-            "WHERE deployment_id = ?",
+            "WHERE deployment_id = %s",
             (deployment_id,),
         ).fetchall()
         instances = {r["resource_id"] for r in rows if r["resource_type"] == "instance"}

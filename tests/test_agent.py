@@ -81,7 +81,7 @@ def _jobs(h: Harness) -> list[str]:
 
 
 def test_asks_for_missing_configuration(agent: AgentHarness) -> None:
-    agent.script(say("What should the VM be called, and how much disk (8-30 GiB)?"))
+    agent.script(say("What should the VM be called, and how much disk (8-30 GiB)%s"))
     reply = agent.send("I want a VM")
     assert reply["proposal"] is None
     assert reply["reply"].startswith(FAKE_PREFIX)
@@ -268,7 +268,7 @@ def plain_client(tmp_path: Any) -> Iterator[tuple[TestClient, Settings]]:
 
 def _client(tmp_path: Any, overrides: dict[str, Any]) -> Iterator[tuple[TestClient, Settings]]:
     settings = make_settings(tmp_path, **overrides)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     db.migrate()
     container = build_container(
         settings, deployments=DeploymentService(db, settings, clock=FakeClock())

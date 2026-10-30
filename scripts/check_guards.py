@@ -37,7 +37,7 @@ class Mutation:
 
 # Errors a mutant produces when the edit itself is invalid rather than the guard missing.
 BROKEN_MUTANT_ERRORS = re.compile(
-    r"\b(OperationalError(?!: database is locked)|SyntaxError|IndentationError|NameError|UnboundLocalError|"
+    r"\b(OperationalError(?!: database is locked)|ProgrammingError|UndefinedColumn|UndefinedTable|InvalidTextRepresentation|IndeterminateDatatype|DatatypeMismatch|InvalidDatetimeFormat|InFailedSqlTransaction|SyntaxError|IndentationError|NameError|UnboundLocalError|"
     r"ImportError|ModuleNotFoundError|AttributeError|TypeError)\b"
 )
 
@@ -50,9 +50,9 @@ MUTATIONS = [
         "owner-scoping",
         (
             (
-                SVC,
-                '"SELECT * FROM deployments WHERE id = ? AND owner_id = ?",',
-                '"SELECT * FROM deployments WHERE id = ? AND ? IS NOT NULL",',
+                "services/deployments.py",
+                '"SELECT * FROM deployments WHERE id = %s AND owner_id = %s",',
+                '"SELECT * FROM deployments WHERE id = %s AND %s::text IS NOT NULL",',
             ),
         ),
         ("tests/test_authorization.py::test_cross_user_access_is_non_enumerating",),
@@ -61,7 +61,7 @@ MUTATIONS = [
         "approve-hash",
         (
             (
-                SVC,
+                "services/deployments.py",
                 'if not hmac.compare_digest(plan["plan_hash"] or "", approval.plan_hash):',
                 "if False:",
             ),
@@ -70,32 +70,49 @@ MUTATIONS = [
     ),
     Mutation(
         "approve-expiry",
-        ((SVC, 'if from_db_time(plan["expires_at"]) <= now_dt:', "if False:"),),
+        (
+            (
+                "services/deployments.py",
+                'if from_db_time(plan["expires_at"]) <= now_dt:',
+                "if False:",
+            ),
+        ),
         ("tests/test_approval.py::test_expired_plan_cannot_be_approved",),
     ),
     Mutation(
         "approve-replay",
-        ((SVC, 'if plan["status"] != "ready":', "if False:"),),
+        (("services/deployments.py", 'if plan["status"] != "ready":', "if False:"),),
         ("tests/test_approval.py::test_approval_replay_does_not_create_second_job",),
     ),
     Mutation(
         "approve-plan-type",
-        ((SVC, 'if deployment["status"] != APPROVABLE_STATUS[plan["kind"]]:', "if False:"),),
+        (
+            (
+                "services/deployments.py",
+                'if deployment["status"] != APPROVABLE_STATUS[plan["kind"]]:',
+                "if False:",
+            ),
+        ),
         ("tests/test_approval.py::test_destroy_plan_cannot_be_approved_as_create",),
     ),
     Mutation(
         "approve-versions",
-        ((SVC, "or plan_versions(plan) != expected_versions(", "or False and expected_versions("),),
+        (
+            (
+                "services/deployments.py",
+                "or plan_versions(plan) != expected_versions(",
+                "or False and expected_versions(",
+            ),
+        ),
         ("tests/test_approval.py::test_stale_template_version_rejected",),
     ),
     Mutation(
         "quota-check-and-index",
         (
-            (SVC, "if live is not None:", "if False:"),
+            ("services/deployments.py", "if live is not None:", "if False:"),
             (
                 "db/migrations/0001_initial.sql",
-                "CREATE UNIQUE INDEX deployments_one_live_per_owner\n    ON deployments (owner_id) "
-                "WHERE status <> 'deleted';",
+                "CREATE UNIQUE INDEX deployments_one_live_per_owner\n    ON deployments (owner_id) WHERE status <> 'deleted';",
                 "",
             ),
         ),
@@ -106,36 +123,39 @@ MUTATIONS = [
     ),
     Mutation(
         "idempotency-payload",
-        ((SVC, 'if not hmac.compare_digest(row["payload_hash"], payload_hash):', "if False:"),),
+        (
+            (
+                "services/deployments.py",
+                'if not hmac.compare_digest(row["payload_hash"], payload_hash):',
+                "if False:",
+            ),
+        ),
         ("tests/test_idempotency_and_races.py::test_same_key_different_payload_conflicts",),
     ),
     Mutation(
         "worker-hash",
-        ((WORKER, 'if sha256_file(plan_path) != plan["plan_hash"]:', "if False:"),),
+        (("worker.py", 'if sha256_file(plan_path) != plan["plan_hash"]:', "if False:"),),
         ("tests/test_approval.py::test_worker_rejects_plan_file_modified_after_approval",),
     ),
     Mutation(
         "worker-approver",
-        ((WORKER, '== plan["owner_id"] == plan["approved_by"]', '== plan["owner_id"]'),),
+        (("worker.py", '== plan["owner_id"] == plan["approved_by"]', '== plan["owner_id"]'),),
         ("tests/test_approval.py::test_worker_rejects_approval_by_someone_else",),
     ),
     Mutation(
         "worker-delete-verification",
-        ((WORKER, "        if remaining:", "        if False:"),),
+        (("worker.py", "        if remaining:", "        if False:"),),
         (
-            "tests/test_worker_recovery.py::"
-            "test_deletion_only_completes_when_resources_verified_gone",
+            "tests/test_worker_recovery.py::test_deletion_only_completes_when_resources_verified_gone",
         ),
     ),
     Mutation(
         "worker-lock-unlock",
         (
             (
-                WORKER,
+                "worker.py",
                 "        if self.fd is not None:\n            os.close",
-                "        if self.fd is not None:\n"
-                "            fcntl.flock(self.fd, fcntl.LOCK_UN)\n"
-                "            os.close",
+                "        if self.fd is not None:\n            fcntl.flock(self.fd, fcntl.LOCK_UN)\n            os.close",
             ),
         ),
         ("tests/test_worker_recovery.py::test_single_worker_lock",),
@@ -178,8 +198,8 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                '"UPDATE chat_sessions SET turns = turns + 1, updated_at = ? WHERE id = ?",',
-                '"UPDATE chat_sessions SET updated_at = ? WHERE id = ?",',
+                '"UPDATE chat_sessions SET turns = turns + 1, updated_at = %s WHERE id = %s",',
+                '"UPDATE chat_sessions SET updated_at = %s WHERE id = %s",',
             ),
         ),
         ("tests/test_review_round1.py::test_r3_concurrent_requests_cannot_exceed_session_turns",),
@@ -189,8 +209,8 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                "                        \"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"\n                        \"finished_at = ? WHERE id = ? AND status = 'reserved'\",\n                        (to_db_time(utcnow()), attempt_id),\n",
-                "                        \"DELETE FROM agent_attempts WHERE id = ? AND status = 'reserved'\",\n                        (attempt_id,),\n",
+                "                        \"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"\n                        \"finished_at = %s WHERE id = %s AND status = 'reserved'\",\n                        (to_db_time(utcnow()), attempt_id),\n",
+                "                        \"DELETE FROM agent_attempts WHERE id = %s AND status = 'reserved'\",\n                        (attempt_id,),\n",
             ),
         ),
         ("tests/test_review_round1.py::test_r3_failed_attempts_stay_counted",),
@@ -207,11 +227,9 @@ MUTATIONS = [
         "s3-approval-binding",
         (
             (
-                SVC,
-                "                binding = binding_problem(self._settings, plan)\n"
-                "                if binding:",
-                "                binding = binding_problem(self._settings, plan)\n"
-                "                if False:",
+                "services/deployments.py",
+                "                binding = binding_problem(self._settings, plan)\n                if binding:",
+                "                binding = binding_problem(self._settings, plan)\n                if False:",
             ),
         ),
         ("tests/test_review_round1.py::test_s3_changed_execution_config_invalidates_approval",),
@@ -220,7 +238,7 @@ MUTATIONS = [
         "s3-worker-binding",
         (
             (
-                WORKER,
+                "worker.py",
                 "        binding = binding_problem(self.settings, plan)\n        if binding:",
                 "        binding = binding_problem(self.settings, plan)\n        if False:",
             ),
@@ -229,21 +247,26 @@ MUTATIONS = [
     ),
     Mutation(
         "s4-provisioners",
-        ((POLICY, 'if resource.get("provisioners"):', "if False:"),),
+        (("provisioning/policy.py", 'if resource.get("provisioners"):', "if False:"),),
         ("tests/test_review_round1.py::test_s4_provisioners_rejected",),
     ),
     Mutation(
         "s4-group-attachment",
-        ((POLICY, "if group_id is not None and groups == [group_id]:", "if True:"),),
+        (
+            (
+                "provisioning/policy.py",
+                "if group_id is not None and groups == [group_id]:",
+                "if True:",
+            ),
+        ),
         ("tests/test_review_round1.py::test_s4_existing_instance_must_use_its_own_group",),
     ),
     Mutation(
         "s4-root-attributes",
         (
             (
-                POLICY,
-                'extra_root = sorted(set(_first(after.get("root_block_device"))) - '
-                "ROOT_CREATE_FIELDS)",
+                "provisioning/policy.py",
+                'extra_root = sorted(set(_first(after.get("root_block_device"))) - ROOT_CREATE_FIELDS)',
                 "extra_root: list[str] = []",
             ),
         ),
@@ -253,7 +276,7 @@ MUTATIONS = [
         "r1-delete-by-id",
         (
             (
-                WORKER,
+                "worker.py",
                 "            found = self.provisioner.find_resources(known.all_ids)",
                 "            found = []",
             ),
@@ -262,12 +285,18 @@ MUTATIONS = [
     ),
     Mutation(
         "r2-stranded-recovery",
-        ((WORKER, "        if self._has_stranded_jobs():", "        if False:"),),
+        (("worker.py", "        if self._has_stranded_jobs():", "        if False:"),),
         ("tests/test_review_round1.py::test_r2_persistent_contention_recovers_without_replay",),
     ),
     Mutation(
         "r2-write-retry",
-        ((WORKER, "        delays = [*self.write_retry_delays, None]", "        delays = [None]"),),
+        (
+            (
+                "worker.py",
+                "        delays = [*self.write_retry_delays, None]",
+                "        delays = [None]",
+            ),
+        ),
         ("tests/test_review_round1.py::test_r2_transient_contention_is_retried",),
     ),
     Mutation(
@@ -279,9 +308,8 @@ MUTATIONS = [
         "r4-health-gate",
         (
             (
-                WORKER,
-                "if self._self_check_due() and not self.self_check():\n            return False\n"
-                "        if not self._healthy:\n            return False",
+                "worker.py",
+                "if self._self_check_due() and not self.self_check():\n            return False\n        if not self._healthy:\n            return False",
                 "if self._self_check_due():\n            self.self_check()",
             ),
         ),
@@ -292,8 +320,7 @@ MUTATIONS = [
         (
             (
                 "provisioning/aws.py",
-                "if account != self._settings.aws_account_id or not "
-                "caller.startswith(expected_prefix):",
+                "if account != self._settings.aws_account_id or not caller.startswith(expected_prefix):",
                 "if False:",
             ),
         ),
@@ -301,18 +328,16 @@ MUTATIONS = [
     ),
     Mutation(
         "r5-connection-ready",
-        ((WORKER, "int(readiness.ready),", "1,"),),
+        (("worker.py", "int(readiness.ready),", "1,"),),
         (
-            "tests/test_review_round1.py::"
-            "test_r5_infrastructure_success_is_distinct_from_connection_readiness",
+            "tests/test_review_round1.py::test_r5_infrastructure_success_is_distinct_from_connection_readiness",
         ),
     ),
     Mutation(
         "r5-exact-ssm-identity",
         (("provisioning/aws.py", 'if item.get("InstanceId") == instance_id', "if True"),),
         (
-            "tests/test_review_round1.py::"
-            "test_r5_connection_readiness_reads_ec2_checks_and_exact_ssm_identity",
+            "tests/test_review_round1.py::test_r5_connection_readiness_reads_ec2_checks_and_exact_ssm_identity",
         ),
     ),
     Mutation(
@@ -416,8 +441,7 @@ MUTATIONS = [
         "r2-3-root-disk-completeness",
         (("worker.py", "            if missing_disks:", "            if False:"),),
         (
-            "tests/test_review_round3.py::"
-            "test_r3_3_deletion_verification_independently_requires_root_identity",
+            "tests/test_review_round3.py::test_r3_3_deletion_verification_independently_requires_root_identity",
         ),
     ),
     Mutation(
@@ -473,8 +497,7 @@ MUTATIONS = [
         "r3-2-root-device-name",
         (("provisioning/aws.py", 'bool(root_name) and m.get("DeviceName") == root_name', "True"),),
         (
-            "tests/test_review_round3.py::"
-            "test_r3_2_root_device_observation_is_distinct_from_launch_root",
+            "tests/test_review_round3.py::test_r3_2_root_device_observation_is_distinct_from_launch_root",
         ),
     ),
     Mutation(
@@ -547,8 +570,8 @@ MUTATIONS = [
         (
             (
                 "db/migrations/0004_source_distinct_identity.sql",
-                "IFNULL(parent_id, ''), source);",
-                "IFNULL(parent_id, ''));",
+                "COALESCE(parent_id, ''), source);",
+                "COALESCE(parent_id, '')) ;",
             ),
         ),
         ("tests/test_review_round4.py::test_r4_4_later_sources_are_kept_for_the_same_volume",),
@@ -584,39 +607,21 @@ MUTATIONS = [
     ),
     Mutation(
         "r5-repair-output-not-launch",
-        (
-            (
-                "worker.py",
-                'LAUNCH_OUTPUT if launched else "apply_output_seen",',
-                "LAUNCH_OUTPUT,",
-            ),
-        ),
+        (("worker.py", 'LAUNCH_OUTPUT if launched else "apply_output_seen",', "LAUNCH_OUTPUT,"),),
         (
             "tests/test_review_round5.py::test_r5_1_repair_outputs_of_existing_instance_are_not_launch_evidence",
         ),
     ),
     Mutation(
         "r5-row-root-kept-on-repair",
-        (
-            (
-                "worker.py",
-                "int(plan_launches_instance(plan)),",
-                "1,",
-            ),
-        ),
+        (("worker.py", "int(plan_launches_instance(plan)),", "1,"),),
         (
             "tests/test_review_round5.py::test_r5_1_repair_outputs_of_existing_instance_are_not_launch_evidence",
         ),
     ),
     Mutation(
         "r5-errored-state-capture",
-        (
-            (
-                "worker.py",
-                "            if errored.is_file():",
-                "            if False:",
-            ),
-        ),
+        (("worker.py", "            if errored.is_file():", "            if False:"),),
         (
             "tests/test_review_round5.py::test_r5_2_errored_state_is_captured_and_blocks_false_deletion",
         ),
@@ -626,8 +631,8 @@ MUTATIONS = [
         (
             (
                 "db/migrations/0006_obligation_revalidation.sql",
-                "BEFORE UPDATE ON recovery_obligations WHEN NOT (",
-                "BEFORE UPDATE ON recovery_obligations WHEN 0 AND NOT (",
+                "THEN RAISE EXCEPTION 'recovery obligations only move forward' USING ERRCODE='23514'; END IF;",
+                "THEN NULL; END IF;",
             ),
         ),
         ("tests/test_review_round5.py::test_r5_2_obligation_rows_only_move_forward",),
@@ -648,11 +653,7 @@ MUTATIONS = [
     Mutation(
         "r5-corruption-isolation",
         (
-            (
-                "identities.py",
-                '    if not isinstance(raw, dict):\n        return None, ""\n',
-                "",
-            ),
+            ("identities.py", '    if not isinstance(raw, dict):\n        return None, ""\n', ""),
             (
                 "worker.py",
                 '                self.import_identities(job["deployment_id"])\n            except Exception:',
@@ -703,9 +704,7 @@ MUTATIONS = [
         (
             (
                 "db/migrations/0003_resource_identity_ledger.sql",
-                "CREATE TRIGGER deployment_resources_no_delete BEFORE DELETE ON "
-                "deployment_resources BEGIN SELECT RAISE(ABORT, "
-                "'deployment_resources is append-only'); END;\n",
+                "CREATE TRIGGER deployment_resources_no_update BEFORE UPDATE OR DELETE ON deployment_resources FOR EACH ROW EXECUTE FUNCTION deny_evidence_mutation();\n",
                 "",
             ),
         ),
@@ -743,24 +742,12 @@ MUTATIONS = [
     ),
     Mutation(
         "r2-2-persist-outputs",
-        (
-            (
-                "worker.py",
-                'identity(instance_output, "apply_output_seen"),',
-                "None,",
-            ),
-        ),
+        (("worker.py", 'identity(instance_output, "apply_output_seen"),', "None,"),),
         ("tests/test_review_round2.py::test_r2_2_apply_outputs_persist_when_inventory_fails",),
     ),
     Mutation(
         "r4-new-file-dir-fsync",
-        (
-            (
-                "identities.py",
-                "        if created:\n",
-                "        if False:\n",
-            ),
-        ),
+        (("identities.py", "        if created:\n", "        if False:\n"),),
         ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
     ),
     Mutation(
@@ -768,8 +755,8 @@ MUTATIONS = [
         (
             (
                 "admin.py",
-                "WHERE deployment_id = ? AND discharged_at IS NULL ORDER BY id",
-                "WHERE deployment_id = ? AND 0 ORDER BY id",
+                "WHERE deployment_id = %s AND discharged_at IS NULL ORDER BY id",
+                "WHERE deployment_id = %s AND FALSE ORDER BY id",
             ),
         ),
         (
@@ -955,13 +942,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-outputs-agree",
-        (
-            (
-                "provisioning/state_evidence.py",
-                "if expected[key] != value:",
-                "if False:",
-            ),
-        ),
+        (("provisioning/state_evidence.py", "if expected[key] != value:", "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_1_unproven_state_never_resolves_an_unknown_mutation",
             "tests/test_review_round6.py::test_r6_1_state_envelope_is_validated",
@@ -983,26 +964,14 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-bind-serial",
-        (
-            (
-                "provisioning/state_evidence.py",
-                "if document.serial < prior.serial:",
-                "if False:",
-            ),
-        ),
+        (("provisioning/state_evidence.py", "if document.serial < prior.serial:", "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
         ),
     ),
     Mutation(
         "r6-bind-prior-ids",
-        (
-            (
-                "provisioning/state_evidence.py",
-                "if resource_id in prior_ids:",
-                "if False:",
-            ),
-        ),
+        (("provisioning/state_evidence.py", "if resource_id in prior_ids:", "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
         ),
@@ -1023,13 +992,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-stored-needs-all-creates",
-        (
-            (
-                "worker.py",
-                "require_all_creates=complete",
-                "require_all_creates=False",
-            ),
-        ),
+        (("worker.py", "require_all_creates=complete", "require_all_creates=False"),),
         (
             "tests/test_review_round6.py::test_r6_1_stored_snapshot_must_show_every_planned_resource",
         ),
@@ -1060,13 +1023,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-signal-classified",
-        (
-            (
-                "provisioning/terraform.py",
-                "if result.returncode < 0:",
-                "if False:",
-            ),
-        ),
+        (("provisioning/terraform.py", "if result.returncode < 0:", "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_1_signal_exit_is_classified_not_reported_as_a_plain_failure",
         ),
@@ -1087,13 +1044,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-legacy-single-ran",
-        (
-            (
-                "identities.py",
-                'if len(ran) != 1 or ran[0]["status"] != "succeeded":',
-                "if False:",
-            ),
-        ),
+        (("identities.py", 'if len(ran) != 1 or ran[0]["status"] != "succeeded":', "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_2_legacy_trust_rule",
             "tests/test_review_round6.py::test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance",
@@ -1142,8 +1093,8 @@ MUTATIONS = [
         (
             (
                 "db/migrations/0006_obligation_revalidation.sql",
-                "AND EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id",
-                "AND NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id",
+                "(NEW.evidence = 'not_needed' AND plan_proves_no_create(NEW.plan_id))",
+                "(NEW.evidence = 'not_needed')",
             ),
         ),
         (
@@ -1165,13 +1116,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-evidence-read-locked",
-        (
-            (
-                "identities.py",
-                "fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)",
-                "pass",
-            ),
-        ),
+        (("identities.py", "fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)", "pass"),),
         ("tests/test_review_round6.py::test_r6_3_import_waits_for_an_append_in_progress",),
     ),
     Mutation(
@@ -1186,18 +1131,15 @@ MUTATIONS = [
         ("tests/test_review_round6.py::test_r6_3_startup_recovery_survives_a_busy_evidence_file",),
     ),
     Mutation(
-        "r6-storage-root-durable",
+        "pg-transaction-durable",
         (
             (
                 "db/database.py",
-                "        ensure_directory(self.path.parent)\n",
-                "        self.path.parent.mkdir(parents=True, exist_ok=True)\n",
+                "            with self.connect() as conn, conn.transaction():\n                # Scoped requests",
+                "            with self.connect() as conn, conn.transaction(force_rollback=True):\n                # Scoped requests",
             ),
         ),
-        (
-            "tests/test_review_round6.py::test_r6_3_initial_storage_ancestors_are_fsynced",
-            "tests/test_review_round6.py::test_r6_3_every_directory_creation_goes_through_the_durable_helpers",
-        ),
+        ("tests/test_postgresql.py::test_transaction_survives_connection_restart",),
     ),
     Mutation(
         "r6-runner-dirs-durable",
@@ -1286,13 +1228,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-tool-results-middleware",
-        (
-            (
-                "agent/service.py",
-                "            _RedactToolResults(),\n",
-                "",
-            ),
-        ),
+        (("agent/service.py", "            _RedactToolResults(),\n", ""),),
         (
             "tests/test_review_round6.py::test_r6_4_tool_errors_that_echo_arguments_are_replaced",
             "tests/test_review_round6.py::test_r6_4_unknown_tool_error_does_not_echo_the_model_supplied_name",
@@ -1301,13 +1237,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r6-name-rejects-credentials",
-        (
-            (
-                "schemas.py",
-                "if redact(value) != value:",
-                "if False:",
-            ),
-        ),
+        (("schemas.py", "if redact(value) != value:", "if False:"),),
         (
             "tests/test_review_round6.py::test_r6_4_credential_shaped_name_is_rejected_not_silently_altered",
             "tests/test_review_round6.py::test_r6_4_typed_validation_and_proposal_bounds_are_unchanged",
@@ -1328,13 +1258,7 @@ MUTATIONS = [
     ),
     Mutation(
         "worker-expiry",
-        (
-            (
-                "worker.py",
-                'if from_db_time(plan["expires_at"]) <= self.clock():',
-                "if False:",
-            ),
-        ),
+        (("worker.py", 'if from_db_time(plan["expires_at"]) <= self.clock():', "if False:"),),
         (
             "tests/test_approval.py::test_worker_rejects_plan_that_expired_in_queue",
             "tests/test_review_round7.py::test_r7_2_worker_rejects_a_plan_that_expired_during_the_evidence_import",
@@ -1369,8 +1293,8 @@ MUTATIONS = [
         (
             (
                 "services/deployments.py",
-                "        with self._db.transaction() as conn:\n            # Sampled only after the write lock is held",
-                "        stale_dt = self._clock()\n        with self._db.transaction() as conn:\n            # Sampled only after the write lock is held",
+                "        with self._db.transaction(principal.owner_id) as conn:\n            self._db.ensure_user(conn, principal)\n            # Sampled only after the write lock is held",
+                "        stale_dt = self._clock()\n        with self._db.transaction(principal.owner_id) as conn:\n            self._db.ensure_user(conn, principal)\n            # Sampled only after the write lock is held",
             ),
             (
                 "services/deployments.py",
@@ -1380,7 +1304,7 @@ MUTATIONS = [
         ),
         (
             "tests/test_review_round7.py::test_r7_2_approval_time_is_sampled_after_the_transaction_wait",
-            "tests/test_review_round7.py::test_r7_2_approval_with_a_real_sqlite_lock_wait",
+            "tests/test_review_round7.py::test_r7_2_approval_with_a_real_postgresql_lock_wait",
         ),
     ),
     Mutation(
@@ -1422,7 +1346,7 @@ MUTATIONS = [
         (
             "tests/test_review_round7.py::test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_visible",
         ),
-        expect="UNIQUE constraint failed",
+        expect="UniqueViolation:.*deployments_one_live_per_owner",
     ),
     Mutation(
         "r7-admin-lists-deleted",
@@ -1439,13 +1363,7 @@ MUTATIONS = [
     ),
     Mutation(
         "r7-runner-stdout-bounded",
-        (
-            (
-                "provisioning/runner.py",
-                "head_limit=MAX_STDOUT_BYTES + 1",
-                "head_limit=1 << 40",
-            ),
-        ),
+        (("provisioning/runner.py", "head_limit=MAX_STDOUT_BYTES + 1", "head_limit=1 << 40"),),
         ("tests/test_review_round7.py::test_r7_3_oversized_stdout_is_bounded_and_still_rejected",),
         expect="peak",
     ),
@@ -1477,29 +1395,29 @@ MUTATIONS = [
     ),
     Mutation(
         "policy-imdsv2",
-        ((POLICY, 'metadata.get("http_tokens") == "required"', "True"),),
+        (("provisioning/policy.py", 'metadata.get("http_tokens") == "required"', "True"),),
         ("tests/test_policy.py::test_policy_rejects_mutation[imdsv1]",),
     ),
     Mutation(
         "policy-ingress",
-        ((POLICY, 'after.get("ingress") == []', "True"),),
+        (("provisioning/policy.py", 'after.get("ingress") == []', "True"),),
         ("tests/test_policy.py::test_policy_rejects_mutation[ssh_ingress]",),
     ),
     Mutation(
         "policy-actions",
-        ((POLICY, "if actions not in ALLOWED_ACTIONS[kind]:", "if False:"),),
+        (("provisioning/policy.py", "if actions not in ALLOWED_ACTIONS[kind]:", "if False:"),),
         ("tests/test_policy.py::test_replace_or_update_of_owned_resources_rejected",),
     ),
     Mutation(
         "policy-orphans",
-        ((POLICY, "    if orphans:", "    if False:"),),
+        (("provisioning/policy.py", "    if orphans:", "    if False:"),),
         ("tests/test_policy.py::test_orphaned_resources_require_operator",),
     ),
     Mutation(
         "policy-provider-args",
         (
             (
-                POLICY,
+                "provisioning/policy.py",
                 'if not set(aws.get("expressions") or {}) <= ALLOWED_PROVIDER_ARGUMENTS:',
                 "if False:",
             ),
@@ -1562,6 +1480,15 @@ MUTATIONS = [
 ]
 
 
+def broken_errors(output: str) -> set[str]:
+    # Tracebacks print unexecuted source too; only exception diagnostics establish a
+    # broken mutation. PostgreSQL's execute implementation contains raise TypeError.
+    diagnostics = "\n".join(
+        line for line in output.splitlines() if line.startswith("E ") or re.match(r"^[\w.]+:", line)
+    )
+    return {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(diagnostics)}
+
+
 def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
     src = workspace / "src"
     shutil.rmtree(src, ignore_errors=True)
@@ -1589,7 +1516,7 @@ def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
     if result.returncode != 1:
         return f"BROKEN({result.returncode})"
     output = result.stdout + result.stderr
-    errors = {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(output)} - set(mutation.allow)
+    errors = broken_errors(output) - set(mutation.allow)
     if errors:
         if verbose:
             for line in output.splitlines():

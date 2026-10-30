@@ -158,8 +158,8 @@ def seed_launch_history(db: Database, dep: str, owner: str = "dev:alice") -> Non
         conn.execute(
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
             "config_hash, region, state_key, template_version, preview_json, created_at) "
-            "VALUES (?, ?, ?, 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
-            "'ec2-vm/v1', ?, ?)",
+            "VALUES (%s, %s, %s, 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
+            "'ec2-vm/v1', %s, %s)",
             (
                 plan_id,
                 dep,
@@ -170,7 +170,7 @@ def seed_launch_history(db: Database, dep: str, owner: str = "dev:alice") -> Non
         )
         conn.execute(
             "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-            "payload_hash, created_at) VALUES (?, ?, ?, ?, 'apply', 'succeeded', 'h', ?)",
+            "payload_hash, created_at) VALUES (%s, %s, %s, %s, 'apply', 'succeeded', 'h', %s)",
             ("job_" + "7" * 32, owner, dep, plan_id, now),
         )
 
@@ -235,9 +235,9 @@ def test_r4_4_later_sources_are_kept_for_the_same_volume(harness: Harness) -> No
     worker.record_identities(dep, [identity(vid, "launch_output", iid)])
     with harness.db.read() as conn:
         rows = {
-            tuple(r)
+            tuple(r.values())
             for r in conn.execute(
-                "SELECT resource_id, source FROM deployment_resources WHERE deployment_id = ?",
+                "SELECT resource_id, source FROM deployment_resources WHERE deployment_id = %s",
                 (dep,),
             )
         }
@@ -260,7 +260,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     from conftest import make_settings
 
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:3])
@@ -270,8 +270,8 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     with db.transaction() as conn:
         conn.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
-            "provisioner, status, created_at, updated_at) VALUES (?, 'dev:a', 'demo', 8, "
-            "'us-east-1', 't3.micro', 'simulated', 'active', ?, ?)",
+            "provisioner, status, created_at, updated_at) VALUES (%s, 'dev:a', 'demo', 8, "
+            "'us-east-1', 't3.micro', 'simulated', 'active', %s, %s)",
             (dep, now, now),
         )
     seed_launch_history(db, dep, "dev:a")
@@ -287,7 +287,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {}  # shadowed under schema 3
-    assert db.migrate() == [4, 5, 6, 7]
+    assert db.migrate() == [4, 5, 6, 7, 8]
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {iid: {vid}}
@@ -511,10 +511,14 @@ def test_r4_3_quoted_legacy_history_is_redacted(harness: Harness) -> None:
     sid = "chat_" + "e" * 32
     now = to_db_time(utcnow())
     with harness.db.transaction() as conn:
-        conn.execute("INSERT INTO chat_sessions VALUES (?, 'dev:alice', 1, ?, ?)", (sid, now, now))
+        conn.execute(
+            "INSERT INTO chat_sessions (id,owner_id,turns,created_at,updated_at) "
+            "VALUES (%s, 'dev:alice', 1, %s, %s)",
+            (sid, now, now),
+        )
         conn.execute(
             "INSERT INTO chat_messages (session_id, role, content, created_at) "
-            "VALUES (?, 'user', ?, ?)",
+            "VALUES (%s, 'user', %s, %s)",
             (sid, f'password: "{SECRET}"', now),
         )
     seen: list[str] = []

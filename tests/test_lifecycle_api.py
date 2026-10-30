@@ -74,7 +74,7 @@ def test_full_lifecycle_create_inspect_delete(harness: Harness) -> None:
         actions = [
             r["action"]
             for r in conn.execute(
-                "SELECT action FROM audit_events WHERE deployment_id = ? ORDER BY id",
+                "SELECT action FROM audit_events WHERE deployment_id = %s ORDER BY id",
                 (detail["id"],),
             )
         ]
@@ -106,7 +106,7 @@ def test_refresh_plan_supersedes_previous(harness: Harness) -> None:
     h.drain()
     with h.db.read() as conn:
         status = conn.execute(
-            "SELECT status FROM plans WHERE id = ?", (old_plan["plan_id"],)
+            "SELECT status FROM plans WHERE id = %s", (old_plan["plan_id"],)
         ).fetchone()["status"]
     assert status == "superseded"
     stale = h.client.post(
@@ -151,7 +151,7 @@ def test_provisioning_disabled_by_default(tmp_path) -> None:  # type: ignore[no-
     from unitcompute.db.database import Database
 
     settings = make_settings(tmp_path, provisioner="disabled")
-    Database(settings.database_path).migrate()
+    Database(settings.database_url, settings.database_schema).migrate()
     with TestClient(create_app(settings)) as client:
         response = client.post("/deployments", json={"name": "demo", "disk_gib": 8}, headers=auth())
     assert response.status_code == 503

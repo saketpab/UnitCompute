@@ -74,7 +74,7 @@ def test_error_shape_and_headers(harness: Harness) -> None:
 
 def test_cors_is_restricted(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, cors_origins="https://app.example.test")
-    Database(settings.database_path).migrate()
+    Database(settings.database_url, settings.database_schema).migrate()
     with TestClient(create_app(settings)) as client:
         good = client.options(
             "/deployments",
@@ -101,6 +101,12 @@ def test_openapi_documents_contract(harness: Harness) -> None:
     paths = spec["paths"]
     assert set(paths) == {
         "/agent/messages",
+        "/me",
+        "/resources",
+        "/resources/{resource_id}",
+        "/chats",
+        "/chats/{chat_id}",
+        "/chats/{chat_id}/messages",
         "/deployments",
         "/deployments/{deployment_id}",
         "/deployments/{deployment_id}/plan",
@@ -136,8 +142,8 @@ def test_api_refuses_unmigrated_database(tmp_path: Path) -> None:
 
 
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
-    db = Database(make_settings(tmp_path).database_path)
-    assert db.migrate() == [1, 2, 3, 4, 5, 6, 7]
+    db = Database(make_settings(tmp_path).database_url, make_settings(tmp_path).database_schema)
+    assert db.migrate() == [1, 2, 3, 4, 5, 6, 7, 8]
     assert db.migrate() == []
     assert db.schema_version() == LATEST_SCHEMA_VERSION
 
@@ -150,7 +156,7 @@ def test_state_survives_restart(harness: Harness) -> None:
 
     # New process: fresh Database/app/worker objects over the same files.
     settings = h.settings
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     container = build_container(
         settings, deployments=DeploymentService(db, settings, clock=h.clock)
     )

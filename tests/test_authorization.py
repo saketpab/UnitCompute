@@ -46,7 +46,10 @@ def test_cross_user_access_is_non_enumerating(harness: Harness) -> None:
     )
     both("get", f"/jobs/{job_id}", f"/jobs/{missing_job}")
 
-    assert h.client.get("/deployments", headers=auth("mallory")).json() == {"deployments": []}
+    assert h.client.get("/deployments", headers=auth("mallory")).json() == {
+        "deployments": [],
+        "next_cursor": None,
+    }
     # Alice's deployment is untouched by the attempts.
     assert h.client.get(f"/deployments/{dep}", headers=auth()).json()["status"] == "active"
 

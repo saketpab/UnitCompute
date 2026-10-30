@@ -9,8 +9,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Path, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,12 +31,15 @@ from unitcompute.schemas import (
     AgentMessageRequest,
     AgentReply,
     ApprovalRequest,
+    ChatTitle,
     DeploymentDetail,
     DeploymentList,
     DeploymentRequest,
     ErrorResponse,
     JobSummary,
+    ProfileUpdate,
 )
+from unitcompute.services.catalog import CatalogService
 from unitcompute.services.deployments import DeploymentService
 
 log = logging.getLogger(__name__)
@@ -58,7 +62,7 @@ def build_container(
     agent: AgentService | None = None,
     deployments: DeploymentService | None = None,
 ) -> Container:
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     deployments = deployments or DeploymentService(db, settings)
     return Container(
         settings=settings,
@@ -186,8 +190,65 @@ def _accepted(status: int, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(AcceptedResponse(**body).model_dump(mode="json"), status_code=status)
 
 
+SessionId = Annotated[str, Path(pattern=r"^chat_[0-9a-f]{32}$")]
+
+
 def build_router() -> APIRouter:
     router = APIRouter()
+
+    @router.get("/me", tags=["users"])
+    def profile(principal: PrincipalDep, request: Request) -> dict[str, Any]:
+        return CatalogService(_container(request).db).profile(principal)
+
+    @router.patch("/me", tags=["users"])
+    def update_profile(
+        body: ProfileUpdate, principal: PrincipalDep, request: Request
+    ) -> dict[str, Any]:
+        return CatalogService(_container(request).db).profile(
+            principal, body.model_dump(exclude_none=True)
+        )
+
+    @router.get("/resources", tags=["resources"])
+    def resources(
+        principal: PrincipalDep,
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=512),
+    ) -> dict[str, Any]:
+        return CatalogService(_container(request).db).resources(principal, limit, cursor)
+
+    @router.get("/resources/{resource_id}", tags=["resources"])
+    def resource(resource_id: UUID, principal: PrincipalDep, request: Request) -> dict[str, Any]:
+        return CatalogService(_container(request).db).resource(principal, str(resource_id))
+
+    @router.post("/chats", tags=["chats"], status_code=201)
+    def create_chat(body: ChatTitle, principal: PrincipalDep, request: Request) -> dict[str, Any]:
+        return CatalogService(_container(request).db).create_chat(principal, body.title)
+
+    @router.get("/chats", tags=["chats"])
+    def chats(
+        principal: PrincipalDep,
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=512),
+    ) -> dict[str, Any]:
+        return CatalogService(_container(request).db).chats(principal, limit, cursor)
+
+    @router.patch("/chats/{chat_id}", tags=["chats"])
+    def chat_title(
+        chat_id: SessionId, body: ChatTitle, principal: PrincipalDep, request: Request
+    ) -> dict[str, Any]:
+        return CatalogService(_container(request).db).title(principal, chat_id, body.title)
+
+    @router.get("/chats/{chat_id}/messages", tags=["chats"])
+    def messages(
+        chat_id: SessionId,
+        principal: PrincipalDep,
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=512),
+    ) -> dict[str, Any]:
+        return CatalogService(_container(request).db).messages(principal, chat_id, limit, cursor)
 
     @router.post(
         "/agent/messages",
@@ -220,10 +281,16 @@ def build_router() -> APIRouter:
     @router.get(
         "/deployments", response_model=DeploymentList, responses=ERRORS, tags=["deployments"]
     )
-    def list_deployments(principal: PrincipalDep, request: Request) -> DeploymentList:
-        return DeploymentList(
-            deployments=_container(request).deployments.list_deployments(principal)
+    def list_deployments(
+        principal: PrincipalDep,
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=512),
+    ) -> DeploymentList:
+        items, next_cursor = _container(request).deployments.deployment_page(
+            principal, limit, cursor
         )
+        return DeploymentList(deployments=items, next_cursor=next_cursor)
 
     @router.get(
         "/deployments/{deployment_id}",
@@ -324,7 +391,9 @@ def build_router() -> APIRouter:
             )
             healthy = bool(row and row["healthy"])
             checks.update(
-                worker_last_heartbeat=last, worker_recent=recent, worker_self_check_ok=healthy
+                worker_last_heartbeat=last.isoformat() if last else None,
+                worker_recent=recent,
+                worker_self_check_ok=healthy,
             )
             if row and not healthy:
                 problem = json.loads(row["checks_json"] or "{}")

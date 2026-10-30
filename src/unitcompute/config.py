@@ -48,10 +48,14 @@ class ConfigError(ValueError):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="UNITCOMPUTE_", extra="forbid", frozen=True)
+    model_config = SettingsConfigDict(
+        env_prefix="UNITCOMPUTE_", extra="forbid", frozen=True, hide_input_in_errors=True
+    )
 
     environment: Environment = Environment.DEVELOPMENT
     data_dir: Path = Path("data")
+    database_url: str = "postgresql://localhost/unitcompute"
+    database_schema: str = "public"
 
     auth_mode: AuthMode = AuthMode.DEV
     auth_issuer: str | None = None
@@ -186,10 +190,6 @@ class Settings(BaseSettings):
         if self.plan_role_arn and self.plan_role_arn == self.apply_role_arn:
             problems.append("plan_role_arn and apply_role_arn must be distinct roles")
         return problems
-
-    @cached_property
-    def database_path(self) -> Path:
-        return self.data_dir / "unitcompute.sqlite3"
 
     @cached_property
     def workdir_root(self) -> Path:

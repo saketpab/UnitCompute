@@ -55,6 +55,7 @@ class StrictRequest(BaseModel):
 
 
 class DeploymentRequest(StrictRequest):
+    chat_id: Annotated[str, StringConstraints(pattern=SESSION_ID_PATTERN)] | None = None
     name: DeploymentName = Field(description="3-32 chars: lowercase letters, digits, hyphens.")
     disk_gib: DiskGiB = Field(description="Encrypted gp3 root disk size in GiB (8-30).")
 
@@ -158,6 +159,7 @@ class DeploymentDetail(BaseModel):
 
 class DeploymentList(BaseModel):
     deployments: list[DeploymentDetail]
+    next_cursor: str | None = None
 
 
 class Proposal(BaseModel):
@@ -188,3 +190,18 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+class ChatTitle(StrictRequest):
+    title: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+
+
+class ProfileUpdate(StrictRequest):
+    name: Annotated[str, StringConstraints(min_length=1, max_length=200)] | None = None
+    email: (
+        Annotated[
+            str,
+            StringConstraints(min_length=3, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+        ]
+        | None
+    ) = None

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import psycopg
 import pytest
 
 from conftest import Harness, auth, create_and_plan
@@ -132,22 +132,24 @@ def test_concurrent_approvals_queue_one_apply(harness: Harness) -> None:
 def test_unique_index_backstops_quota(harness: Harness) -> None:
     """Even if the service check were bypassed, the database refuses a second live VM."""
     create_and_plan(harness)
-    with pytest.raises(sqlite3.IntegrityError), harness.db.transaction() as conn:
+    with pytest.raises(psycopg.IntegrityError), harness.db.transaction() as conn:
         conn.execute(
-            "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
-            "provisioner, status, created_at, updated_at) VALUES ('dep_x', 'dev:alice', 'b', "
-            "8, 'us-east-1', 't3.micro', 'simulated', 'planning', 'now', 'now')"
+            "INSERT INTO deployments (id, owner_id, name, disk_gib, regio"
+            "n, instance_type, provisioner, status, created_at, updated_a"
+            "t) VALUES ('dep_x', 'dev:alice', 'b', 8, 'us-east-1', 't3.mi"
+            "cro', 'simulated', 'planning', '2026-10-30T00:00:00Z', '2026"
+            "-10-30T00:00:00Z')"
         )
 
 
 def test_unique_active_job_per_deployment(harness: Harness) -> None:
     detail = create_and_plan(harness)
     rows = [(job, detail["id"], detail["current_plan"]["plan_id"]) for job in ("job_a", "job_b")]
-    with pytest.raises(sqlite3.IntegrityError), harness.db.transaction() as conn:
-        conn.executemany(
+    with pytest.raises(psycopg.IntegrityError), harness.db.transaction() as conn:
+        conn.cursor().executemany(
             "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
-            "payload_hash, created_at) VALUES (?, 'dev:alice', ?, ?, 'apply', 'queued', "
-            "'h', 'now')",
+            "payload_hash, created_at) VALUES (%s, 'dev:alice', %s, %s, 'apply', 'queued', "
+            "'h', '2026-10-30T00:00:00Z')",
             rows,
         )
 
@@ -156,8 +158,12 @@ def test_lock_contention_returns_retryable_503(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 50)
-    blocker = sqlite3.connect(harness.settings.database_path, isolation_level=None)
-    blocker.execute("BEGIN IMMEDIATE")
+    blocker = harness.db.connect()
+    blocker.execute("BEGIN")
+    blocker.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (harness.settings.database_schema + ":writes",),
+    )
     try:
         response = harness.client.post(
             "/deployments", json={"name": "demo", "disk_gib": 8}, headers=auth()

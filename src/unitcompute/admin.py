@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
 
     if args.command == "migrate":
         applied = db.migrate()
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             "SELECT d.id, d.status, d.status_reason, d.provisioner, d.updated_at, "
             "j.id AS job_id, j.kind, j.status AS job_status, j.error_code "
             "FROM deployments d LEFT JOIN jobs j ON j.id = ("
-            "  SELECT id FROM jobs WHERE deployment_id = d.id ORDER BY rowid DESC LIMIT 1) "
+            "  SELECT id FROM jobs WHERE deployment_id = d.id ORDER BY sequence DESC LIMIT 1) "
             "WHERE d.status = 'recovery_required' OR EXISTS (SELECT 1 FROM "
             "recovery_obligations o WHERE o.deployment_id = d.id AND o.discharged_at IS NULL "
             "AND o.evidence = 'uncaptured') ORDER BY d.updated_at"
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             known = IdentityLedger.known(conn, row["id"])
             obligations = conn.execute(
                 "SELECT job_id, plan_id, reason, evidence, created_at FROM recovery_obligations "
-                "WHERE deployment_id = ? AND discharged_at IS NULL ORDER BY id",
+                "WHERE deployment_id = %s AND discharged_at IS NULL ORDER BY id",
                 (row["id"],),
             ).fetchall()
         entry["open_recovery_obligations"] = [dict(o) for o in obligations]
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
                 {"type": r.resource_type, "id": r.resource_id, "state": r.state}
                 for r in provisioner.owned_resources(row["id"])
             ]
-        print(json.dumps(entry))
+        print(json.dumps(entry, default=str))
     return 0
 
 

@@ -7,6 +7,8 @@ exists only for local work and cannot be constructed outside development mode.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +30,14 @@ class Principal:
     """Stable owner ID: the verified token subject (``dev:<name>`` in development)."""
 
     auth_method: str
+    issuer: str = "unitcompute:development"
+
+    @property
+    def owner_id(self) -> str:
+        if self.auth_method == "dev":
+            return self.subject
+        identity = json.dumps([self.issuer, self.subject], separators=(",", ":"))
+        return "owner_" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 class Authenticator(Protocol):
@@ -98,7 +108,7 @@ class JwtAuthenticator:
                 groups = [groups]
             if not isinstance(groups, list) or self._group not in groups:
                 raise Forbidden("Your account is not a member of the UnitCompute team.")
-        return Principal(subject=subject, auth_method="jwt")
+        return Principal(subject=subject, auth_method="jwt", issuer=self._issuer)
 
 
 class DevAuthenticator:

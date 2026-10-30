@@ -16,7 +16,6 @@ import re
 import shutil
 import signal
 import socket
-import sqlite3
 import threading
 import time
 import uuid
@@ -28,7 +27,7 @@ from types import FrameType
 from typing import Any
 
 from unitcompute.config import ProvisionerKind, Settings, load_settings
-from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
+from unitcompute.db.database import Connection, Database, Row, from_db_time, to_db_time, utcnow
 from unitcompute.durable import ensure_directory
 from unitcompute.errors import ServiceUnavailable
 from unitcompute.identities import (
@@ -108,14 +107,14 @@ def planned_changes(preview_json: str | None) -> list[dict[str, Any]] | None:
     return changes
 
 
-def planned_creates(plan: sqlite3.Row) -> set[str] | None:
+def planned_creates(plan: Row) -> set[str] | None:
     changes = planned_changes(plan["preview_json"])
     if changes is None:
         return None
     return {str(c.get("address")) for c in changes if c["action"] != "delete"}
 
 
-def plan_launches_instance(plan: sqlite3.Row) -> bool:
+def plan_launches_instance(plan: Row) -> bool:
     """True when this plan itself creates the VM, so its outputs/state name the launch root."""
     return any(
         c.get("address") == "aws_instance.vm" and c["action"] == "create"
@@ -123,7 +122,7 @@ def plan_launches_instance(plan: sqlite3.Row) -> bool:
     )
 
 
-def plan_may_create(plan: sqlite3.Row) -> bool:
+def plan_may_create(plan: Row) -> bool:
     """False only when the recorded changes show the plan creates nothing (deletions only,
     or no changes at all). Unreadable or unknown changes count as creating."""
     creates = planned_creates(plan)
@@ -197,8 +196,12 @@ class Worker:
         now = to_db_time(self.clock())
         with self._tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO worker_heartbeats (worker_id, started_at, heartbeat_at, "
-                "healthy, checks_json) VALUES (?, ?, ?, 0, '{}')",
+                (
+                    "INSERT INTO worker_heartbeats (worker_id, started_at, heartbeat_at, "
+                    "healthy, checks_json) VALUES (%s, %s, %s, 0, '{}') ON CONFLICT (worker_id) "
+                    "DO UPDATE SET started_at=EXCLUDED.started_at, "
+                    "heartbeat_at=EXCLUDED.heartbeat_at, healthy=0, checks_json='{}'"
+                ),
                 (self.worker_id, now, now),
             )
         self._registered = True
@@ -223,8 +226,8 @@ class Worker:
             self.register()
         with self._tx() as conn:
             conn.execute(
-                "UPDATE worker_heartbeats SET healthy = ?, checks_json = ?, heartbeat_at = ? "
-                "WHERE worker_id = ?",
+                "UPDATE worker_heartbeats SET healthy = %s, checks_json = %s, heartbeat_at = %s "
+                "WHERE worker_id = %s",
                 (
                     int(self._healthy),
                     json.dumps(checks, default=str),
@@ -237,7 +240,7 @@ class Worker:
         return self._healthy
 
     @contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
+    def _tx(self) -> Iterator[Connection]:
         """Write transaction that retries lock acquisition before giving up."""
         delays = [*self.write_retry_delays, None]
         for delay in delays:
@@ -313,22 +316,23 @@ class Worker:
 
     # ----------------------------------------------------------------- jobs
 
-    def claim(self) -> sqlite3.Row | None:
+    def claim(self) -> Row | None:
         now = to_db_time(self.clock())
         with self._tx() as conn:
             job = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY rowid LIMIT 1"
+                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY sequence FOR "
+                "UPDATE SKIP LOCKED LIMIT 1"
             ).fetchone()
             if job is None:
                 return None
             conn.execute(
-                "UPDATE jobs SET status = 'running', worker_id = ?, started_at = ?, "
-                "heartbeat_at = ? WHERE id = ? AND status = 'queued'",
+                "UPDATE jobs SET status = 'running', worker_id = %s, started_at = %s, "
+                "heartbeat_at = %s WHERE id = %s AND status = 'queued'",
                 (self.worker_id, now, now, job["id"]),
             )
-            row: sqlite3.Row = conn.execute(
+            row = conn.execute(
                 "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
-                "ON plans.id = jobs.plan_id WHERE jobs.id = ?",
+                "ON plans.id = jobs.plan_id WHERE jobs.id = %s",
                 (job["id"],),
             ).fetchone()
             return row
@@ -372,9 +376,9 @@ class Worker:
                 is not None
             )
 
-    def _finish_crashed(self, job: sqlite3.Row) -> None:
+    def _finish_crashed(self, job: Row) -> None:
         with self.db.read() as conn:
-            current = conn.execute("SELECT status FROM jobs WHERE id = ?", (job["id"],)).fetchone()
+            current = conn.execute("SELECT status FROM jobs WHERE id = %s", (job["id"],)).fetchone()
         if current is None or current["status"] != "running":
             return
         if job["kind"] == "plan":
@@ -395,24 +399,26 @@ class Worker:
             try:
                 now = to_db_time(self.clock())
                 with self.db.transaction() as conn:
-                    conn.execute("UPDATE jobs SET heartbeat_at = ? WHERE id = ?", (now, job_id))
+                    conn.execute("UPDATE jobs SET heartbeat_at = %s WHERE id = %s", (now, job_id))
                     conn.execute(
-                        "UPDATE worker_heartbeats SET heartbeat_at = ? WHERE worker_id = ?",
+                        "UPDATE worker_heartbeats SET heartbeat_at = %s WHERE worker_id = %s",
                         (now, self.worker_id),
                     )
             except Exception:
                 log.warning("heartbeat update failed", exc_info=True)
 
-    def _load(self, job: sqlite3.Row) -> tuple[sqlite3.Row, sqlite3.Row]:
+    def _load(self, job: Row) -> tuple[Row, Row]:
         with self.db.read() as conn:
             deployment = conn.execute(
-                "SELECT * FROM deployments WHERE id = ?", (job["deployment_id"],)
+                "SELECT * FROM deployments WHERE id = %s", (job["deployment_id"],)
             ).fetchone()
-            plan = conn.execute("SELECT * FROM plans WHERE id = ?", (job["plan_id"],)).fetchone()
+            plan = conn.execute("SELECT * FROM plans WHERE id = %s", (job["plan_id"],)).fetchone()
+        if deployment is None or plan is None:
+            raise RuntimeError("job references missing deployment or plan")
         return deployment, plan
 
     @staticmethod
-    def _spec(deployment: sqlite3.Row) -> DeploymentSpec:
+    def _spec(deployment: Row) -> DeploymentSpec:
         return DeploymentSpec(
             deployment_id=deployment["id"],
             owner_tag=owner_tag(deployment["owner_id"]),
@@ -435,8 +441,8 @@ class Worker:
 
     def _finish_plan_failure(
         self,
-        conn: sqlite3.Connection,
-        job: sqlite3.Row,
+        conn: Connection,
+        job: Row,
         code: str,
         message: str,
         plan_status: str = "failed",
@@ -444,24 +450,24 @@ class Worker:
         now = to_db_time(self.clock())
         message = redact(message)[:2000]
         conn.execute(
-            "UPDATE jobs SET status = 'failed', finished_at = ?, error_code = ?, "
-            "error_message = ? WHERE id = ?",
+            "UPDATE jobs SET status = 'failed', finished_at = %s, error_code = %s, "
+            "error_message = %s WHERE id = %s",
             (now, code, message, job["id"]),
         )
         conn.execute(
-            "UPDATE plans SET status = ?, error_code = ?, error_message = ? "
-            "WHERE id = ? AND status IN ('pending', 'approved')",
+            "UPDATE plans SET status = %s, error_code = %s, error_message = %s "
+            "WHERE id = %s AND status IN ('pending', 'approved')",
             (plan_status, code, message, job["plan_id"]),
         )
         # A deployment whose last apply needs recovery stays recovery_required until a later
         # apply succeeds, so a failed repair preview cannot hide partial resources.
         unresolved = conn.execute(
-            "SELECT status FROM jobs WHERE deployment_id = ? AND kind = 'apply' "
-            "ORDER BY rowid DESC LIMIT 1",
+            "SELECT status FROM jobs WHERE deployment_id = %s AND kind = 'apply' "
+            "ORDER BY sequence DESC LIMIT 1",
             (job["deployment_id"],),
         ).fetchone()
         open_uncaptured = conn.execute(
-            "SELECT 1 FROM recovery_obligations WHERE deployment_id = ? "
+            "SELECT 1 FROM recovery_obligations WHERE deployment_id = %s "
             "AND discharged_at IS NULL AND evidence = 'uncaptured' LIMIT 1",
             (job["deployment_id"],),
         ).fetchone()
@@ -472,8 +478,8 @@ class Worker:
             else "plan_failed"
         )
         conn.execute(
-            "UPDATE deployments SET status = ?, status_reason = ?, updated_at = ? "
-            "WHERE id = ? AND current_plan_id = ?",
+            "UPDATE deployments SET status = %s, status_reason = %s, updated_at = %s "
+            "WHERE id = %s AND current_plan_id = %s",
             (status, message, now, job["deployment_id"], job["plan_id"]),
         )
         record_audit(
@@ -486,7 +492,7 @@ class Worker:
             detail={"code": code},
         )
 
-    def process_plan(self, job: sqlite3.Row) -> None:
+    def process_plan(self, job: Row) -> None:
         deployment, plan = self._load(job)
         kind: PlanKind = plan["kind"]
         try:
@@ -558,11 +564,11 @@ class Worker:
             if self.provisioner.kind == ProvisionerKind.SIMULATED:
                 warnings.append("SIMULATED: no AWS resources are created or deleted.")
             updated = conn.execute(
-                "UPDATE plans SET status = 'ready', plan_hash = ?, plan_path = ?, "
-                "preview_json = ?, cost_json = ?, template_hash = ?, terraform_version = ?, "
-                "provider_versions_json = ?, account_id = ?, ami_id = ?, ready_at = ?, "
-                "expires_at = ?, execution_hash = ?, prior_resource_ids_json = ? "
-                "WHERE id = ? AND status = 'pending'",
+                "UPDATE plans SET status = 'ready', plan_hash = %s, plan_path = %s, "
+                "preview_json = %s, cost_json = %s, template_hash = %s, terraform_version = %s, "
+                "provider_versions_json = %s, account_id = %s, ami_id = %s, ready_at = %s, "
+                "expires_at = %s, execution_hash = %s, prior_resource_ids_json = %s "
+                "WHERE id = %s AND status = 'pending'",
                 (
                     result.plan_hash,
                     str(result.plan_path),
@@ -587,13 +593,13 @@ class Worker:
                 return
             status = "awaiting_approval" if kind == "create" else "awaiting_deletion_approval"
             conn.execute(
-                "UPDATE deployments SET status = ?, status_reason = NULL, updated_at = ? "
-                "WHERE id = ? AND current_plan_id = ?",
+                "UPDATE deployments SET status = %s, status_reason = NULL, updated_at = %s "
+                "WHERE id = %s AND current_plan_id = %s",
                 (status, now, deployment["id"], plan["id"]),
             )
             conn.execute(
-                "UPDATE jobs SET status = 'succeeded', finished_at = ?, result_json = ? "
-                "WHERE id = ?",
+                "UPDATE jobs SET status = 'succeeded', finished_at = %s, result_json = %s "
+                "WHERE id = %s",
                 (
                     now,
                     json.dumps({"plan_id": plan["id"], "plan_hash": result.plan_hash}),
@@ -684,7 +690,7 @@ class Worker:
         merged = {r.resource_id: r for r in [*tagged, *live]}
         return list(merged.values())
 
-    def _precheck_apply(self, job: sqlite3.Row, deployment: sqlite3.Row, plan: sqlite3.Row) -> Path:
+    def _precheck_apply(self, job: Row, deployment: Row, plan: Row) -> Path:
         if (
             plan["status"] != "approved"
             or deployment["current_plan_id"] != plan["id"]
@@ -730,7 +736,7 @@ class Worker:
         self._require_no_uncaptured(deployment["id"])
         return plan_path
 
-    def _require_unexpired(self, plan: sqlite3.Row) -> None:
+    def _require_unexpired(self, plan: Row) -> None:
         if from_db_time(plan["expires_at"]) <= self.clock():
             raise JobFailure(
                 "plan_expired",
@@ -738,7 +744,7 @@ class Worker:
                 "request a fresh preview and approve it.",
             )
 
-    def process_apply(self, job: sqlite3.Row) -> None:
+    def process_apply(self, job: Row) -> None:
         deployment, plan = self._load(job)
         spec = self._spec(deployment)
         try:
@@ -749,7 +755,7 @@ class Worker:
                 self._require_unexpired(plan)
                 conn.execute(
                     "UPDATE deployments SET apply_attempted = 1, "
-                    "ami_id = COALESCE(?, ami_id), updated_at = ? WHERE id = ?",
+                    "ami_id = COALESCE(%s, ami_id), updated_at = %s WHERE id = %s",
                     (
                         plan["ami_id"] if plan["kind"] == "create" else None,
                         to_db_time(self.clock()),
@@ -828,10 +834,10 @@ class Worker:
             with self._tx() as conn:
                 conn.execute(
                     "UPDATE deployments SET status = 'active', status_reason = NULL, "
-                    "instance_id = ?, security_group_id = ?, "
-                    "root_volume_id = CASE WHEN ? THEN ? ELSE root_volume_id END, "
+                    "instance_id = %s, security_group_id = %s, "
+                    "root_volume_id = CASE WHEN %s <> 0 THEN %s ELSE root_volume_id END, "
                     "connection_ready = 0, ec2_status = NULL, ssm_ping_status = NULL, "
-                    "readiness_checked_at = NULL, updated_at = ? WHERE id = ?",
+                    "readiness_checked_at = NULL, updated_at = %s WHERE id = %s",
                     (
                         instance_id,
                         outcome.outputs.get("security_group_id"),
@@ -870,13 +876,13 @@ class Worker:
             conn.execute(
                 "UPDATE deployments SET status = 'deleted', status_reason = NULL, "
                 "connection_ready = 0, ssm_ping_status = NULL, ec2_status = NULL, "
-                "updated_at = ? WHERE id = ?",
+                "updated_at = %s WHERE id = %s",
                 (now, deployment["id"]),
             )
             self._finish_apply_success(conn, job, plan, result, "deployment.deleted")
 
     def _remaining_after_delete(
-        self, deployment: sqlite3.Row, plan: sqlite3.Row, inventory: list[OwnedResource]
+        self, deployment: Row, plan: Row, inventory: list[OwnedResource]
     ) -> list[str] | JobFailure:
         """Every identity ever recorded must be confirmed gone by direct lookup.
 
@@ -906,24 +912,27 @@ class Worker:
 
     def _finish_apply_success(
         self,
-        conn: sqlite3.Connection,
-        job: sqlite3.Row,
-        plan: sqlite3.Row,
+        conn: Connection,
+        job: Row,
+        plan: Row,
         result: dict[str, Any],
         action: str,
     ) -> None:
         now = to_db_time(self.clock())
-        conn.execute("UPDATE plans SET status = 'applied' WHERE id = ?", (plan["id"],))
+        conn.execute("UPDATE plans SET status = 'applied' WHERE id = %s", (plan["id"],))
         # A verified apply discharges obligations whose evidence was captured (and so was
         # reconciled by this plan). Uncaptured ones can never be discharged this way.
         conn.execute(
-            "UPDATE recovery_obligations SET discharged_at = ?, discharged_by_job_id = ? "
-            "WHERE deployment_id = ? AND discharged_at IS NULL "
+            "UPDATE recovery_obligations SET discharged_at = %s, discharged_by_job_id = %s "
+            "WHERE deployment_id = %s AND discharged_at IS NULL "
             "AND evidence IN ('captured', 'not_needed')",
             (now, job["id"], job["deployment_id"]),
         )
         conn.execute(
-            "UPDATE jobs SET status = 'succeeded', finished_at = ?, result_json = ? WHERE id = ?",
+            (
+                "UPDATE jobs SET status = 'succeeded', finished_at = %s, "
+                "result_json = %s WHERE id = %s"
+            ),
             (now, json.dumps(result), job["id"]),
         )
         record_audit(
@@ -935,7 +944,7 @@ class Worker:
             job_id=job["id"],
         )
 
-    def _capture_apply_evidence(self, job: sqlite3.Row, *, immediate: bool) -> str:
+    def _capture_apply_evidence(self, job: Row, *, immediate: bool) -> str:
         """Establish what a failed apply did. Returns the obligation's evidence state.
 
         Accepted evidence is a validated raw state bound to this apply's saved plan (see
@@ -988,7 +997,7 @@ class Worker:
         return "captured"
 
     def _bind_evidence(
-        self, plan: sqlite3.Row, workdir: Path, document: object, *, require_all_creates: bool
+        self, plan: Row, workdir: Path, document: object, *, require_all_creates: bool
     ) -> AppliedState:
         creates = planned_creates(plan)
         if creates is None:
@@ -1008,11 +1017,11 @@ class Worker:
             require_all_creates=require_all_creates,
         )
 
-    def _is_latest_apply(self, job: sqlite3.Row) -> bool:
+    def _is_latest_apply(self, job: Row) -> bool:
         with self.db.read() as conn:
             row = conn.execute(
-                "SELECT id FROM jobs WHERE deployment_id = ? AND kind = 'apply' "
-                "ORDER BY rowid DESC LIMIT 1",
+                "SELECT id FROM jobs WHERE deployment_id = %s AND kind = 'apply' "
+                "ORDER BY sequence DESC LIMIT 1",
                 (job["deployment_id"],),
             ).fetchone()
         return row is not None and row["id"] == job["id"]
@@ -1029,7 +1038,7 @@ class Worker:
             if (
                 job_id is None
                 and conn.execute(
-                    "SELECT 1 FROM recovery_obligations WHERE deployment_id = ? AND reason = ? "
+                    "SELECT 1 FROM recovery_obligations WHERE deployment_id = %s AND reason = %s "
                     "AND discharged_at IS NULL",
                     (deployment_id, reason),
                 ).fetchone()
@@ -1037,7 +1046,7 @@ class Worker:
                 return
             conn.execute(
                 "INSERT INTO recovery_obligations (deployment_id, job_id, plan_id, reason, "
-                "evidence, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "evidence, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
                 (deployment_id, job_id, plan_id, reason, evidence, to_db_time(self.clock())),
             )
 
@@ -1051,11 +1060,11 @@ class Worker:
                 "support decision.",
             )
 
-    def _uncaptured_obligations(self, deployment_id: str) -> list[sqlite3.Row]:
+    def _uncaptured_obligations(self, deployment_id: str) -> list[Row]:
         with self.db.read() as conn:
             return list(
                 conn.execute(
-                    "SELECT * FROM recovery_obligations WHERE deployment_id = ? "
+                    "SELECT * FROM recovery_obligations WHERE deployment_id = %s "
                     "AND discharged_at IS NULL AND evidence = 'uncaptured' ORDER BY id",
                     (deployment_id,),
                 ).fetchall()
@@ -1069,7 +1078,7 @@ class Worker:
             with self.db.read() as conn:
                 job = conn.execute(
                     "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
-                    "ON plans.id = jobs.plan_id WHERE jobs.id = ?",
+                    "ON plans.id = jobs.plan_id WHERE jobs.id = %s",
                     (obligation["job_id"],),
                 ).fetchone()
             if job is None:
@@ -1079,12 +1088,12 @@ class Worker:
                 continue
             with self._tx() as conn:
                 conn.execute(
-                    "UPDATE recovery_obligations SET evidence = ? WHERE id = ?",
+                    "UPDATE recovery_obligations SET evidence = %s WHERE id = %s",
                     (evidence, obligation["id"]),
                 )
 
     def _recovery_required(
-        self, job: sqlite3.Row, code: str, message: str, *, immediate: bool = True
+        self, job: Row, code: str, message: str, *, immediate: bool = True
     ) -> None:
         """``immediate``: called right after this worker ran the apply, so stored state can
         still be attributed to it. False after a crash or restart."""
@@ -1102,18 +1111,18 @@ class Worker:
         )
         with self._tx() as conn:
             conn.execute(
-                "UPDATE jobs SET status = 'recovery_required', finished_at = ?, error_code = ?, "
-                "error_message = ? WHERE id = ?",
+                "UPDATE jobs SET status = 'recovery_required', finished_at = %s, error_code = %s, "
+                "error_message = %s WHERE id = %s",
                 (now, code, message, job["id"]),
             )
             conn.execute(
-                "UPDATE plans SET status = 'apply_failed', error_code = ?, "
-                "error_message = ? WHERE id = ?",
+                "UPDATE plans SET status = 'apply_failed', error_code = %s, "
+                "error_message = %s WHERE id = %s",
                 (code, message, job["plan_id"]),
             )
             conn.execute(
-                "UPDATE deployments SET status = 'recovery_required', status_reason = ?, "
-                "updated_at = ? WHERE id = ?",
+                "UPDATE deployments SET status = 'recovery_required', status_reason = %s, "
+                "updated_at = %s WHERE id = %s",
                 (reason, now, job["deployment_id"]),
             )
             record_audit(
@@ -1139,9 +1148,9 @@ class Worker:
                 readiness = Readiness(ec2_status=None, ssm_status=None)
             with self._tx() as conn:
                 conn.execute(
-                    "UPDATE deployments SET ec2_status = ?, ssm_ping_status = ?, "
-                    "connection_ready = ?, readiness_checked_at = ? "
-                    "WHERE id = ? AND instance_id = ? AND status <> 'deleted'",
+                    "UPDATE deployments SET ec2_status = %s, ssm_ping_status = %s, "
+                    "connection_ready = %s, readiness_checked_at = %s "
+                    "WHERE id = %s AND instance_id = %s AND status <> 'deleted'",
                     (
                         readiness.ec2_status,
                         readiness.ssm_status,
@@ -1165,7 +1174,7 @@ class Worker:
                 # never freezes a stale readiness answer.
                 "SELECT id, instance_id FROM deployments WHERE status <> 'deleted' "
                 "AND instance_id IS NOT NULL AND (readiness_checked_at IS NULL "
-                "OR readiness_checked_at <= ?) ORDER BY readiness_checked_at LIMIT ?",
+                "OR readiness_checked_at <= %s) ORDER BY readiness_checked_at LIMIT %s",
                 (cutoff, limit),
             ).fetchall()
         for row in rows:
@@ -1179,11 +1188,11 @@ class Worker:
         now = to_db_time(now_dt)
         with self._tx() as conn:
             conn.execute(
-                "UPDATE plans SET status = 'expired' WHERE status = 'ready' AND expires_at <= ?",
+                "UPDATE plans SET status = 'expired' WHERE status = 'ready' AND expires_at <= %s",
                 (now,),
             )
             conn.execute(
-                "UPDATE worker_heartbeats SET heartbeat_at = ? WHERE worker_id = ?",
+                "UPDATE worker_heartbeats SET heartbeat_at = %s WHERE worker_id = %s",
                 (now, self.worker_id),
             )
         if self._self_check_due():
@@ -1196,7 +1205,7 @@ class Worker:
             # (Terraform writes errored.tfstate there if the backend write fails). Keep it
             # while any obligation for that apply is open, whatever happened since.
             rows = conn.execute(
-                "SELECT plans.id, plans.deployment_id FROM plans WHERE plans.created_at < ? AND ("
+                "SELECT plans.id, plans.deployment_id FROM plans WHERE plans.created_at < %s AND ("
                 "plans.status IN ('superseded', 'expired', 'rejected', 'failed', 'applied') "
                 "OR (plans.status = 'apply_failed' "
                 "  AND EXISTS (SELECT 1 FROM recovery_obligations o WHERE o.plan_id = plans.id) "
@@ -1214,8 +1223,28 @@ def main() -> None:
     secure_process_defaults()
     configure_logging()
     settings = load_settings()
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     db.require_current_schema()
+    # The inherited local flock remains the orphan-recovery proof. Pin this database to
+    # that host and durable directory so a second host cannot recover live work merely
+    # because it can reach PostgreSQL. Moving storage requires an explicit operator action.
+    with db.transaction() as conn:
+        conn.execute(
+            (
+                "INSERT INTO worker_storage_binding (hostname,workdir_root) "
+                "VALUES (%s,%s) ON CONFLICT DO NOTHING"
+            ),
+            (socket.gethostname(), str(settings.workdir_root.resolve())),
+        )
+        binding = conn.execute(
+            "SELECT hostname,workdir_root FROM worker_storage_binding"
+        ).fetchone()
+        if (
+            binding is None
+            or binding["hostname"] != socket.gethostname()
+            or binding["workdir_root"] != str(settings.workdir_root.resolve())
+        ):
+            raise SystemExit("database is bound to another worker storage location")
     lock = WorkerLock(settings.worker_lock_path)
     fd = lock.acquire()
     provisioner = build_provisioner(settings, inherit_fds=(fd,))

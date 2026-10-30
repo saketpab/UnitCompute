@@ -250,7 +250,7 @@ def test_workdirs_are_private(harness: Harness) -> None:
     workdir = h.settings.workdir_root / d["id"] / d["current_plan"]["plan_id"]
     assert workdir.stat().st_mode & 0o077 == 0
     assert (workdir / "tfplan").stat().st_mode & 0o277 == 0
-    assert h.settings.database_path.stat().st_mode & 0o077 == 0
+    assert h.db.schema_version() is not None  # PostgreSQL storage is server-owned.
 
 
 def test_single_worker_lock(tmp_path: Path) -> None:

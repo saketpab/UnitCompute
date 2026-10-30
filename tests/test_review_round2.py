@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 import jwt
+import psycopg
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -458,11 +458,15 @@ def _strand_reservation(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reviewer reproduction: cancellation while the database is locked."""
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 20)
     monkeypatch.setattr("unitcompute.agent.service.MARK_FAILED_RETRY_DELAYS", (0.01,))
-    blocker = sqlite3.connect(h.settings.database_path, isolation_level=None)
+    blocker = h.db.connect()
 
     class Interrupted(AgentService):
         async def _run(self, *args: Any) -> Any:
-            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("BEGIN")
+            blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (h.settings.database_schema + ":writes",),
+            )
             raise asyncio.CancelledError
 
     service = Interrupted(h.settings, h.db, h.container.deployments, ScriptedChatModel)
@@ -511,13 +515,15 @@ def test_r2_4_failure_marking_retries_through_contention(
     import threading
 
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 20)
-    blocker = sqlite3.connect(
-        harness.settings.database_path, isolation_level=None, check_same_thread=False
-    )
+    blocker = harness.db.connect()
 
     class Interrupted(AgentService):
         async def _run(self, *args: Any) -> Any:
-            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("BEGIN")
+            blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (harness.settings.database_schema + ":writes",),
+            )
             threading.Timer(0.1, lambda: blocker.execute("ROLLBACK")).start()
             raise asyncio.CancelledError
 
@@ -544,7 +550,7 @@ def test_r2_1_known_live_vm_blocks_second_vm(harness: Harness, moto_env: Any) ->
         "InstanceId"
     ]
     with h.db.transaction() as conn:
-        conn.execute("UPDATE deployments SET instance_id = ? WHERE id = ?", (old, d["id"]))
+        conn.execute("UPDATE deployments SET instance_id = %s WHERE id = %s", (old, d["id"]))
     h.provisioner._state_path(d["id"]).unlink()  # state lost; the VM has no tag
     launched: list[str] = []
 
@@ -572,7 +578,7 @@ def test_r2_1_identity_history_survives_replacement(harness: Harness) -> None:
     first_instance = d["resources"]["instance_id"]
     with harness.db.transaction() as conn:
         conn.execute(
-            "UPDATE deployments SET instance_id = 'i-0fffffffffffffff0' WHERE id = ?", (d["id"],)
+            "UPDATE deployments SET instance_id = 'i-0fffffffffffffff0' WHERE id = %s", (d["id"],)
         )
     with harness.db.transaction() as conn:
         known = IdentityLedger(harness.settings.workdir_root)
@@ -585,8 +591,11 @@ def test_r2_1_identity_rows_are_append_only(harness: Harness) -> None:
     d = launch(harness)
     with harness.db.transaction() as conn:
         conn.execute(
-            "INSERT INTO identity_acknowledgements (deployment_id, instance_id, operator, "
-            "reason, recorded_at) VALUES (?, 'i-0123456789', 'ops', 'test', 'now')",
+            (
+                "INSERT INTO identity_acknowledgements (deployment_id, instan"
+                "ce_id, operator, reason, recorded_at) VALUES (%s, 'i-0123456"
+                "789', 'ops', 'test', '2026-10-30T00:00:00Z')"
+            ),
             (d["id"],),
         )
     for statement in (
@@ -597,7 +606,7 @@ def test_r2_1_identity_rows_are_append_only(harness: Harness) -> None:
     ):
         conn = harness.db.connect()
         try:
-            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            with pytest.raises(psycopg.IntegrityError, match="append-only"):
                 conn.execute(statement)
         finally:
             conn.close()
@@ -628,7 +637,7 @@ def test_r2_2_apply_outputs_persist_when_inventory_fails(harness: Harness, moto_
         ids = [
             r[0]
             for r in conn.execute(
-                "SELECT resource_id FROM deployment_resources WHERE deployment_id = ?", (d["id"],)
+                "SELECT resource_id FROM deployment_resources WHERE deployment_id = %s", (d["id"],)
             )
         ]
     assert iid in ids
@@ -646,12 +655,16 @@ def test_r2_2_evidence_file_survives_database_contention(
     d = create_and_plan(h)
     approve_current(h, d)
     monkeypatch.setattr(database, "BUSY_TIMEOUT_MS", 20)
-    blocker = sqlite3.connect(h.settings.database_path, isolation_level=None)
+    blocker = h.db.connect()
 
     class LockedAfterApply(SimulatedProvisioner):
         def apply(self, *args: Any) -> ApplyResult:
             result = super().apply(*args)
-            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("BEGIN")
+            blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (h.settings.database_schema + ":writes",),
+            )
             return result
 
     worker = Worker(h.settings, h.db, LockedAfterApply(h.settings.data_dir), clock=h.clock)
@@ -671,7 +684,7 @@ def test_r2_2_evidence_file_survives_database_contention(
         ids = {
             r[0]
             for r in conn.execute(
-                "SELECT resource_id FROM deployment_resources WHERE deployment_id = ?", (d["id"],)
+                "SELECT resource_id FROM deployment_resources WHERE deployment_id = %s", (d["id"],)
             )
         }
     assert recorded <= ids
@@ -685,7 +698,7 @@ def _schema_v1_deployment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, iid: str, volume: str | None = None
 ) -> tuple[Any, Database, str]:
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:1])
@@ -696,14 +709,14 @@ def _schema_v1_deployment(
         conn.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
             "provisioner, status, instance_id, apply_attempted, created_at, updated_at) VALUES "
-            "(?, 'dev:alice', 'demo', 8, 'us-east-1', 't3.micro', 'simulated', 'active', ?, 1, "
-            "?, ?)",
+            "(%s, 'dev:alice', 'demo', 8, 'us-east-1', 't3.micro', 'simulated', 'active', %s, 1, "
+            "%s, %s)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4, 5, 6, 7]
+    assert db.migrate() == [2, 3, 4, 5, 6, 7, 8]
     if volume:
         with db.transaction() as conn:
-            conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
+            conn.execute("UPDATE deployments SET root_volume_id = %s WHERE id = %s", (volume, dep))
     return settings, db, dep
 
 
@@ -711,7 +724,7 @@ def test_r2_3_migration_backfills_known_identities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = make_settings(tmp_path)
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     migrations = database._migration_files()
     with monkeypatch.context() as m:
         m.setattr(database, "_migration_files", lambda: migrations[:2])
@@ -721,19 +734,19 @@ def test_r2_3_migration_backfills_known_identities(
         conn.execute(
             "INSERT INTO deployments (id, owner_id, name, disk_gib, region, instance_type, "
             "provisioner, status, instance_id, security_group_id, root_volume_id, created_at, "
-            "updated_at) VALUES (?, 'dev:a', 'demo', 8, 'us-east-1', 't3.micro', 'simulated', "
+            "updated_at) VALUES (%s, 'dev:a', 'demo', 8, 'us-east-1', 't3.micro', 'simulated', "
             "'active', 'i-0aaaaaaaaaaaaaaa1', 'sg-0aaaaaaaaaaaaaaa1', 'vol-0aaaaaaaaaaaaaaa1', "
-            "?, ?)",
+            "%s, %s)",
             (dep, now, now),
         )
         conn.execute(
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
             "config_hash, region, state_key, template_version, created_at, "
-            "prior_resource_ids_json) VALUES ('plan_x', ?, 'dev:a', 'create', 'applied', "
-            "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
+            "prior_resource_ids_json) VALUES ('plan_x', %s, 'dev:a', 'create', 'applied', "
+            "'simulated', 'h', 'us-east-1', 'k', 'v', %s, %s)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4, 5, 6, 7]
+    assert db.migrate() == [3, 4, 5, 6, 7, 8]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}
@@ -756,7 +769,7 @@ def _restore_terraform_state(h: Any, dep: str, instance_id: str, volume_id: str)
     """Model an operator restoring the deployment's Terraform state from the versioned state
     bucket (or the retained errored.tfstate): the recoverable launch-root evidence."""
     with h.db.read() as conn:
-        row = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep,)).fetchone()
+        row = conn.execute("SELECT * FROM deployments WHERE id = %s", (dep,)).fetchone()
     provisioner = SimulatedProvisioner(h.settings.data_dir)
     state = provisioner._desired(Worker._spec(row), "ami-0123456789abcdef0")
     state["aws_instance.vm"]["id"] = instance_id

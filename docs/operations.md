@@ -15,9 +15,11 @@ Run three things on one persistent host:
 | Worker | `unitcompute-worker` | Exactly one per data directory, enforced by an exclusive `flock` on `data/worker.lock` that every Terraform child inherits. Stop it with SIGTERM and allow it to finish the current job; an apply can take up to `UNITCOMPUTE_APPLY_TIMEOUT_SECONDS`. |
 
 Both the API and the worker read and write `UNITCOMPUTE_DATA_DIR`, which must be on durable
-local storage (not tmpfs, not a network filesystem). It holds the SQLite database (WAL
-mode), per-plan Terraform work directories and logs. Everything is created with owner-only
-permissions. Back it up with `sqlite3 data/unitcompute.sqlite3 ".backup <file>"`.
+local storage (not tmpfs, not a network filesystem). It holds append-only identity evidence,
+per-plan Terraform work directories and logs, created with owner-only permissions.
+Application data lives exclusively in PostgreSQL, configured by `UNITCOMPUTE_DATABASE_URL`
+and optional `UNITCOMPUTE_DATABASE_SCHEMA` (default `public`). Back up PostgreSQL using
+its native backup tooling and retain matching local recovery artifacts separately.
 Terraform state is not stored here; it lives in S3.
 
 ### Worker self-check and readiness
@@ -37,6 +39,28 @@ schema is current and, whenever provisioning is enabled, the newest worker heart
 younger than `UNITCOMPUTE_WORKER_STALE_SECONDS` (default 120) and its self-check passed. The
 failing check's code is included in the response. Only the last four digits of the account
 are reported.
+
+### PostgreSQL transactions and recovery
+
+PostgreSQL 15 or later is required in development, CI and production. There is no SQLite
+runtime. Run `unitcompute-admin migrate` explicitly before starting the application.
+Migrations commit atomically under a schema-specific advisory lock and record their engine
+and SHA-256 checksums. Rewriting an applied migration is rejected.
+
+API deployment/chat mutations take a shared transaction advisory gate plus an exclusive
+owner lock. Different owners can proceed concurrently. Unscoped worker/recovery writes
+exclusively lock that gate, preserving cross-row safety decisions without holding a SQL
+transaction during Terraform, AWS or model calls. Unique indexes backstop owner quota,
+one active job and idempotency. Lock acquisition is bounded to five seconds; contention
+returns `503 database_busy`. Only a rolled-back database operation may be retried. An
+uncertain cloud dispatch or commit is inspected by durable identity rather than replayed.
+
+The worker remains a singleton. Its inherited local `flock` proves that earlier Terraform
+children have stopped. PostgreSQL records the worker host and resolved work directory;
+a different host/directory is refused. Moving that binding requires an explicit operator
+recovery decision after proving all writers and children stopped and restoring artifacts.
+Heartbeat expiry alone does not authorize takeover. Multiple API processes are supported;
+multiple provisioning workers/hosts are not enabled by switching to PostgreSQL.
 
 ### Database contention
 
@@ -332,3 +356,31 @@ run this once against the real bootstrap. No such run has been recorded yet.
 5. Confirm no instance, volume or security group tagged with the deployment ID remains, that
    the bootstrap network, roles and bucket are unchanged, and that the state object and
    audit trail remain.
+
+## Offline SQLite import
+
+For an existing schema-v7 database, stop all API/worker writers and preserve a backup plus
+its work/evidence directory. Create and migrate a new empty PostgreSQL schema. Then run:
+
+```sh
+uv run python -m unitcompute.db.import_sqlite /absolute/path/to/snapshot.sqlite3 --issuer https://verified-original-issuer.example/
+```
+
+The importer opens the snapshot read-only, checks integrity, schema version, tables and
+columns, and rejects unknown, invalid or recognizably unredacted sensitive data. Non-development ownership is remapped from
+subject to issuer+subject while prefixed API IDs, historical actors and all stored hashes
+are retained. Source timestamps must include timezone information. Every row and the
+source fingerprint receipt commit together; retrying the same snapshot returns that
+receipt, while a different snapshot or nonempty target is refused. Sequence values retain
+source ordering. The receipt does not substitute for backing up/restoring recovery files.
+Verify imported counts, identity history, obligations, approval binding and readiness before
+cutover; keep the old backup for rollback. Older snapshots must first be upgraded with the
+original release's offline migrations. No runtime fallback or dual-write is provided.
+
+Resource UUIDs coexist with legacy deployment/chat aliases. User identity is issuer+subject,
+never email. Resource/chat/user links enforce ownership through composite foreign keys.
+Resource rows and append-only evidence cannot be deleted through cascading product cleanup.
+Provider settings use bounded JSONB with version/kind/key/type checks; credentials, raw
+Terraform plans and state do not belong there. Azure/GCP fixtures describe records only;
+AWS remains the active backend. Planned lifecycle operation names reserve schema room for
+edit, stop/start, delete and cleanup; they do not implement those execution paths.
