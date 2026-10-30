@@ -15,7 +15,7 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
 | Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7 on `5756293`: **not clean**. Round 8 on `256356c`: **not clean**. Round 9: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). `5756293`: passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)). `256356c`: passed ([run 41106001355](https://github.com/saketpab/UnitCompute/actions/runs/41106001355)). Round-8 fix commit: see below |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). `5756293`: passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)). `256356c`: passed ([run 41106001355](https://github.com/saketpab/UnitCompute/actions/runs/41106001355)). `4f601ee`: passed ([run 41133967493](https://github.com/saketpab/UnitCompute/actions/runs/41133967493)). Lifecycle extension: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -589,7 +589,7 @@ the intended outcome), and `delay=0` still dispatches.
 The second plan-time recheck (after reconciliation) stays own-deployment only: it exists for
 obligations that reconciliation itself opens, which are the deployment's own.
 
-## Round 8 fix commit (parent `256356c`)
+## Round 8 fix commit: `4f601eee7ac0c3b6f7f61ba1315446d4ca3b272c` (parent `256356c`)
 
 | Check | Result |
 |---|---|
@@ -606,3 +606,38 @@ one about expiry). The dispatch check runs in the provisioner immediately before
 not controllable from Python. A different `Provisioner` implementation must call
 `check_dispatch()` at its own spawn boundary; the worker's checks before it remain as the
 backstop. Live AWS behaviour, including real STS latency, remains part of the blocked live gate.
+
+## Lifecycle extension (after the round-8 safety candidate `4f601ee`)
+
+Added on top of the frozen safety candidate, by native Claude Sonnet 5.5 (high): a validated
+configurable region; inspect/edit (name, larger disk); stop/start; and the read-only
+`orphan-report`. Architecture, boundaries and the PostgreSQL compatibility contract are in
+`docs/lifecycle-architecture.md`. Nothing here has been reviewed independently yet and none of
+it has run against AWS.
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check`, `uv sync --locked` | passed |
+| `pytest` with offline Terraform tests required | 595 passed |
+| `scripts/check_guards.py --verbose` | 193/193 mutants killed for the intended reason (154 earlier, all retained, plus 39 new). Four earlier mutants were retargeted because the code moved; three new ones first survived or were killed for the wrong reason and were fixed (redundant coverage of the power-state ownership and `force` checks; a test that indexed a missing error) |
+| Real Terraform 1.17.1 / provider 6.71.0, offline | create plan (three resources) and update plans for rename, grow, stop, start and all three at once pass the policy; a disk shrink is planned as an ordinary in-place update by Terraform and is stopped only by the policy; `terraform test` with the mocked provider covers region format and power state; the static fixtures are regenerated and compared to the pinned Terraform's output on every run |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–8) and an upgrade of a schema-7 data dir (`applied: [8]`): the client walkthrough (create, rename and grow, stop, start, delete) exited 0, `update-plan` with a `region` field returned 422, `orphan-report` was empty, a second worker was refused and the worker stopped on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff |
+
+What the lifecycle guarantees offline, and how it is proven: edit/stop/start use the same
+exact-plan approval, fresh dispatch-time expiry, owner-wide recovery rule and evidence capture
+as create (`tests/test_lifecycle_ops.py`, one test per guarantee, plus mutants); the policy
+refuses replacement, shrinking, forced power changes and any other attribute change
+(`tests/test_policy_updates.py`); the worker reads EC2 back before recording an edit; the IAM
+documents and session policy grant exactly the needed extra actions, scoped to the
+deployment's own tagged resources and, for renames, to the `Name` tag only
+(`tests/test_region_and_iam.py`).
+
+Residual limits, specific to this extension: nothing about `aws_ec2_instance_state`,
+`ModifyVolume`, tag edits or the packed session policy has been exercised on AWS; the
+`ForAllValues:StringEquals aws:TagKeys` rename rule is evaluated by an offline model of IAM
+only; a failed pure power change may show an instance "update" that the provider computes
+(not listed, but validated); disks cannot shrink and the filesystem may need extending inside
+the VM; the orphan report only finds resources that carry the `ManagedBy` tag. Live
+create/inspect/edit/stop/start/delete/orphan-cleanup verification is a separate approval gate.

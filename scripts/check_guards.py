@@ -715,7 +715,7 @@ MUTATIONS = [
         "r3-1-template-tag-on-create",
         (
             (
-                "provisioning/templates/ec2_vm_v1/main.tf",
+                "provisioning/templates/ec2_vm_v2/main.tf",
                 '  volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })\n',
                 "",
             ),
@@ -781,8 +781,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '            "recovery_required"\n            if open_uncaptured',
-                '            "plan_failed"\n            if open_uncaptured',
+                '            status = "recovery_required"\n        elif edited_vm is not None:',
+                '            status = "plan_failed"\n        elif edited_vm is not None:',
             ),
         ),
         ("tests/test_worker_recovery.py::test_failed_repair_preview_keeps_recovery_status",),
@@ -920,8 +920,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                "            if open_uncaptured is not None\n            or (unresolved",
-                "            if (unresolved",
+                '        if open_uncaptured is not None or (\n            unresolved is not None and unresolved["status"] == "recovery_required"\n        ):',
+                '        if (\n            unresolved is not None and unresolved["status"] == "recovery_required"\n        ):',
             ),
         ),
         ("tests/test_review_round6.py::test_r6_3_corruption_found_while_planning_stops_that_plan",),
@@ -999,7 +999,7 @@ MUTATIONS = [
         (
             (
                 "provisioning/state_evidence.py",
-                "if resource_id in prior_ids:",
+                "if resource_id in prior_ids and address != INSTANCE_STATE:",
                 "if False:",
             ),
         ),
@@ -1643,6 +1643,484 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "r9-no-replacement",
+        (
+            (
+                "provisioning/policy.py",
+                '    "create": {("create",), ("no-op",), ("update",)},',
+                '    "create": {("create",), ("no-op",), ("update",), ("delete", "create")},',
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_update_policy_rejects_mutation",),
+    ),
+    Mutation(
+        "r9-update-instance-keys",
+        (
+            (
+                "provisioning/policy.py",
+                "        extra = sorted(changed - INSTANCE_UPDATE_CHANGES)\n",
+                "        extra: list[str] = []\n",
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_update_policy_rejects_mutation",),
+    ),
+    Mutation(
+        "r9-update-unknown-keys",
+        (
+            (
+                "provisioning/policy.py",
+                "        unexpected = sorted(unknown_keys - INSTANCE_UPDATE_UNKNOWN)\n",
+                "        unexpected: list[str] = []\n",
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_update_policy_rejects_mutation",),
+    ),
+    Mutation(
+        "r9-update-instance-shape",
+        (
+            (
+                "provisioning/policy.py",
+                "        v.extend(_check_instance(after, spec, targets, ami_id, unknown))\n",
+                "        pass\n",
+            ),
+        ),
+        (
+            "tests/test_policy_updates.py::test_update_policy_rejects_mutation",
+            "tests/test_policy_updates.py::test_the_plan_must_match_the_request_it_was_made_for",
+        ),
+    ),
+    Mutation(
+        "r9-disk-grow-only",
+        (
+            (
+                "provisioning/policy.py",
+                "isinstance(size, int) and isinstance(old_size, int) and size >= old_size,",
+                "True,",
+            ),
+        ),
+        (
+            "tests/test_policy_updates.py::test_update_policy_rejects_mutation",
+            "tests/test_policy_updates.py::test_real_terraform_plans_a_disk_shrink_as_an_update_and_only_the_policy_stops_it",
+        ),
+    ),
+    Mutation(
+        "r9-update-sg-keys",
+        (
+            (
+                "provisioning/policy.py",
+                "        extra = sorted(changed - SECURITY_GROUP_UPDATE_CHANGES)\n",
+                "        extra: list[str] = []\n",
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_update_policy_rejects_mutation",),
+    ),
+    Mutation(
+        "r9-power-targets-own-instance",
+        (
+            (
+                "provisioning/policy.py",
+                'return instance_id is not None and values.get("instance_id") == instance_id',
+                "return True",
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_update_policy_rejects_mutation",),
+    ),
+    Mutation(
+        "r9-power-never-forced",
+        (
+            (
+                "provisioning/policy.py",
+                'values.get("force") in (None, False)',
+                "True",
+            ),
+        ),
+        (
+            "tests/test_policy_updates.py::test_a_forced_power_change_is_refused_when_the_resource_is_created_or_kept",
+        ),
+    ),
+    Mutation(
+        "r9-power-matches-request",
+        (
+            (
+                "provisioning/policy.py",
+                '        values.get("state") == spec.power_state,\n',
+                '        values.get("state") in POWER_STATES,\n',
+            ),
+        ),
+        (
+            "tests/test_policy_updates.py::test_the_plan_must_match_the_request_it_was_made_for",
+            "tests/test_policy_updates.py::test_a_create_plan_may_not_set_a_power_state_other_than_requested",
+        ),
+    ),
+    Mutation(
+        "r9-power-variable-checked",
+        (
+            (
+                "provisioning/policy.py",
+                '        "power_state": spec.power_state,\n        "vpc_id": targets.vpc_id,',
+                '        "vpc_id": targets.vpc_id,',
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_power_state_variable_is_checked",),
+    ),
+    Mutation(
+        "r9-invisible-updates-hidden",
+        (
+            (
+                "provisioning/policy.py",
+                'invisible = actions == ("update",) and not _diff(address, before, after)',
+                "invisible = False",
+            ),
+        ),
+        ("tests/test_policy_updates.py::test_real_terraform_plans_start_after_stop",),
+    ),
+    Mutation(
+        "r9-empty-edit-rejected",
+        (
+            (
+                "worker.py",
+                "        if edit_request(plan) and policy.allowed and not policy.changes:",
+                "        if False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_an_edit_that_changes_nothing_is_rejected_by_the_worker",
+        ),
+    ),
+    Mutation(
+        "r9-disk-shrink-refused",
+        (
+            (
+                "services/deployments.py",
+                'if request.disk_gib is not None and request.disk_gib < deployment["disk_gib"]:',
+                "if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_the_disk_can_only_grow_and_a_noop_is_refused",),
+    ),
+    Mutation(
+        "r9-noop-edit-refused",
+        (
+            (
+                "services/deployments.py",
+                "            if unchanged:",
+                "            if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_the_disk_can_only_grow_and_a_noop_is_refused",),
+    ),
+    Mutation(
+        "r9-edit-needs-a-vm",
+        (
+            (
+                "services/deployments.py",
+                '            if not deployment["instance_id"]:',
+                "            if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_an_edit_needs_an_existing_vm_and_an_owner",),
+    ),
+    Mutation(
+        "r9-edit-state-gate",
+        (
+            (
+                "services/deployments.py",
+                'if deployment["status"] not in PLANNABLE["create"] - {"awaiting_deletion_approval"}:',
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_an_edit_cannot_be_requested_while_a_deletion_is_in_progress",
+        ),
+    ),
+    Mutation(
+        "r9-edit-request-nonempty",
+        (
+            (
+                "schemas.py",
+                "if self.name is None and self.disk_gib is None and self.power_state is None:",
+                "if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_invalid_update_requests_are_rejected_without_a_plan",),
+    ),
+    Mutation(
+        "r9-plan-spec-from-edit",
+        (
+            (
+                "worker.py",
+                'name=edit.get("name", deployment["name"]),',
+                'name=deployment["name"],',
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_edit_name_and_grow_disk",
+            "tests/test_lifecycle_ops.py::test_combined_edit",
+        ),
+    ),
+    Mutation(
+        "r9-power-persisted-in-spec",
+        (
+            (
+                "worker.py",
+                'power_state=edit.get("power_state") or deployment["power_state"] or "running",',
+                'power_state=edit.get("power_state") or "running",',
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_a_stopped_vm_stays_stopped_through_repair_and_other_edits",
+        ),
+    ),
+    Mutation(
+        "r9-edit-verified-against-ec2",
+        (
+            (
+                "worker.py",
+                'if plan["request_json"] or spec.power_state != "running":',
+                "if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_an_edit_is_verified_against_ec2_not_just_terraform",),
+    ),
+    Mutation(
+        "r9-edit-power-verified",
+        (
+            (
+                "worker.py",
+                "if details.state not in wanted[spec.power_state]:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::TestMotoLifecycle::test_a_stop_that_did_not_happen_in_ec2_is_recovery",
+            "tests/test_lifecycle_ops.py::test_an_edit_is_verified_against_ec2_not_just_terraform",
+        ),
+    ),
+    Mutation(
+        "r9-edit-disk-verified",
+        (
+            (
+                "worker.py",
+                "if details.root_volume_gib != spec.disk_gib:",
+                "if False:",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_the_root_disk_size_is_verified_against_ec2",),
+    ),
+    Mutation(
+        "r9-failed-edit-keeps-vm-active",
+        (
+            (
+                "worker.py",
+                "        elif edited_vm is not None:",
+                "        elif False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_a_rejected_edit_leaves_the_vm_active",
+            "tests/test_lifecycle_ops.py::test_edits_are_blocked_by_the_owner_wide_recovery_rule_but_deletion_is_not",
+        ),
+    ),
+    Mutation(
+        "r9-updates-are-not-creates",
+        (
+            (
+                "worker.py",
+                '    return {str(c.get("address")) for c in changes if c["action"] == "create"}',
+                '    return {str(c.get("address")) for c in changes if c["action"] != "delete"}',
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_a_failed_edit_needs_recovery_without_blocking_the_owner_forever",
+        ),
+    ),
+    Mutation(
+        "r9-cost-follows-power",
+        (
+            (
+                "worker.py",
+                'spec.disk_gib, region=spec.region, running=spec.power_state == "running"',
+                "spec.disk_gib, region=spec.region, running=True",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_stop_then_start_is_previewed_approved_and_verified",),
+    ),
+    Mutation(
+        "r9-stopped-cost",
+        (
+            (
+                "pricing.py",
+                "hours = Decimal(snapshot.hours_per_month if running else 0)",
+                "hours = Decimal(snapshot.hours_per_month)",
+            ),
+        ),
+        ("tests/test_lifecycle_ops.py::test_stop_then_start_is_previewed_approved_and_verified",),
+    ),
+    Mutation(
+        "r9-power-resource-matches-instance",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "    if power_entry and (not instance_entry or power_entry[0] != instance_entry[0]):",
+                "    if False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_a_power_resource_must_belong_to_the_states_own_instance",
+        ),
+    ),
+    Mutation(
+        "r9-power-resource-prior-id",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if resource_id in prior_ids and address != INSTANCE_STATE:",
+                "if resource_id in prior_ids:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_state_evidence_accepts_the_power_resource_added_to_an_existing_vm",
+        ),
+    ),
+    Mutation(
+        "r9-region-format",
+        (
+            (
+                "config.py",
+                "if not _REGION.fullmatch(self.aws_region):",
+                "if False:",
+            ),
+        ),
+        ("tests/test_region_and_iam.py::test_malformed_regions_are_rejected",),
+    ),
+    Mutation(
+        "r9-region-reviewed",
+        (
+            (
+                "config.py",
+                "elif self.aws_region not in SUPPORTED_REGIONS:",
+                "elif False:",
+            ),
+        ),
+        (
+            "tests/test_region_and_iam.py::test_a_well_formed_region_without_a_reviewed_snapshot_is_rejected",
+        ),
+    ),
+    Mutation(
+        "r9-price-per-region",
+        (
+            (
+                "pricing.py",
+                "snapshot = PRICE_SNAPSHOTS[region] if region is not None else PRICE_SNAPSHOT",
+                "snapshot = PRICE_SNAPSHOT",
+            ),
+        ),
+        (
+            "tests/test_region_and_iam.py::test_a_registered_region_flows_through_configuration_prices_and_plans",
+        ),
+    ),
+    Mutation(
+        "r9-session-region",
+        (
+            (
+                "provisioning/aws.py",
+                "region, account = settings.aws_region, settings.aws_account_id",
+                'region, account = "us-east-1", settings.aws_account_id',
+            ),
+        ),
+        ("tests/test_region_and_iam.py::test_the_session_policy_follows_the_configured_region",),
+    ),
+    Mutation(
+        "r9-agent-region",
+        (
+            (
+                "agent/service.py",
+                "            region=region,",
+                '            region="us-east-1",',
+            ),
+        ),
+        ("tests/test_region_and_iam.py::test_the_agent_uses_the_configured_region",),
+    ),
+    Mutation(
+        "r9-rename-name-tag-only",
+        (
+            (
+                "provisioning/aws.py",
+                '                "ForAllValues:StringEquals": {"aws:TagKeys": ["Name"]},\n',
+                "",
+            ),
+        ),
+        (
+            "tests/test_region_and_iam.py::test_each_policy_alone_enforces_the_name_only_rule",
+            "tests/test_lifecycle_ops.py::test_each_execution_policy_alone_keeps_a_deployment_to_its_own_resources",
+        ),
+    ),
+    Mutation(
+        "r9-session-grants-stop",
+        (
+            (
+                "provisioning/aws.py",
+                '                "ec2:StopInstances",\n',
+                "",
+            ),
+        ),
+        (
+            "tests/test_region_and_iam.py::test_lifecycle_actions_work_only_on_the_deployments_own_tagged_resources",
+        ),
+    ),
+    Mutation(
+        "r9-session-lifecycle-owned-only",
+        (
+            (
+                "provisioning/aws.py",
+                '                "StringEquals": owned,\n                "ForAllValues',
+                '                "StringEquals": {},\n                "ForAllValues',
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_each_execution_policy_alone_keeps_a_deployment_to_its_own_resources",
+        ),
+    ),
+    Mutation(
+        "r9-orphan-deleted-deployment",
+        (
+            (
+                "admin.py",
+                '        elif statuses[deployment_id] == "deleted":',
+                "        elif False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_orphan_report_flags_resources_of_a_deleted_deployment",
+        ),
+    ),
+    Mutation(
+        "r9-orphan-unknown-deployment",
+        (
+            (
+                "admin.py",
+                "        elif deployment_id not in statuses:",
+                "        elif False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_orphan_report_lists_resources_without_a_live_deployment",
+        ),
+    ),
+    Mutation(
+        "r9-orphan-unrecorded",
+        (
+            (
+                "admin.py",
+                "        elif resource.resource_id not in recorded.get(deployment_id, set()):",
+                "        elif False:",
+            ),
+        ),
+        (
+            "tests/test_lifecycle_ops.py::test_orphan_report_flags_unrecorded_resources_of_a_live_deployment",
+        ),
+    ),
+    Mutation(
         "policy-imdsv2",
         ((POLICY, 'metadata.get("http_tokens") == "required"', "True"),),
         ("tests/test_policy.py::test_policy_rejects_mutation[imdsv1]",),
@@ -1655,7 +2133,7 @@ MUTATIONS = [
     Mutation(
         "policy-actions",
         ((POLICY, "if actions not in ALLOWED_ACTIONS[kind]:", "if False:"),),
-        ("tests/test_policy.py::test_replace_or_update_of_owned_resources_rejected",),
+        ("tests/test_policy.py::test_replacement_of_owned_resources_rejected",),
     ),
     Mutation(
         "policy-orphans",

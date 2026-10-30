@@ -1,8 +1,8 @@
 variable "region" {
   type = string
   validation {
-    condition     = var.region == "us-east-1"
-    error_message = "Only us-east-1 is supported."
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.region))
+    error_message = "region must be an AWS region name such as us-east-1."
   }
 }
 
@@ -83,5 +83,14 @@ variable "instance_profile_name" {
   validation {
     condition     = can(regex("^[A-Za-z0-9+=,.@_-]{1,128}$", var.instance_profile_name))
     error_message = "instance_profile_name must be an instance profile name."
+  }
+}
+
+variable "power_state" {
+  type    = string
+  default = "running"
+  validation {
+    condition     = contains(["running", "stopped"], var.power_state)
+    error_message = "power_state must be running or stopped."
   }
 }

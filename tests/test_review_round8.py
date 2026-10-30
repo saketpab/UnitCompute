@@ -172,7 +172,7 @@ def test_r8_1_schema4_upgrade_with_a_preexisting_reservation(
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
             "config_hash, region, state_key, template_version, created_at) VALUES "
             "(?, ?, 'dev:alice', 'create', 'pending', 'simulated', 'h', 'us-east-1', 'k', "
-            "'ec2-vm/v1', '2026-10-02')",
+            "'ec2-vm/v2', '2026-10-02')",
             (plan_id, newer),
         )
         c.execute("UPDATE deployments SET current_plan_id = ? WHERE id = ?", (plan_id, newer))
@@ -182,7 +182,7 @@ def test_r8_1_schema4_upgrade_with_a_preexisting_reservation(
             "'2026-10-02')",
             (job_id, newer, plan_id),
         )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     client, h = _client(settings, db, FakeClock())
     provisioner = SimulatedProvisioner(settings.data_dir)
     with client:

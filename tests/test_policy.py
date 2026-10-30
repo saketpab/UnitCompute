@@ -65,7 +65,9 @@ def as_destroy(plan: dict[str, Any]) -> dict[str, Any]:
     resources = []
     for c in destroy["resource_changes"]:
         values = dict(c["change"]["after"])
-        values["id"] = "i-0abc" if c["type"] == "aws_instance" else "sg-0abc"
+        values["id"] = "sg-0abc" if c["type"] == "aws_security_group" else "i-0abc"
+        if c["type"] == "aws_ec2_instance_state":
+            values["instance_id"] = "i-0abc"
         if c["type"] == "aws_instance":
             values["root_block_device"][0]["volume_id"] = "vol-0abc"
             values["vpc_security_group_ids"] = ["sg-0abc"]
@@ -80,7 +82,11 @@ def test_real_terraform_plan_passes() -> None:
         load(), kind="create", spec=SPEC, targets=TARGETS, ami_id=AMI, inventory=[]
     )
     assert result.violations == []
-    assert {c["address"] for c in result.changes} == {"aws_instance.vm", "aws_security_group.vm"}
+    assert {c["address"] for c in result.changes} == {
+        "aws_instance.vm",
+        "aws_security_group.vm",
+        "aws_ec2_instance_state.vm",
+    }
 
 
 def _set(path: list[Any], value: Any) -> Callable[[dict[str, Any]], None]:
@@ -182,7 +188,7 @@ def test_policy_rejects_mutation(name: str) -> None:
         (lambda p: p["configuration"]["provider_config"].update(null={}), "unexpected providers"),
         (lambda p: p["configuration"]["root_module"].update(module_calls={"m": {}}), "modules"),
         (lambda p: change(p, INST).update(provider_name="registry.example/evil/aws"), "provider"),
-        (lambda p: p["resource_changes"].pop(), "exactly one VM"),
+        (lambda p: p["resource_changes"].pop(), "exactly the VM"),
     ],
 )
 def test_plan_level_violations(mutate: Callable[[dict[str, Any]], None], expected: str) -> None:
@@ -241,9 +247,10 @@ def test_no_op_requires_ownership_tags() -> None:
     assert run(plan, inventory=inventory)
 
 
-@pytest.mark.parametrize("actions", [["delete", "create"], ["create", "delete"], ["update"]])
-def test_replace_or_update_of_owned_resources_rejected(actions: list[str]) -> None:
-    """Even correctly owned resources may not be replaced or updated in place."""
+@pytest.mark.parametrize("actions", [["delete", "create"], ["create", "delete"]])
+def test_replacement_of_owned_resources_rejected(actions: list[str]) -> None:
+    """Even correctly owned resources may never be replaced (an edit must not destroy the VM
+    or its disk)."""
     plan = as_destroy(load())
     for c in plan["resource_changes"]:
         c["change"]["actions"] = ["no-op"]

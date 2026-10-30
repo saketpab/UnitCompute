@@ -27,6 +27,7 @@ never allowed cross-origin.
 | `GET /deployments` | Your deployments (up to 50, newest first) | 200 |
 | `GET /deployments/{id}` | Status, current plan preview (changes, warnings, cost, hash, expiry), latest job, resources and SSM access instructions | 200 |
 | `POST /deployments/{id}/plan` | Refresh the create/repair preview; supersedes any earlier plan and its approvability | 202 |
+| `POST /deployments/{id}/update-plan` | `{name?, disk_gib?, power_state?}` (at least one): preview renaming the VM, enlarging its root disk (never shrinking) and/or stopping (`"stopped"`) or starting (`"running"`) it. An ordinary plan: nothing changes until its exact ID and hash are approved | 202 `{deployment_id, plan_id, job_id, status}` |
 | `POST /deployments/{id}/deletion-plan` | Preview deletion, including the irreversible data-loss warning | 202 |
 | `POST /deployments/{id}/approve` | `{plan_id, plan_hash}` of the plan you reviewed; queues exactly that saved plan | 202 |
 | `GET /jobs/{id}` | Job status, timestamps, safe error or result | 200 |
@@ -55,6 +56,29 @@ deployment stays `recovery_required` (`verification_failed` or `identity_incompl
 preview is rejected if a recorded or tagged resource exists that Terraform state does not
 track. Any preview, for repair or deletion, also fails with `identity_incomplete` while a
 known VM's root disk has not been positively identified.
+
+### Editing, stopping and starting
+
+`GET /deployments/{id}` shows `power_state` (the state UnitCompute last verified it applied,
+`running` or `stopped`) and `instance_state` (the EC2 state the worker last observed), next to
+`name` and `disk_gib`. They change only after an approved plan has been applied *and*
+EC2 itself confirms the result: the worker reads the instance state and the root disk size back
+from EC2, and a mismatch makes the job `recovery_required` (`verification_failed`).
+
+`POST /deployments/{id}/update-plan` accepts exactly these fields; anything else (region,
+instance type, image, network) is rejected with 422. It is allowed for a deployment that has a
+VM and is `active`, `plan_failed`, `recovery_required` or waiting for approval. The preview is
+a Terraform plan like any other: its `operation` is `update` and its `request` echoes what
+was asked. Each change lists a before/after under `summary.changes` (`name`, `disk_gib`,
+`power_state`), cost is recomputed (a stopped VM costs only its disk), and warnings explain
+the consequences (stopping releases the public IPv4 address; a disk cannot shrink). If an edit
+is rejected, fails to plan, expires, or is refused at dispatch, the VM stays `active` and
+unchanged.
+
+Limits: the disk can only grow (422 `The root disk can only be enlarged`), a request that
+changes nothing is refused (422), and the whole owner is blocked from creating or editing
+while any of their earlier applies is unproven (`409 recovery_required`); deleting what
+exists is never blocked. A stop is a clean OS shutdown, never forced.
 
 ### Connection readiness
 

@@ -73,7 +73,7 @@ for example in a dedicated bootstrap Terraform configuration whose state lives u
 `bootstrap/` (or in another bucket). UnitCompute's runtime roles are explicitly denied
 access to that prefix, and nothing in this repository applies them.
 
-1. **Network.** A VPC in `us-east-1` with one public subnet. The subnet needs a route to an
+1. **Network.** A VPC in the configured region (`us-east-1` by default) with one public subnet. The subnet needs a route to an
    internet gateway and must auto-assign public IPv4 addresses. No NAT gateway and no
    Elastic IPs: each VM gets an ephemeral public IPv4 address (about $3.65/month) for
    outbound HTTPS to SSM and package repositories. Inbound traffic is impossible because
@@ -314,6 +314,43 @@ security group is confirmed gone by direct lookup. The retired schema-3
 
 A failed or expired plan never changes infrastructure, so you can always request a new
 preview.
+
+## Lifecycle operations and orphan cleanup
+
+Every lifecycle change is the same exact-plan mechanism, so it has the same guarantees:
+
+| Operation | API | How it runs | Verified by |
+|---|---|---|---|
+| Create | `POST /deployments` | Terraform creates the VM, security group and power-state resource | the instance found by tags and by ID; launch root recorded |
+| Inspect | `GET /deployments/{id}` | database plus the worker's periodic EC2/SSM observation | read-only |
+| Edit name, grow disk | `POST /deployments/{id}/update-plan` | in-place Terraform update (tags; `root_block_device.volume_size`) | EC2 `DescribeVolumes` size |
+| Stop, start | `POST /deployments/{id}/update-plan` | Terraform `aws_ec2_instance_state` (`force = false`) | EC2 `DescribeInstances` state |
+| Delete | `POST /deployments/{id}/deletion-plan` | Terraform destroy | every recorded ID confirmed gone |
+
+The policy allows an update only for those attributes. Replacing the VM (delete + create),
+changing the image, type, network, profile or metadata options, adding rules or resources, and
+shrinking the disk are all rejected before approval. Dispatch-time expiry, the owner-wide
+recovery rule, evidence capture and the `terraform state` restrictions apply unchanged;
+an edit creates nothing, so a failed one records a `captured` or `not_needed` obligation and
+never leaves an unproven create.
+
+**Region.** `UNITCOMPUTE_AWS_REGION` (default `us-east-1`) is validated at startup: it must look
+like an AWS region and be one of the regions that have a reviewed price snapshot
+(`config.SUPPORTED_REGIONS`). It is passed to the template (whose `region` variable only checks
+the format), the state backend, the session policies and the agent. The role policies in
+`docs/iam` use a `${region}` placeholder; fill it like `${account_id}`. One region per
+installation, and the VPC, subnet, instance profile, state bucket and roles must exist in it.
+
+**Orphan cleanup.** `unitcompute-admin orphan-report` is read-only. It lists every live resource
+in the region tagged `ManagedBy=unitcompute` that the database does not account for, with the
+reason: `no_deployment_tag`, `unknown_deployment`, `deployment_deleted` (AWS still has
+resources of a deployment recorded as deleted) or `unrecorded_resource` (tagged for a live
+deployment but never recorded in its identity ledger). UnitCompute never deletes resources it
+cannot tie to an approved plan: after confirming each ID in the AWS console or CLI, remove it
+deliberately, then re-run the report until `orphans` is empty. The report uses the plan role
+(read-only EC2 `Describe*`). A normal deletion already leaves nothing behind (it is verified by
+direct lookup of every recorded ID plus a tag scan); the report is the final check for
+anything that escaped that, and the evidence that a test left the account clean.
 
 ## Retention
 

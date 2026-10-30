@@ -5,7 +5,8 @@ Easy-to-use service to simplify AWS usage.
 UnitCompute gives each team member one small Linux VM on AWS through an approval-gated
 workflow:
 
-configure → preview resources and cost → explicitly approve → launch → inspect → explicitly
+configure → preview resources and cost → explicitly approve → launch → inspect → (optionally
+rename, enlarge the disk, stop or start, each previewed and approved the same way) → explicitly
 delete.
 
 It is one FastAPI service, with a LangChain assistant inside it, plus a single worker
@@ -14,7 +15,7 @@ a SQLite database on persistent local disk.
 
 | Fixed by the server | Chosen by the user |
 |---|---|
-| Region `us-east-1`, official Amazon Linux 2023 x86_64 AMI (frozen at plan time), `t3.micro`, `cpu_credits=standard`, IMDSv2, approved public subnet and SSM instance profile, dedicated security group with no inbound rules | `name` (3–32 lowercase letters, digits, hyphens) and `disk_gib` (8–30 GiB encrypted gp3 root disk) |
+| Region `us-east-1` by default (configurable and validated), official Amazon Linux 2023 x86_64 AMI (frozen at plan time), `t3.micro`, `cpu_credits=standard`, IMDSv2, approved public subnet and SSM instance profile, dedicated security group with no inbound rules | `name` (3–32 lowercase letters, digits, hyphens) and `disk_gib` (8–30 GiB encrypted gp3 root disk) |
 
 Access is through AWS Systems Manager Session Manager only. There is no SSH, and a
 UnitCompute login alone does not grant shell access.
@@ -36,10 +37,10 @@ src/unitcompute/
   services/       Authorization-aware deployment operations shared by REST and the agent
   agent/          LangChain assistant: read/validate tools only, offline scripted fake model
   provisioning/   Terraform runner and provisioner, plan policy, AWS reads, simulator
-    templates/ec2_vm_v1/   Reviewed Terraform template, provider lock file, module tests
+    templates/ec2_vm_v2/   Reviewed Terraform template, provider lock file, module tests
   db/             SQLite access and versioned SQL migrations
   worker.py       Single job worker (plan/apply), recovery and housekeeping
-  admin.py        Operator CLI: migrate, check-config, recovery-report
+  admin.py        Operator CLI: migrate, check-config, recovery-report, orphan-report
 docs/             API guide, operations and bootstrap prerequisites, example IAM policies
 examples/         Offline HTTP client walkthrough
 tests/            pytest suite (API, auth, policy, worker recovery, agent, Terraform)

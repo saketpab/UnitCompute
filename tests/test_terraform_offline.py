@@ -191,7 +191,7 @@ def test_bootstrap_isolation() -> None:
     """The per-deployment template cannot reach bootstrap network, IAM or state."""
     text = "\n".join(p.read_text() for p in template_dir().glob("*.tf"))
     resources = re.findall(r'^resource "([^"]+)"', text, flags=re.MULTILINE)
-    assert sorted(resources) == ["aws_instance", "aws_security_group"]
+    assert sorted(resources) == ["aws_ec2_instance_state", "aws_instance", "aws_security_group"]
     assert not re.search(r'^\s*data "', text, flags=re.MULTILINE)
     assert "terraform_remote_state" not in text
     assert not re.search(r'^\s*module "', text, flags=re.MULTILINE)

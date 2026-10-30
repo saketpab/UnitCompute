@@ -159,7 +159,7 @@ def seed_launch_history(db: Database, dep: str, owner: str = "dev:alice") -> Non
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
             "config_hash, region, state_key, template_version, preview_json, created_at) "
             "VALUES (?, ?, ?, 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
-            "'ec2-vm/v1', ?, ?)",
+            "'ec2-vm/v2', ?, ?)",
             (
                 plan_id,
                 dep,
@@ -287,7 +287,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {}  # shadowed under schema 3
-    assert db.migrate() == [4, 5, 6, 7]
+    assert db.migrate() == [4, 5, 6, 7, 8]
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {iid: {vid}}

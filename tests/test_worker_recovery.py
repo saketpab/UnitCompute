@@ -96,8 +96,9 @@ def test_partial_apply_requires_recovery_then_reconciles(
     # ... Terraform's final state establishes the partial outcome, and a new preview
     # reconciles from state: SG is a no-op, the VM is created.
     assert repaired["status"] == "awaiting_approval"
-    assert [c["address"] for c in repaired["current_plan"]["resource_changes"]] == [
-        "aws_instance.vm"
+    assert sorted(c["address"] for c in repaired["current_plan"]["resource_changes"]) == [
+        "aws_ec2_instance_state.vm",
+        "aws_instance.vm",
     ]
     approve_current(h, repaired)
     h.drain()

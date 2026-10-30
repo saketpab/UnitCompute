@@ -88,12 +88,52 @@ run "rejects_other_instance_type" {
   expect_failures = [var.instance_type]
 }
 
-run "rejects_other_region" {
+run "rejects_malformed_region" {
+  command = plan
+  variables {
+    region = "Europe/Paris"
+  }
+  expect_failures = [var.region]
+}
+
+run "accepts_other_well_formed_region" {
   command = plan
   variables {
     region = "eu-west-1"
   }
-  expect_failures = [var.region]
+}
+
+run "power_state_defaults_to_running" {
+  command = plan
+
+  assert {
+    condition     = aws_ec2_instance_state.vm.state == "running"
+    error_message = "a new VM must be running"
+  }
+  assert {
+    condition     = aws_ec2_instance_state.vm.force == false
+    error_message = "power changes must never be forced"
+  }
+}
+
+run "power_state_can_be_stopped" {
+  command = plan
+  variables {
+    power_state = "stopped"
+  }
+
+  assert {
+    condition     = aws_ec2_instance_state.vm.state == "stopped"
+    error_message = "power_state must drive the state resource"
+  }
+}
+
+run "rejects_other_power_states" {
+  command = plan
+  variables {
+    power_state = "hibernated"
+  }
+  expect_failures = [var.power_state]
 }
 
 run "rejects_bad_name" {

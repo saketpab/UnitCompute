@@ -3,7 +3,7 @@ locals {
     ManagedBy             = "unitcompute"
     UnitComputeDeployment = var.deployment_id
     UnitComputeOwner      = var.owner_tag
-    UnitComputeTemplate   = "ec2-vm/v1"
+    UnitComputeTemplate   = "ec2-vm/v2"
   }
 }
 
@@ -65,4 +65,14 @@ resource "aws_instance" "vm" {
   volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })
 
   tags = merge(local.tags, { Name = "unitcompute-${var.name}" })
+}
+
+# Power state is part of the reviewed lifecycle: stopping and starting are Terraform updates of
+# this one attribute, so they are previewed, approved by exact plan hash, applied under the same
+# state lock and recorded in the same state as every other change. force stays false: a stop
+# is always a clean OS shutdown, never a forced one.
+resource "aws_ec2_instance_state" "vm" {
+  instance_id = aws_instance.vm.id
+  state       = var.power_state
+  force       = false
 }

@@ -668,7 +668,7 @@ def _legacy_history(
                 "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
                 "config_hash, region, state_key, template_version, preview_json, created_at) "
                 "VALUES (?, ?, 'dev:alice', 'create', ?, 'simulated', 'h', 'us-east-1', 'k', "
-                "'ec2-vm/v1', ?, ?)",
+                "'ec2-vm/v2', ?, ?)",
                 (plan, dep, plan_status, json.dumps({"changes": changes}), f"2026-10-0{n + 1}"),
             )
             c.execute(
@@ -743,7 +743,7 @@ def test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance(
         replacement,
         [("1", "apply_failed", "recovery_required", _LAUNCH), ("2", "applied", "succeeded", [])],
     )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -782,7 +782,7 @@ def test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance(
         replacement,
         [("1", "applied", "succeeded", _LAUNCH), ("2", "apply_failed", "recovery_required", [])],
     )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:

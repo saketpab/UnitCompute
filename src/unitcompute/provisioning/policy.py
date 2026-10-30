@@ -27,11 +27,36 @@ from unitcompute.provisioning.base import (
 AWS_PROVIDER = "registry.terraform.io/hashicorp/aws"
 INSTANCE = "aws_instance.vm"
 SECURITY_GROUP = "aws_security_group.vm"
-EXPECTED_TYPES = {INSTANCE: "aws_instance", SECURITY_GROUP: "aws_security_group"}
+INSTANCE_STATE = "aws_ec2_instance_state.vm"
+EXPECTED_TYPES = {
+    INSTANCE: "aws_instance",
+    SECURITY_GROUP: "aws_security_group",
+    INSTANCE_STATE: "aws_ec2_instance_state",
+}
+POWER_STATES = ("running", "stopped")
+# "create" plans converge the deployment on its requested spec: they create what is missing,
+# update the few attributes below in place, and leave the rest alone. Replacement
+# (delete + create) is never allowed: an edit must not destroy the VM or its disk.
 ALLOWED_ACTIONS: dict[PlanKind, set[tuple[str, ...]]] = {
-    "create": {("create",), ("no-op",)},
+    "create": {("create",), ("no-op",), ("update",)},
     "destroy": {("delete",)},
 }
+# What an in-place update may change, per resource. The VM's name is a tag; its disk can only
+# grow (checked separately); its power state is the one attribute of the state resource.
+INSTANCE_UPDATE_CHANGES = {"tags", "tags_all", "volume_tags", "root_block_device"}
+# Attributes the provider reports as unknown after an in-place update of the above even though
+# the reviewed configuration pins them (the template hash is the guard for their values).
+INSTANCE_UPDATE_UNKNOWN = {
+    "credit_specification",
+    "ipv6_addresses",
+    "metadata_options",
+    "root_block_device",
+    "secondary_private_ips",
+    "vpc_security_group_ids",
+}
+SECURITY_GROUP_UPDATE_CHANGES = {"tags", "tags_all"}
+INSTANCE_STATE_UPDATE_CHANGES = {"state"}
+INSTANCE_STATE_CREATE_FIELDS = {"force", "region", "state", "timeouts"}
 EXPECTED_EGRESS = {
     "from_port": 443,
     "to_port": 443,
@@ -100,6 +125,7 @@ CONFIGURED_ARGUMENTS = {
         "vpc_security_group_ids",
     },
     SECURITY_GROUP: {"description", "egress", "ingress", "name", "tags", "vpc_id"},
+    INSTANCE_STATE: {"force", "instance_id", "state"},
 }
 CONFIGURED_BLOCK_ARGUMENTS = {
     # No "tags": root_block_device.tags are applied after launch by a separate CreateTags
@@ -218,8 +244,16 @@ def _check_group_attachment(
 
 
 def _check_instance(
-    after: dict[str, Any], spec: DeploymentSpec, targets: NetworkTargets, ami_id: str | None
+    after: dict[str, Any],
+    spec: DeploymentSpec,
+    targets: NetworkTargets,
+    ami_id: str | None,
+    unknown: dict[str, Any] | None = None,
 ) -> list[str]:
+    """Shape of an instance as it will be after the plan. ``unknown`` lists attributes the
+    provider cannot predict for an in-place update; the reviewed template pins their values
+    (its hash is checked), so they are skipped here rather than failed."""
+    pending = unknown or {}
     v: list[str] = []
     _check(v, not after.get("key_name"), "SSH key pairs are not allowed")
     _check(v, after.get("tenancy") in (None, "default"), "only default tenancy is allowed")
@@ -242,13 +276,17 @@ def _check_instance(
     _check(v, after.get("launch_template") in (None, []), "launch templates are not allowed")
     _check(v, after.get("ebs_block_device") in (None, []), "extra EBS volumes are not allowed")
     metadata = _first(after.get("metadata_options"))
-    _check(
-        v, metadata.get("http_tokens") == "required", "IMDSv2 (http_tokens=required) is required"
-    )
-    _check(v, metadata.get("http_endpoint") == "enabled", "metadata endpoint must stay enabled")
-    _check(v, metadata.get("http_put_response_hop_limit") == 1, "IMDS hop limit must be 1")
+    if pending.get("metadata_options") is not True:
+        _check(
+            v,
+            metadata.get("http_tokens") == "required",
+            "IMDSv2 (http_tokens=required) is required",
+        )
+        _check(v, metadata.get("http_endpoint") == "enabled", "metadata endpoint must stay enabled")
+        _check(v, metadata.get("http_put_response_hop_limit") == 1, "IMDS hop limit must be 1")
     credits = _first(after.get("credit_specification"))
-    _check(v, credits.get("cpu_credits") == "standard", "cpu_credits must be standard")
+    if pending.get("credit_specification") is not True:
+        _check(v, credits.get("cpu_credits") == "standard", "cpu_credits must be standard")
     root = _first(after.get("root_block_device"))
     _check(v, root.get("volume_type") == "gp3", "root volume must be gp3")
     _check(v, root.get("volume_size") == spec.disk_gib, "root volume size does not match request")
@@ -284,7 +322,146 @@ def _check_security_group(
     return v
 
 
+def _prior_instance_id(plan: dict[str, Any]) -> str | None:
+    root = plan.get("prior_state", {}).get("values", {}).get("root_module", {})
+    for resource in root.get("resources", []) or []:
+        if resource.get("address") == INSTANCE:
+            found = (resource.get("values") or {}).get("id")
+            return found if isinstance(found, str) else None
+    return None
+
+
+def _owned(
+    address: str, values: dict[str, Any], spec: DeploymentSpec, instance_id: str | None
+) -> bool:
+    """Existing resources must belong to this deployment: tagged for it, or (the power-state
+    resource has no tags) attached to this deployment's own instance."""
+    if address == INSTANCE_STATE:
+        return instance_id is not None and values.get("instance_id") == instance_id
+    return _owned_by_deployment(values, spec)
+
+
+def _check_instance_state(values: dict[str, Any], spec: DeploymentSpec) -> list[str]:
+    v: list[str] = []
+    _check(
+        v,
+        values.get("state") == spec.power_state,
+        f"power state does not match the request ({spec.power_state})",
+    )
+    _check(v, values.get("force") in (None, False), "forced power changes are not allowed")
+    _check(v, values.get("region") in (None, spec.region), "power-state region is not approved")
+    return v
+
+
+def _check_instance_state_create(
+    after: dict[str, Any], spec: DeploymentSpec, instance_id: str | None
+) -> list[str]:
+    v = _check_instance_state(after, spec)
+    extra = sorted(set(after) - INSTANCE_STATE_CREATE_FIELDS)
+    if extra:
+        v.append(f"power state sets unreviewed attributes: {', '.join(extra)}")
+    if after.get("instance_id") not in (None, instance_id):
+        v.append("power state must target this deployment's own instance")
+    return v
+
+
+def _changed_keys(
+    before: dict[str, Any], after: dict[str, Any], unknown: dict[str, Any]
+) -> set[str]:
+    return {
+        k for k in set(before) | set(after) if before.get(k) != after.get(k) and not unknown.get(k)
+    }
+
+
+def _check_update(
+    address: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    unknown: dict[str, Any],
+    spec: DeploymentSpec,
+    group_id: str | None,
+    targets: NetworkTargets,
+    ami_id: str | None,
+) -> list[str]:
+    """An in-place update is allowed only for the three edits the service offers: the name
+    (tags), a larger disk, and the power state. Everything else must be unchanged."""
+    v: list[str] = []
+    changed = _changed_keys(before, after, unknown)
+    unknown_keys = {k for k, u in unknown.items() if u}
+    if address == INSTANCE:
+        extra = sorted(changed - INSTANCE_UPDATE_CHANGES)
+        if extra:
+            v.append(f"instance update changes unreviewed attributes: {', '.join(extra)}")
+        unexpected = sorted(unknown_keys - INSTANCE_UPDATE_UNKNOWN)
+        if unexpected:
+            v.append(
+                f"instance update leaves unreviewed attributes unknown: {', '.join(unexpected)}"
+            )
+        _check(
+            v, after.get("tags_all") == after.get("tags"), "instance has unexpected default tags"
+        )
+        _check(v, unknown.get("root_block_device") is not True, "root volume size is not known")
+        v.extend(_check_instance(after, spec, targets, ami_id, unknown))
+        old_size = _first(before.get("root_block_device")).get("volume_size")
+        size = _first(after.get("root_block_device")).get("volume_size")
+        _check(
+            v,
+            isinstance(size, int) and isinstance(old_size, int) and size >= old_size,
+            "the root disk can only grow",
+        )
+        groups = after.get("vpc_security_group_ids")
+        if unknown.get("vpc_security_group_ids") is not True:
+            _check(
+                v,
+                group_id is not None and groups == [group_id],
+                "instance must be attached only to its dedicated security group",
+            )
+    elif address == SECURITY_GROUP:
+        extra = sorted(changed - SECURITY_GROUP_UPDATE_CHANGES)
+        if extra:
+            v.append(f"security group update changes unreviewed attributes: {', '.join(extra)}")
+        _check(v, not unknown_keys, "security group update leaves attributes unknown")
+        _check(
+            v, _tags_ok(after, spec, f"unitcompute-{spec.name}"), "security group tags do not match"
+        )
+    else:
+        extra = sorted(changed - INSTANCE_STATE_UPDATE_CHANGES)
+        if extra:
+            v.append(f"power state update changes unreviewed attributes: {', '.join(extra)}")
+        _check(v, not unknown_keys, "power state update leaves attributes unknown")
+        v.extend(_check_instance_state(after, spec))
+        _check(
+            v,
+            before.get("state") in POWER_STATES and after.get("state") in POWER_STATES,
+            "unexpected power state",
+        )
+    return v
+
+
+def _diff(address: str, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Human-readable before/after of what an update changes."""
+    out: dict[str, Any] = {}
+    if address == INSTANCE:
+        old, new = _first(before.get("root_block_device")), _first(after.get("root_block_device"))
+        if old.get("volume_size") != new.get("volume_size"):
+            out["disk_gib"] = [old.get("volume_size"), new.get("volume_size")]
+    if address in (INSTANCE, SECURITY_GROUP):
+        old_name = (before.get("tags") or {}).get("Name")
+        new_name = (after.get("tags") or {}).get("Name")
+        if old_name != new_name:
+            prefix = "unitcompute-"
+            out["name"] = [
+                str(old_name).removeprefix(prefix) if old_name else None,
+                str(new_name).removeprefix(prefix) if new_name else None,
+            ]
+    if address == INSTANCE_STATE and before.get("state") != after.get("state"):
+        out["power_state"] = [before.get("state"), after.get("state")]
+    return out
+
+
 def _summary(address: str, values: dict[str, Any], kind: PlanKind) -> dict[str, Any]:
+    if address == INSTANCE_STATE:
+        return {"power_state": values.get("state")}
     if address == INSTANCE:
         root = _first(values.get("root_block_device"))
         return {
@@ -412,6 +589,7 @@ def evaluate_plan(
         "name": spec.name,
         "disk_gib": spec.disk_gib,
         "instance_type": spec.instance_type,
+        "power_state": spec.power_state,
         "vpc_id": targets.vpc_id,
         "subnet_id": targets.subnet_id,
         "instance_profile_name": targets.instance_profile_name,
@@ -428,6 +606,7 @@ def evaluate_plan(
     v.extend(_check_configuration(plan))
 
     group_id = _prior_group_id(plan)
+    instance_id = _prior_instance_id(plan)
     seen: dict[str, tuple[str, ...]] = {}
     for change in plan.get("resource_changes") or []:
         address = change.get("address")
@@ -454,33 +633,47 @@ def evaluate_plan(
             if address == INSTANCE:
                 v.extend(_check_instance(after, spec, targets, ami_id))
                 v.extend(_check_instance_create_fields(after, unknown, group_id))
-            else:
+            elif address == SECURITY_GROUP:
                 extra = sorted(set(after) - SECURITY_GROUP_CREATE_FIELDS)
                 if extra:
                     v.append(f"security group sets unreviewed attributes: {', '.join(extra)}")
                 v.extend(_check_security_group(after, spec, targets))
-        elif not _owned_by_deployment(before, spec):
+            else:
+                v.extend(_check_instance_state_create(after, spec, instance_id))
+        elif not _owned(address, before, spec, instance_id):
             v.append(f"{address} is not tagged as owned by this deployment")
         elif actions == ("no-op",):
             # Existing resources must still match the reviewed shape, not just be owned.
             if address == INSTANCE:
                 v.extend(_check_instance(after, spec, targets, ami_id))
                 v.extend(_check_group_attachment(after, {}, group_id))
-            else:
+            elif address == SECURITY_GROUP:
                 v.extend(_check_security_group(after, spec, targets))
-        if actions != ("no-op",):
+            else:
+                v.extend(_check_instance_state(after, spec))
+        elif actions == ("update",):
+            v.extend(
+                _check_update(address, before, after, unknown, spec, group_id, targets, ami_id)
+            )
+        # An update that changes nothing the user can see (the provider refreshing computed
+        # attributes) is validated above but not listed as a change.
+        invisible = actions == ("update",) and not _diff(address, before, after)
+        if actions != ("no-op",) and not invisible:
             values = before if actions == ("delete",) else after
+            summary = _summary(address, values, kind)
+            if actions == ("update",):
+                summary["changes"] = _diff(address, before, after)
             result.changes.append(
                 {
                     "address": address,
                     "resource_type": EXPECTED_TYPES[address],
                     "action": actions[0],
-                    "summary": _summary(address, values, kind),
+                    "summary": summary,
                 }
             )
 
     if kind == "create" and set(seen) != set(EXPECTED_TYPES):
-        v.append("create plan must manage exactly one VM and one security group")
+        v.append("create plan must manage exactly the VM, its security group and its power state")
     if kind == "destroy":
         result.warnings.append(DATA_LOSS_WARNING)
 

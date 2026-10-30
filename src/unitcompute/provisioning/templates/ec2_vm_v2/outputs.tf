@@ -13,3 +13,7 @@ output "root_volume_id" {
 output "availability_zone" {
   value = aws_instance.vm.availability_zone
 }
+
+output "power_state" {
+  value = aws_ec2_instance_state.vm.state
+}

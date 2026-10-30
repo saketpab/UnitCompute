@@ -18,6 +18,7 @@ from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     ApplyResult,
     DeploymentSpec,
+    InstanceDetails,
     NetworkTargets,
     OwnedResource,
     PlanKind,
@@ -97,6 +98,27 @@ def raw_state(
         ],
         "check_results": None,
     }
+
+
+def _keep_identity(before: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+    """Desired values for an existing resource keep its IDs, as Terraform's state does."""
+    kept = dict(desired)
+    for key in ("id", "instance_id", "vpc_security_group_ids"):
+        if key in before:
+            kept[key] = before[key]
+    if "root_block_device" in kept and before.get("root_block_device"):
+        kept["root_block_device"] = [
+            {**device, "volume_id": old.get("volume_id")}
+            for device, old in zip(
+                kept["root_block_device"], before["root_block_device"], strict=False
+            )
+        ]
+    return kept
+
+
+def _same(before: dict[str, Any], desired: dict[str, Any]) -> bool:
+    """Whether the stored resource already matches the desired one (ignoring tags_all)."""
+    return {k: v for k, v in before.items() if k != "tags_all"} == desired
 
 
 def _expressions(address: str) -> dict[str, Any]:
@@ -195,6 +217,14 @@ class SimulatedProvisioner:
                 "volume_tags": {**tags, "Name": f"unitcompute-{spec.name}-root"},
                 "tags": {**tags, "Name": f"unitcompute-{spec.name}"},
             },
+            "aws_ec2_instance_state.vm": {
+                "id": _sim_id("i", spec.deployment_id),
+                "instance_id": _sim_id("i", spec.deployment_id),
+                "state": spec.power_state,
+                "force": False,
+                "region": spec.region,
+                "timeouts": None,
+            },
         }
 
     @staticmethod
@@ -202,9 +232,16 @@ class SimulatedProvisioner:
         values: dict[str, Any], current: dict[str, dict[str, Any]]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Mirror Terraform: computed IDs are unknown until apply."""
-        after = {k: v for k, v in values.items() if k not in {"id", "vpc_security_group_ids"}}
-        after["tags_all"] = after["tags"]
+        after = {
+            k: v
+            for k, v in values.items()
+            if k not in {"id", "vpc_security_group_ids", "instance_id"}
+        }
+        if "tags" in after:
+            after["tags_all"] = after["tags"]
         unknown: dict[str, Any] = {"id": True}
+        if "instance_id" in values:
+            unknown["instance_id"] = True
         if "root_block_device" in after:
             after["root_block_device"] = [
                 {k: v for k, v in device.items() if k != "volume_id"}
@@ -224,6 +261,9 @@ class SimulatedProvisioner:
         create_directory(workdir)
         current = self._load(spec.deployment_id)
         desired = self._desired(spec, ami_id)
+        for address, before_values in current.items():
+            if address in desired:  # an edit never changes what a resource is
+                desired[address] = _keep_identity(before_values, desired[address])
         changes: list[dict[str, Any]] = []
         for address, values in desired.items():
             before = current.get(address)
@@ -234,8 +274,11 @@ class SimulatedProvisioner:
             elif before is None:
                 actions = ["create"]
                 after, unknown = self._planned_create(values, current)
-            else:
+            elif _same(before, values):
                 actions, after = ["no-op"], before
+            else:  # edit in place: new name (tags), larger disk, or power state
+                actions = ["update"]
+                after = {**values, "tags_all": values["tags"]} if "tags" in values else values
             changes.append(
                 {
                     "address": address,
@@ -260,6 +303,7 @@ class SimulatedProvisioner:
             "name": spec.name,
             "disk_gib": spec.disk_gib,
             "instance_type": spec.instance_type,
+            "power_state": spec.power_state,
             "ami_id": ami_id,
             "vpc_id": t.vpc_id,
             "subnet_id": t.subnet_id,
@@ -340,6 +384,7 @@ class SimulatedProvisioner:
                 "instance_id": instance["id"],
                 "security_group_id": desired["aws_security_group.vm"]["id"],
                 "root_volume_id": instance["root_block_device"][0]["volume_id"],
+                "power_state": desired["aws_ec2_instance_state.vm"]["state"],
             }
         )
 
@@ -356,7 +401,8 @@ class SimulatedProvisioner:
         found: list[OwnedResource] = []
         if "aws_instance.vm" in state:
             instance = state["aws_instance.vm"]
-            found.append(OwnedResource("instance", instance["id"], "running"))
+            power = state.get("aws_ec2_instance_state.vm", {}).get("state", "running")
+            found.append(OwnedResource("instance", instance["id"], power))
             found.append(
                 OwnedResource("volume", instance["root_block_device"][0]["volume_id"], "in-use")
             )
@@ -384,8 +430,32 @@ class SimulatedProvisioner:
                 volumes[instance["id"]] = [(instance["root_block_device"][0]["volume_id"], True)]
         return volumes
 
+    def managed_resources(self) -> list[tuple[OwnedResource, str | None]]:
+        found: list[tuple[OwnedResource, str | None]] = []
+        for path in sorted(self._state_dir.glob("dep_*.json")):
+            found.extend((r, path.stem) for r in self.owned_resources(path.stem))
+        return found
+
+    def instance_details(self, instance_ids: list[str]) -> dict[str, InstanceDetails]:
+        wanted = set(instance_ids)
+        details: dict[str, InstanceDetails] = {}
+        for path in sorted(self._state_dir.glob("dep_*.json")):
+            state = self._load(path.stem)
+            instance = state.get("aws_instance.vm")
+            if instance and instance["id"] in wanted:
+                root = instance["root_block_device"][0]
+                details[instance["id"]] = InstanceDetails(
+                    state=state.get("aws_ec2_instance_state.vm", {}).get("state", "running"),
+                    root_volume_id=root["volume_id"],
+                    root_volume_gib=root["volume_size"],
+                )
+        return details
+
     def connection_readiness(self, instance_id: str) -> Readiness:
-        return Readiness(ec2_status="ok", ssm_status="Online (simulated)")
+        state = self.instance_details([instance_id]).get(instance_id)
+        if state is not None and state.state != "running":
+            return Readiness(ec2_status=None, ssm_status=None, instance_state=state.state)
+        return Readiness(ec2_status="ok", ssm_status="Online (simulated)", instance_state="running")
 
     def self_check(self) -> dict[str, Any]:
         return {"provisioner": "simulated", "aws": "not contacted"}

@@ -13,7 +13,14 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 _VARIABLE = re.compile(r"\$\{([^}]+)\}")
-SUPPORTED = {"StringEquals", "StringLike", "StringEqualsIfExists", "Bool", "NumericLessThanEquals"}
+SUPPORTED = {
+    "StringEquals",
+    "StringLike",
+    "StringEqualsIfExists",
+    "Bool",
+    "NumericLessThanEquals",
+    "ForAllValues:StringEquals",
+}
 
 
 def _seq(value: Any) -> list[Any]:
@@ -46,6 +53,13 @@ def _condition_ok(
         for key, expected in entries.items():
             values = [_substitute(str(v), context, placeholders) for v in _seq(expected)]
             actual = context.get(key)
+            if operator == "ForAllValues:StringEquals":
+                # Multi-valued keys are given comma-joined. A key absent from the request is
+                # vacuously satisfied (AWS semantics): the statement then relies on its other
+                # conditions.
+                if actual is not None and not all(a in values for a in actual.split(",")):
+                    return False
+                continue
             if actual is None:
                 if operator.endswith("IfExists"):
                     continue

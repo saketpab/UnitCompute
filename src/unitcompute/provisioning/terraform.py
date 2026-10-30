@@ -20,6 +20,7 @@ from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     ApplyResult,
     DeploymentSpec,
+    InstanceDetails,
     NetworkTargets,
     OwnedResource,
     PlanKind,
@@ -72,6 +73,7 @@ def build_tfvars(spec: DeploymentSpec, targets: NetworkTargets, ami_id: str) -> 
         "name": spec.name,
         "disk_gib": spec.disk_gib,
         "instance_type": spec.instance_type,
+        "power_state": spec.power_state,
         "ami_id": ami_id,
         "vpc_id": targets.vpc_id,
         "subnet_id": targets.subnet_id,
@@ -295,6 +297,14 @@ class TerraformProvisioner:
     def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[tuple[str, bool]]]:
         creds = self._aws.credentials("plan", "uc-verify-volumes")
         return self._aws.instance_volumes(instance_ids, creds)
+
+    def instance_details(self, instance_ids: list[str]) -> dict[str, InstanceDetails]:
+        creds = self._aws.credentials("plan", "uc-verify-details")
+        return self._aws.instance_details(instance_ids, creds)
+
+    def managed_resources(self) -> list[tuple[OwnedResource, str | None]]:
+        creds = self._aws.credentials("plan", "uc-orphan-scan")
+        return self._aws.managed_resources(creds)
 
     def connection_readiness(self, instance_id: str) -> Readiness:
         creds = self._aws.credentials("plan", "uc-readiness")

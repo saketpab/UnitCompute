@@ -249,6 +249,7 @@ def test_plan_commands_and_backend(tmp_path: Path) -> None:
         "name": "demo",
         "disk_gib": 8,
         "instance_type": "t3.micro",
+        "power_state": "running",
         "ami_id": "ami-0123456789abcdef0",
         "vpc_id": "vpc-0123456789abcdef0",
         "subnet_id": "subnet-0123456789abcdef0",

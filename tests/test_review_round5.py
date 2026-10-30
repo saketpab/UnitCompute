@@ -77,6 +77,8 @@ def _raw_state(
     resources: dict[str, dict[str, Any]] = {}
     if iid:
         resources["aws_instance.vm"] = {"id": iid, "root_block_device": [{"volume_id": vid}]}
+    if iid:
+        resources["aws_ec2_instance_state.vm"] = {"id": iid, "instance_id": iid, "state": "running"}
     if sg:
         resources["aws_security_group.vm"] = {"id": sg}
     return raw_state(simulated_lineage(dep), 1, resources, terraform_version)
@@ -493,7 +495,7 @@ def test_r5_2_migration_backfills_obligations_for_earlier_failures(
                     "'succeeded', 'h', ?)",
                     ("job_ok" + dep[4:], dep, "plan_ok" + dep[4:], now),
                 )
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     with db.read() as conn:
         rows = sorted(
             (r["deployment_id"], r["reason"], r["evidence"], r["discharged_at"] is not None)
@@ -592,7 +594,12 @@ def test_r5_2_real_terraform_backend_failure_leaves_errored_state(tmp_path: Path
     [
         (
             _raw_state("i-0aaaaaaaaaaaaaaa1", "vol-0aaaaaaaaaaaaaaa1", "sg-0aaaaaaaaaaaaaaa1"),
-            AppliedState("i-0aaaaaaaaaaaaaaa1", "sg-0aaaaaaaaaaaaaaa1", "vol-0aaaaaaaaaaaaaaa1"),
+            AppliedState(
+                "i-0aaaaaaaaaaaaaaa1",
+                "sg-0aaaaaaaaaaaaaaa1",
+                "vol-0aaaaaaaaaaaaaaa1",
+                "i-0aaaaaaaaaaaaaaa1",
+            ),
         ),
         (_raw_state(None, None), AppliedState(None, None, None)),
     ],

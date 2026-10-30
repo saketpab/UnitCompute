@@ -32,7 +32,7 @@ def poll_job(client: httpx.Client, job_id: str, timeout: float = 120) -> dict[st
 
 def show_preview(deployment: dict[str, Any]) -> dict[str, Any]:
     plan: dict[str, Any] = deployment["current_plan"]
-    print(f"\nPlan {plan['plan_id']} ({plan['kind']}), expires {plan['expires_at']}")
+    print(f"\nPlan {plan['plan_id']} ({plan['operation']}), expires {plan['expires_at']}")
     print(f"  hash: {plan['plan_hash']}")
     for change in plan["resource_changes"]:
         print(f"  {change['action']:>6} {change['address']}: {json.dumps(change['summary'])}")
@@ -92,6 +92,30 @@ def main() -> int:
         print("access:", deployment["access"]["command"] or "(simulated: none)")
         for requirement in deployment["access"]["requirements"]:
             print("  -", requirement)
+
+    # Edit the running VM: a new name and a larger disk, then stop and start it. Each is a
+    # preview that must be approved by plan ID and hash, like creation and deletion.
+    for label, body in (
+        ("rename and grow the disk", {"name": "demo-renamed", "disk_gib": 12}),
+        ("stop", {"power_state": "stopped"}),
+        ("start", {"power_state": "running"}),
+    ):
+        edit = client.post(
+            f"/deployments/{deployment_id}/update-plan",
+            json=body,
+            headers={"Idempotency-Key": f"update-{uuid.uuid4().hex}"},
+        ).raise_for_status()
+        poll_job(client, edit.json()["job_id"])
+        print(f"\n{label}:")
+        plan = show_preview(client.get(f"/deployments/{deployment_id}").json())
+        job = poll_job(client, approve(client, deployment_id, plan)["job_id"])
+        deployment = client.get(f"/deployments/{deployment_id}").json()
+        print(
+            f"{label} job {job['status']}; {deployment['name']}, {deployment['disk_gib']} GiB, "
+            f"power {deployment['power_state']} (EC2: {deployment['instance_state']})"
+        )
+        if job["status"] != "succeeded":
+            return 1
 
     deletion = client.post(f"/deployments/{deployment_id}/deletion-plan").raise_for_status()
     poll_job(client, deletion.json()["job_id"])

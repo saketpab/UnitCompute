@@ -132,6 +132,22 @@
   {
    "address": {
     "kind": "var",
+    "name": "power_state",
+    "to_display": "var.power_state"
+   },
+   "instances": [
+    {
+     "address": {
+      "to_display": "var.power_state"
+     },
+     "status": "pass"
+    }
+   ],
+   "status": "pass"
+  },
+  {
+   "address": {
+    "kind": "var",
     "name": "region",
     "to_display": "var.region"
    },
@@ -217,6 +233,14 @@
       ]
      }
     },
+    "power_state": {
+     "expression": {
+      "references": [
+       "aws_ec2_instance_state.vm.state",
+       "aws_ec2_instance_state.vm"
+      ]
+     }
+    },
     "root_volume_id": {
      "expression": {
       "references": [
@@ -237,6 +261,30 @@
     }
    },
    "resources": [
+    {
+     "address": "aws_ec2_instance_state.vm",
+     "expressions": {
+      "force": {
+       "constant_value": false
+      },
+      "instance_id": {
+       "references": [
+        "aws_instance.vm.id",
+        "aws_instance.vm"
+       ]
+      },
+      "state": {
+       "references": [
+        "var.power_state"
+       ]
+      }
+     },
+     "mode": "managed",
+     "name": "vm",
+     "provider_config_key": "aws",
+     "schema_version": 0,
+     "type": "aws_ec2_instance_state"
+    },
     {
      "address": "aws_instance.vm",
      "expressions": {
@@ -393,6 +441,9 @@
     "instance_type": {},
     "name": {},
     "owner_tag": {},
+    "power_state": {
+     "default": "running"
+    },
     "region": {},
     "subnet_id": {},
     "vpc_id": {}
@@ -417,6 +468,16 @@
    ],
    "after_sensitive": false,
    "after_unknown": true,
+   "before": null,
+   "before_sensitive": false
+  },
+  "power_state": {
+   "actions": [
+    "create"
+   ],
+   "after": "running",
+   "after_sensitive": false,
+   "after_unknown": false,
    "before": null,
    "before_sensitive": false
   },
@@ -447,6 +508,11 @@
    "instance_id": {
     "sensitive": false
    },
+   "power_state": {
+    "sensitive": false,
+    "type": "string",
+    "value": "running"
+   },
    "root_volume_id": {
     "sensitive": false
    },
@@ -456,6 +522,21 @@
   },
   "root_module": {
    "resources": [
+    {
+     "address": "aws_ec2_instance_state.vm",
+     "mode": "managed",
+     "name": "vm",
+     "provider_name": "registry.terraform.io/hashicorp/aws",
+     "schema_version": 0,
+     "sensitive_values": {},
+     "type": "aws_ec2_instance_state",
+     "values": {
+      "force": false,
+      "region": "us-east-1",
+      "state": "running",
+      "timeouts": null
+     }
+    },
     {
      "address": "aws_instance.vm",
      "identity": {
@@ -542,14 +623,14 @@
        "Name": "unitcompute-demo",
        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
        "UnitComputeOwner": "0123456789abcdef",
-       "UnitComputeTemplate": "ec2-vm/v1"
+       "UnitComputeTemplate": "ec2-vm/v2"
       },
       "tags_all": {
        "ManagedBy": "unitcompute",
        "Name": "unitcompute-demo",
        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
        "UnitComputeOwner": "0123456789abcdef",
-       "UnitComputeTemplate": "ec2-vm/v1"
+       "UnitComputeTemplate": "ec2-vm/v2"
       },
       "timeouts": null,
       "user_data": null,
@@ -559,7 +640,7 @@
        "Name": "unitcompute-demo-root",
        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
        "UnitComputeOwner": "0123456789abcdef",
-       "UnitComputeTemplate": "ec2-vm/v1"
+       "UnitComputeTemplate": "ec2-vm/v2"
       }
      }
     },
@@ -617,20 +698,34 @@
        "Name": "unitcompute-demo",
        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
        "UnitComputeOwner": "0123456789abcdef",
-       "UnitComputeTemplate": "ec2-vm/v1"
+       "UnitComputeTemplate": "ec2-vm/v2"
       },
       "tags_all": {
        "ManagedBy": "unitcompute",
        "Name": "unitcompute-demo",
        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
        "UnitComputeOwner": "0123456789abcdef",
-       "UnitComputeTemplate": "ec2-vm/v1"
+       "UnitComputeTemplate": "ec2-vm/v2"
       },
       "timeouts": null,
       "vpc_id": "vpc-0123456789abcdef0"
      }
     }
    ]
+  }
+ },
+ "prior_state": {
+  "format_version": "1.0",
+  "terraform_version": "1.17.1",
+  "values": {
+   "outputs": {
+    "power_state": {
+     "sensitive": false,
+     "type": "string",
+     "value": "running"
+    }
+   },
+   "root_module": {}
   }
  },
  "relevant_attributes": [
@@ -642,9 +737,7 @@
   },
   {
    "attribute": [
-    "root_block_device",
-    0,
-    "volume_id"
+    "id"
    ],
    "resource": "aws_instance.vm"
   },
@@ -656,12 +749,45 @@
   },
   {
    "attribute": [
-    "id"
+    "root_block_device",
+    0,
+    "volume_id"
    ],
    "resource": "aws_instance.vm"
+  },
+  {
+   "attribute": [
+    "state"
+   ],
+   "resource": "aws_ec2_instance_state.vm"
   }
  ],
  "resource_changes": [
+  {
+   "address": "aws_ec2_instance_state.vm",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "force": false,
+     "region": "us-east-1",
+     "state": "running",
+     "timeouts": null
+    },
+    "after_sensitive": {},
+    "after_unknown": {
+     "id": true,
+     "instance_id": true
+    },
+    "before": null,
+    "before_sensitive": false
+   },
+   "mode": "managed",
+   "name": "vm",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "type": "aws_ec2_instance_state"
+  },
   {
    "address": "aws_instance.vm",
    "change": {
@@ -709,14 +835,14 @@
       "Name": "unitcompute-demo",
       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
       "UnitComputeOwner": "0123456789abcdef",
-      "UnitComputeTemplate": "ec2-vm/v1"
+      "UnitComputeTemplate": "ec2-vm/v2"
      },
      "tags_all": {
       "ManagedBy": "unitcompute",
       "Name": "unitcompute-demo",
       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
       "UnitComputeOwner": "0123456789abcdef",
-      "UnitComputeTemplate": "ec2-vm/v1"
+      "UnitComputeTemplate": "ec2-vm/v2"
      },
      "timeouts": null,
      "user_data": null,
@@ -726,7 +852,7 @@
       "Name": "unitcompute-demo-root",
       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
       "UnitComputeOwner": "0123456789abcdef",
-      "UnitComputeTemplate": "ec2-vm/v1"
+      "UnitComputeTemplate": "ec2-vm/v2"
      }
     },
     "after_identity": {
@@ -870,14 +996,14 @@
       "Name": "unitcompute-demo",
       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
       "UnitComputeOwner": "0123456789abcdef",
-      "UnitComputeTemplate": "ec2-vm/v1"
+      "UnitComputeTemplate": "ec2-vm/v2"
      },
      "tags_all": {
       "ManagedBy": "unitcompute",
       "Name": "unitcompute-demo",
       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
       "UnitComputeOwner": "0123456789abcdef",
-      "UnitComputeTemplate": "ec2-vm/v1"
+      "UnitComputeTemplate": "ec2-vm/v2"
      },
      "timeouts": null,
      "vpc_id": "vpc-0123456789abcdef0"
@@ -955,6 +1081,9 @@
   },
   "owner_tag": {
    "value": "0123456789abcdef"
+  },
+  "power_state": {
+   "value": "running"
   },
   "region": {
    "value": "us-east-1"

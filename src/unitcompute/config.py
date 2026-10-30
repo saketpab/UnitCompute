@@ -18,7 +18,13 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-SUPPORTED_REGION = "us-east-1"
+DEFAULT_REGION = "us-east-1"
+# One region per installation (SPEC). A region is supported only when it has a reviewed price
+# snapshot (pricing.PRICE_SNAPSHOTS), a bootstrapped network/IAM/state environment and
+# regional IAM policies filled from docs/iam. Adding one is a code change that adds its
+# snapshot here and there; the configured value is checked against this set at startup.
+SUPPORTED_REGIONS = frozenset({DEFAULT_REGION})
+_REGION = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-[0-9]$")
 INSTANCE_TYPE = "t3.micro"
 AL2023_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 AGENT_PROVIDERS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
@@ -66,7 +72,7 @@ class Settings(BaseSettings):
     max_request_bytes: int = Field(default=16 * 1024, ge=1024, le=1024 * 1024)
 
     provisioner: ProvisionerKind = ProvisionerKind.DISABLED
-    aws_region: str = SUPPORTED_REGION
+    aws_region: str = DEFAULT_REGION
     aws_account_id: str | None = None
     vpc_id: str | None = None
     subnet_id: str | None = None
@@ -133,8 +139,13 @@ class Settings(BaseSettings):
     def _fail_closed(self) -> Self:
         problems: list[str] = []
         production = self.environment is Environment.PRODUCTION
-        if self.aws_region != SUPPORTED_REGION:
-            problems.append(f"aws_region must be {SUPPORTED_REGION}")
+        if not _REGION.fullmatch(self.aws_region):
+            problems.append("aws_region must look like an AWS region name such as us-east-1")
+        elif self.aws_region not in SUPPORTED_REGIONS:
+            problems.append(
+                "aws_region must be one of the supported regions: "
+                + ", ".join(sorted(SUPPORTED_REGIONS))
+            )
         if production and self.auth_mode is not AuthMode.JWT:
             problems.append("production requires auth_mode=jwt")
         if self.provisioner is ProvisionerKind.TERRAFORM and (

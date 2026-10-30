@@ -462,7 +462,11 @@ def test_s4_real_plan_with_local_exec_and_foreign_group_rejected(tmp_path: Path)
 # ------------------------------------------------------------------- S5: IAM
 
 
-PLACEHOLDERS = {"state_bucket": "${state_bucket}"}
+PLACEHOLDERS = {
+    "state_bucket": "${state_bucket}",
+    "region": "us-east-1",
+    "account_id": "123456789012",
+}
 ALICE_SESSION = {"aws:PrincipalTag/UnitComputeDeployment": "dep_alice"}
 
 
@@ -574,6 +578,7 @@ def test_r1_retained_untagged_root_volume_blocks_deletion(
     state = json.loads(path.read_text())
     state["aws_instance.vm"]["id"] = iid
     state["aws_instance.vm"]["root_block_device"][0]["volume_id"] = vid
+    state["aws_ec2_instance_state.vm"].update(id=iid, instance_id=iid)
     path.write_text(json.dumps(state))
     with harness.db.transaction() as conn:
         conn.execute(
@@ -877,28 +882,32 @@ def _status(state: str, instance: str, system: str) -> dict[str, Any]:
         (
             _status("running", "ok", "ok"),
             [{"InstanceId": "i-1", "PingStatus": "Online", "ResourceType": "EC2Instance"}],
-            Readiness("ok", "Online"),
+            Readiness("ok", "Online", "running"),
         ),
-        (_status("running", "initializing", "ok"), [], Readiness("initializing", "NotRegistered")),
+        (
+            _status("running", "initializing", "ok"),
+            [],
+            Readiness("initializing", "NotRegistered", "running"),
+        ),
         (
             _status("running", "impaired", "ok"),
             [{"InstanceId": "i-1", "PingStatus": "ConnectionLost"}],
-            Readiness("impaired", "ConnectionLost"),
+            Readiness("impaired", "ConnectionLost", "running"),
         ),
         (
             _status("running", "ok", "ok"),
             [{"InstanceId": "i-other", "PingStatus": "Online", "ResourceType": "EC2Instance"}],
-            Readiness("ok", "NotRegistered"),
+            Readiness("ok", "NotRegistered", "running"),
         ),
         (
             _status("running", "ok", "ok"),
             [{"InstanceId": "i-1", "PingStatus": "Online", "ResourceType": "ManagedInstance"}],
-            Readiness("ok", "NotRegistered"),
+            Readiness("ok", "NotRegistered", "running"),
         ),
         (
             _status("stopped", "not-applicable", "not-applicable"),
             [],
-            Readiness("stopped", "NotRegistered"),
+            Readiness("stopped", "NotRegistered", "stopped"),
         ),
     ],
 )
@@ -912,7 +921,7 @@ def test_r5_connection_readiness_reads_ec2_checks_and_exact_ssm_identity(
     )
     readiness = aws.connection_readiness("i-1", TemporaryCredentials("a", "b", "c"))
     assert readiness == expected
-    assert readiness.ready is (expected == Readiness("ok", "Online"))
+    assert readiness.ready is (expected == Readiness("ok", "Online", "running"))
 
 
 def test_r5_infrastructure_success_is_distinct_from_connection_readiness(

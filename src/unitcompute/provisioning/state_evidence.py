@@ -33,9 +33,12 @@ from typing import Any
 
 INSTANCE = "aws_instance.vm"
 SECURITY_GROUP = "aws_security_group.vm"
+INSTANCE_STATE = "aws_ec2_instance_state.vm"
 _PATTERNS = {
     "aws_instance": re.compile(r"^i-[0-9a-f]{8,17}$"),
     "aws_security_group": re.compile(r"^sg-[0-9a-f]{8,17}$"),
+    # The power-state resource's ID is the ID of the instance it manages.
+    "aws_ec2_instance_state": re.compile(r"^i-[0-9a-f]{8,17}$"),
 }
 _VOLUME = re.compile(r"^vol-[0-9a-f]{8,17}$")
 _ANY_ID = re.compile(r"^(i|vol|sg)-[0-9a-f]{8,17}$")
@@ -53,6 +56,7 @@ class AppliedState:
     instance_id: str | None
     security_group_id: str | None
     root_volume_id: str | None
+    instance_state_id: str | None = None  # the instance its power-state resource manages
 
 
 @dataclass(frozen=True)
@@ -139,11 +143,15 @@ def parse_raw_state(document: object, *, terraform_version: str) -> StateDocumen
         found[rtype] = _single(attributes, rtype)
     instance_entry = found.get("aws_instance")
     group_entry = found.get("aws_security_group")
+    power_entry = found.get("aws_ec2_instance_state")
     applied = AppliedState(
         instance_id=instance_entry[0] if instance_entry else None,
         security_group_id=group_entry[0] if group_entry else None,
         root_volume_id=instance_entry[1] if instance_entry else None,
+        instance_state_id=power_entry[0] if power_entry else None,
     )
+    if power_entry and (not instance_entry or power_entry[0] != instance_entry[0]):
+        raise StateEvidenceError("power state does not belong to the state's instance")
     outputs: dict[str, str] = {}
     for key in _OUTPUTS:
         if key not in raw_outputs:
@@ -178,7 +186,11 @@ def bind_to_plan(
     if document.serial < prior.serial:
         raise StateEvidenceError("state is older than the applied plan's state")
     applied = document.applied
-    present = {INSTANCE: applied.instance_id, SECURITY_GROUP: applied.security_group_id}
+    present = {
+        INSTANCE: applied.instance_id,
+        SECURITY_GROUP: applied.security_group_id,
+        INSTANCE_STATE: applied.instance_state_id,
+    }
     if creates and all(present.get(address) is None for address in creates):
         # A state that shows none of what the plan creates says nothing about the apply
         # (it may be stale, or taken before anything was persisted).
@@ -191,7 +203,9 @@ def bind_to_plan(
             if require_all_creates:
                 raise StateEvidenceError(f"state does not show the created {address}")
             continue
-        if resource_id in prior_ids:
+        # The power-state resource is keyed by its instance's ID, which is legitimately in the
+        # prior state when the plan only adds this resource to an existing VM.
+        if resource_id in prior_ids and address != INSTANCE_STATE:
             raise StateEvidenceError(f"state shows the plan's prior {address}, not a new one")
     if INSTANCE in creates and applied.root_volume_id in prior_ids:
         raise StateEvidenceError("state shows a prior root volume for a new instance")

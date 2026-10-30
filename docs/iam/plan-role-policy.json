@@ -23,7 +23,7 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:RequestedRegion": "us-east-1"
+          "aws:RequestedRegion": "${region}"
         }
       }
     },
@@ -31,7 +31,7 @@
       "Sid": "ResolveOfficialAmazonLinuxAmi",
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:us-east-1::parameter/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+      "Resource": "arn:aws:ssm:${region}::parameter/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
     },
     {
       "Sid": "ListDeploymentStatePrefixOnly",

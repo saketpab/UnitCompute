@@ -35,6 +35,7 @@ from unitcompute.schemas import (
     DeploymentRequest,
     ErrorResponse,
     JobSummary,
+    UpdateRequest,
 )
 from unitcompute.services.deployments import DeploymentService
 
@@ -252,6 +253,26 @@ def build_router() -> APIRouter:
     ) -> JSONResponse:
         status, response = _container(request).deployments.request_plan(
             principal, deployment_id, "create", key, request_id_var.get()
+        )
+        return _accepted(status, response)
+
+    @router.post(
+        "/deployments/{deployment_id}/update-plan",
+        status_code=202,
+        response_model=AcceptedResponse,
+        responses=ERRORS,
+        tags=["deployments"],
+        summary="Preview an edit: new name, larger root disk and/or stop or start the VM",
+    )
+    def update_plan(
+        deployment_id: DeploymentId,
+        body: UpdateRequest,
+        principal: PrincipalDep,
+        key: IdempotencyDep,
+        request: Request,
+    ) -> JSONResponse:
+        status, response = _container(request).deployments.request_update(
+            principal, deployment_id, body, key, request_id_var.get()
         )
         return _accepted(status, response)
 

@@ -20,7 +20,10 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from unitcompute.config import AL2023_AMI_PARAMETER, Settings
 from unitcompute.provisioning.base import (
+    MANAGED_BY_VALUE,
     TAG_DEPLOYMENT,
+    TAG_MANAGED_BY,
+    InstanceDetails,
     OwnedResource,
     ProvisioningError,
     Readiness,
@@ -75,7 +78,8 @@ def session_policy(
     region, account = settings.aws_region, settings.aws_account_id
     read = {
         "Effect": "Allow",
-        "Action": ["ec2:Describe*", "ssm:DescribeInstanceInformation"],
+        "Action": ["ec2:Describe*"]
+        + (["ssm:DescribeInstanceInformation"] if role == "plan" else []),
         "Resource": "*",
     }
     if deployment_id is None:
@@ -130,7 +134,7 @@ def session_policy(
             # New VM, root volume and security group must carry this deployment's tag.
             "Effect": "Allow",
             "Action": ["ec2:RunInstances", "ec2:CreateTags", "ec2:CreateSecurityGroup"],
-            "Resource": [f"{ec2}:instance/*", f"{ec2}:volume/*", f"{ec2}:security-group/*"],
+            "Resource": f"{ec2}:*/*",
             "Condition": {"StringEquals": tag},
         },
         {
@@ -148,19 +152,30 @@ def session_policy(
             "Resource": f"{ec2}:vpc/{settings.vpc_id}",
         },
         {
+            # Everything done to resources that already carry this deployment's tag: delete,
+            # stop/start, grow the disk, and rename (only the Name tag may be edited; the
+            # TagKeys condition is vacuously true for the actions that carry no tags). The type
+            # wildcard keeps the policy under the STS size limit; the role policy lists types.
             "Effect": "Allow",
             "Action": [
-                "ec2:RunInstances",
                 "ec2:TerminateInstances",
+                "ec2:StartInstances",
+                "ec2:StopInstances",
+                "ec2:ModifyVolume",
                 "ec2:DeleteSecurityGroup",
                 "ec2:AuthorizeSecurityGroupEgress",
                 "ec2:RevokeSecurityGroupEgress",
                 "ec2:RevokeSecurityGroupIngress",
                 "ec2:ModifyInstanceCreditSpecification",
                 "ec2:ModifyInstanceMetadataOptions",
+                "ec2:CreateTags",
+                "ec2:DeleteTags",
             ],
-            "Resource": [f"{ec2}:instance/*", f"{ec2}:security-group/*"],
-            "Condition": {"StringEquals": owned},
+            "Resource": f"{ec2}:*/*",
+            "Condition": {
+                "StringEquals": owned,
+                "ForAllValues:StringEquals": {"aws:TagKeys": ["Name"]},
+            },
         },
         {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
     ]
@@ -361,6 +376,102 @@ class AwsEnvironment:
                 ) from exc
         return found
 
+    def instance_details(
+        self, instance_ids: list[str], creds: TemporaryCredentials
+    ) -> dict[str, InstanceDetails]:
+        """State and root-volume size read directly from EC2 (terminated or unknown
+        instances are omitted). Used to verify that an edit or a stop/start really happened."""
+        details: dict[str, InstanceDetails] = {}
+        ec2 = self._client("ec2", creds)
+        for instance_id in sorted(set(instance_ids)):
+            try:
+                reservations = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"]
+                for reservation in reservations:
+                    for instance in reservation["Instances"]:
+                        state = str(instance["State"]["Name"])
+                        if state == "terminated":
+                            continue
+                        root_name = instance.get("RootDeviceName")
+                        volume_id = next(
+                            (
+                                m["Ebs"]["VolumeId"]
+                                for m in instance.get("BlockDeviceMappings", [])
+                                if m.get("DeviceName") == root_name
+                                and m.get("Ebs", {}).get("VolumeId")
+                            ),
+                            None,
+                        )
+                        size: int | None = None
+                        if volume_id:
+                            volumes = ec2.describe_volumes(VolumeIds=[volume_id])["Volumes"]
+                            size = int(volumes[0]["Size"]) if volumes else None
+                        details[instance_id] = InstanceDetails(state, volume_id, size)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code", "") in _NOT_FOUND:
+                    continue
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not read {instance_id}."
+                ) from exc
+            except BotoCoreError as exc:
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not read {instance_id}."
+                ) from exc
+        return details
+
+    def managed_resources(
+        self, creds: TemporaryCredentials
+    ) -> list[tuple[OwnedResource, str | None]]:
+        """Everything in the region tagged ManagedBy=unitcompute, with the deployment ID it
+        claims (None when that tag is missing). Read-only; used to find orphans."""
+        tag_filter = {"Name": f"tag:{TAG_MANAGED_BY}", "Values": [MANAGED_BY_VALUE]}
+
+        def deployment(item: dict[str, Any]) -> str | None:
+            for tag in item.get("Tags", []):
+                if tag.get("Key") == TAG_DEPLOYMENT:
+                    return str(tag.get("Value"))
+            return None
+
+        found: list[tuple[OwnedResource, str | None]] = []
+        try:
+            ec2 = self._client("ec2", creds)
+            for page in ec2.get_paginator("describe_instances").paginate(
+                Filters=[
+                    tag_filter,
+                    {"Name": "instance-state-name", "Values": LIVE_INSTANCE_STATES},
+                ]
+            ):
+                for reservation in page["Reservations"]:
+                    for instance in reservation["Instances"]:
+                        found.append(
+                            (
+                                OwnedResource(
+                                    "instance", instance["InstanceId"], instance["State"]["Name"]
+                                ),
+                                deployment(instance),
+                            )
+                        )
+            for page in ec2.get_paginator("describe_volumes").paginate(Filters=[tag_filter]):
+                for volume in page["Volumes"]:
+                    found.append(
+                        (
+                            OwnedResource("volume", volume["VolumeId"], volume["State"]),
+                            deployment(volume),
+                        )
+                    )
+            for page in ec2.get_paginator("describe_security_groups").paginate(
+                Filters=[tag_filter]
+            ):
+                for group in page["SecurityGroups"]:
+                    found.append(
+                        (
+                            OwnedResource("security_group", group["GroupId"], "exists"),
+                            deployment(group),
+                        )
+                    )
+        except (ClientError, BotoCoreError) as exc:
+            raise ProvisioningError("aws_unavailable", "Could not list managed resources.") from exc
+        return found
+
     def instance_volumes(
         self, instance_ids: list[str], creds: TemporaryCredentials
     ) -> dict[str, list[tuple[str, bool]]]:
@@ -396,6 +507,7 @@ class AwsEnvironment:
 
     def connection_readiness(self, instance_id: str, creds: TemporaryCredentials) -> Readiness:
         """EC2 status checks plus SSM registration of this exact EC2 instance."""
+        state_name: str | None = None
         try:
             statuses = self._client("ec2", creds).describe_instance_status(
                 InstanceIds=[instance_id], IncludeAllInstances=True
@@ -412,6 +524,7 @@ class AwsEnvironment:
                     status.get("SystemStatus", {}).get("Status"),
                 }
                 state = status.get("InstanceState", {}).get("Name")
+                state_name = str(state) if state else None
                 if state != "running":
                     ec2_status = str(state)
                 elif checks == {"ok"}:
@@ -434,4 +547,4 @@ class AwsEnvironment:
                 and item.get("ResourceType", "EC2Instance") == "EC2Instance"
             ]
             ssm_status = str(matching[0].get("PingStatus")) if matching else "NotRegistered"
-        return Readiness(ec2_status=ec2_status, ssm_status=ssm_status)
+        return Readiness(ec2_status=ec2_status, ssm_status=ssm_status, instance_state=state_name)

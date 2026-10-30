@@ -32,6 +32,7 @@ def test_full_lifecycle_create_inspect_delete(harness: Harness) -> None:
     assert {c["address"] for c in plan["resource_changes"]} == {
         "aws_instance.vm",
         "aws_security_group.vm",
+        "aws_ec2_instance_state.vm",
     }
     instance = next(c for c in plan["resource_changes"] if c["address"] == "aws_instance.vm")
     assert instance["summary"]["imdsv2_required"] is True

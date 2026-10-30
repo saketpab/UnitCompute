@@ -13,7 +13,7 @@ from typing import Any, Literal, Protocol
 
 from unitcompute.provisioning.state_evidence import PriorState
 
-TEMPLATE_VERSION = "ec2-vm/v1"
+TEMPLATE_VERSION = "ec2-vm/v2"
 TAG_MANAGED_BY = "ManagedBy"
 TAG_DEPLOYMENT = "UnitComputeDeployment"
 TAG_OWNER = "UnitComputeOwner"
@@ -44,6 +44,7 @@ class DeploymentSpec:
     disk_gib: int
     region: str
     instance_type: str
+    power_state: str = "running"  # the power state this plan should leave the VM in
 
 
 @dataclass(frozen=True)
@@ -85,11 +86,21 @@ class OwnedResource:
 
 
 @dataclass(frozen=True)
+class InstanceDetails:
+    """What AWS reports for one instance, read directly (not from Terraform state)."""
+
+    state: str
+    root_volume_id: str | None
+    root_volume_gib: int | None
+
+
+@dataclass(frozen=True)
 class Readiness:
     """Connection readiness, separate from whether infrastructure was applied."""
 
     ec2_status: str | None  # "ok" once both EC2 status checks pass
     ssm_status: str | None  # SSM PingStatus for this exact EC2 instance, e.g. "Online"
+    instance_state: str | None = None  # EC2 state name: pending, running, stopping, stopped...
 
     @property
     def ready(self) -> bool:
@@ -180,6 +191,16 @@ class Provisioner(Protocol):
         ProvisioningError when the lookup itself fails."""
         ...
 
+    def instance_details(self, instance_ids: list[str]) -> dict[str, InstanceDetails]:
+        """Direct lookup of state and root volume size for instances that exist (terminated
+        and unknown ones are omitted). Raises ProvisioningError when the lookup fails."""
+        ...
+
+    def managed_resources(self) -> list[tuple[OwnedResource, str | None]]:
+        """Every live resource in the region tagged ManagedBy=unitcompute with the deployment
+        ID it claims (None if untagged). Read-only; the basis of the orphan report."""
+        ...
+
     def connection_readiness(self, instance_id: str) -> Readiness: ...
 
     def self_check(self) -> dict[str, Any]:
@@ -188,7 +209,7 @@ class Provisioner(Protocol):
 
 
 def template_dir() -> Path:
-    return Path(__file__).parent / "templates" / "ec2_vm_v1"
+    return Path(__file__).parent / "templates" / "ec2_vm_v2"
 
 
 def template_hash(directory: Path | None = None) -> str:

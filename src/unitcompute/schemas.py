@@ -5,7 +5,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from unitcompute.logging_setup import redact
 
@@ -59,6 +66,28 @@ class DeploymentRequest(StrictRequest):
     disk_gib: DiskGiB = Field(description="Encrypted gp3 root disk size in GiB (8-30).")
 
 
+PowerState = Literal["running", "stopped"]
+
+
+class UpdateRequest(StrictRequest):
+    """An edit of an existing VM: any non-empty subset of the three supported changes. The
+    region, image, network and instance type are fixed by the server and cannot be edited."""
+
+    name: DeploymentName | None = Field(default=None, description="New VM name.")
+    disk_gib: DiskGiB | None = Field(
+        default=None, description="New root disk size in GiB; it can only grow."
+    )
+    power_state: PowerState | None = Field(
+        default=None, description="'stopped' to stop the VM, 'running' to start it."
+    )
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> UpdateRequest:
+        if self.name is None and self.disk_gib is None and self.power_state is None:
+            raise ValueError("request at least one of name, disk_gib and power_state")
+        return self
+
+
 class ApprovalRequest(StrictRequest):
     plan_id: Annotated[str, StringConstraints(pattern=PLAN_ID_PATTERN)]
     plan_hash: Annotated[str, StringConstraints(pattern=SHA256_PATTERN)] = Field(
@@ -104,6 +133,12 @@ class ResourceChange(BaseModel):
 class PlanPreview(BaseModel):
     plan_id: str
     kind: PlanKind
+    operation: Literal["create", "update", "delete"] = Field(
+        description="What this plan does: create or repair, edit in place, or delete."
+    )
+    request: dict[str, Any] | None = Field(
+        default=None, description="The edit this plan was made for (update plans only)."
+    )
     status: str
     plan_hash: str | None
     expires_at: datetime | None
@@ -148,6 +183,12 @@ class DeploymentDetail(BaseModel):
     provisioner: str
     status: DeploymentStatus
     status_reason: str | None
+    power_state: PowerState = Field(
+        default="running", description="The power state UnitCompute last verified it applied."
+    )
+    instance_state: str | None = Field(
+        default=None, description="EC2 state last observed by the worker (informational)."
+    )
     created_at: datetime
     updated_at: datetime
     current_plan: PlanPreview | None

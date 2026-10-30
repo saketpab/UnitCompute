@@ -40,6 +40,9 @@ PRICE_SNAPSHOT = PriceSnapshot(
     ),
 )
 
+# Region -> snapshot. A region is configurable only if it appears here (config.SUPPORTED_REGIONS).
+PRICE_SNAPSHOTS: dict[str, PriceSnapshot] = {PRICE_SNAPSHOT.region: PRICE_SNAPSHOT}
+
 EXCLUDED = [
     "taxes",
     "data transfer",
@@ -61,8 +64,18 @@ def _usd(value: Decimal) -> str:
     return str(value.quantize(_CENT, rounding=ROUND_HALF_UP))
 
 
-def estimate_monthly_cost(disk_gib: int, snapshot: PriceSnapshot = PRICE_SNAPSHOT) -> CostEstimate:
-    hours = Decimal(snapshot.hours_per_month)
+def estimate_monthly_cost(
+    disk_gib: int,
+    snapshot: PriceSnapshot | None = None,
+    *,
+    region: str | None = None,
+    running: bool = True,
+) -> CostEstimate:
+    """``running=False`` prices a stopped VM: EC2 compute and the auto-assigned public IPv4
+    stop accruing, the EBS root volume keeps accruing."""
+    if snapshot is None:
+        snapshot = PRICE_SNAPSHOTS[region] if region is not None else PRICE_SNAPSHOT
+    hours = Decimal(snapshot.hours_per_month if running else 0)
     compute = (snapshot.t3_micro_hourly * hours).quantize(_CENT, rounding=ROUND_HALF_UP)
     ipv4 = (snapshot.public_ipv4_hourly * hours).quantize(_CENT, rounding=ROUND_HALF_UP)
     disk = (snapshot.gp3_gib_month * disk_gib).quantize(_CENT, rounding=ROUND_HALF_UP)
@@ -73,12 +86,14 @@ def estimate_monthly_cost(disk_gib: int, snapshot: PriceSnapshot = PRICE_SNAPSHO
             CostLine(
                 item="EC2 t3.micro (Linux, on-demand)",
                 monthly_usd=_usd(compute),
-                basis=f"${snapshot.t3_micro_hourly}/hour x {snapshot.hours_per_month} h",
+                basis=f"${snapshot.t3_micro_hourly}/hour x {hours} h"
+                + ("" if running else " (stopped)"),
             ),
             CostLine(
                 item="Public IPv4 address",
                 monthly_usd=_usd(ipv4),
-                basis=f"${snapshot.public_ipv4_hourly}/hour x {snapshot.hours_per_month} h",
+                basis=f"${snapshot.public_ipv4_hourly}/hour x {hours} h"
+                + ("" if running else " (stopped)"),
             ),
             CostLine(
                 item=f"EBS gp3 root volume ({disk_gib} GiB)",

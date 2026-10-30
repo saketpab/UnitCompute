@@ -19,7 +19,7 @@ from typing import Any
 from unitcompute.auth import Principal
 from unitcompute.config import INSTANCE_TYPE, ProvisionerKind, Settings
 from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
-from unitcompute.errors import Conflict, NotFound, ServiceUnavailable
+from unitcompute.errors import Conflict, InvalidInput, NotFound, ServiceUnavailable
 from unitcompute.logging_setup import redact
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
@@ -38,6 +38,7 @@ from unitcompute.schemas import (
     JobSummary,
     PlanPreview,
     ResourceChange,
+    UpdateRequest,
 )
 
 Clock = Callable[[], datetime]
@@ -276,6 +277,7 @@ class DeploymentService:
         provisioner: str,
         payload_hash: str,
         idempotency: tuple[str, str] | None,
+        edit: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         now = to_db_time(self._clock())
         conn.execute(
@@ -291,12 +293,13 @@ class DeploymentService:
                 "region": deployment["region"],
                 "instance_type": deployment["instance_type"],
                 "kind": kind,
+                "edit": edit,
             }
         )
         conn.execute(
             "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
-            "config_hash, region, state_key, template_version, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            "config_hash, region, state_key, template_version, created_at, request_json) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
             (
                 plan_id,
                 deployment["id"],
@@ -308,6 +311,7 @@ class DeploymentService:
                 state_key(deployment["id"]),
                 TEMPLATE_VERSION,
                 now,
+                json.dumps(edit, sort_keys=True) if edit else None,
             ),
         )
         try:
@@ -473,6 +477,80 @@ class DeploymentService:
             status = "planning" if kind == "create" else "deletion_planning"
             response = AcceptedResponse(
                 deployment_id=deployment_id, plan_id=plan_id, job_id=job_id, status=status
+            ).model_dump()
+            self._store_idempotency(
+                conn, principal, scope, idempotency_key, payload_hash, 202, response
+            )
+        return 202, response
+
+    def request_update(
+        self,
+        principal: Principal,
+        deployment_id: str,
+        request: UpdateRequest,
+        idempotency_key: str | None,
+        request_id: str | None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Preview an edit of the VM's name, root disk size (grow only) and/or power state.
+
+        It is an ordinary plan: computed by Terraform, checked by the policy, approved by exact
+        plan hash, and applied by the worker. Nothing changes until it is approved."""
+        provisioner = self._require_provisioning()
+        scope = f"POST /deployments/{deployment_id}/update-plan"
+        edit = request.model_dump(exclude_none=True)
+        payload_hash = canonical_hash({"scope": scope, "body": edit})
+        with self._db.transaction() as conn:
+            replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)
+            if replay:
+                return replay
+            deployment = self._owned_deployment(conn, principal, deployment_id)
+            if deployment["status"] not in PLANNABLE["create"] - {"awaiting_deletion_approval"}:
+                raise Conflict(
+                    f"An update cannot be requested while the deployment is "
+                    f"{deployment['status']}.",
+                    code="invalid_state",
+                )
+            if not deployment["instance_id"]:
+                raise Conflict(
+                    "There is no VM to edit yet; preview and approve the creation first.",
+                    code="invalid_state",
+                )
+            if deployment["provisioner"] != provisioner:
+                raise Conflict(
+                    "This deployment belongs to a different provisioner.",
+                    code="provisioner_mismatch",
+                )
+            current_power = deployment["power_state"] or "running"
+            if request.disk_gib is not None and request.disk_gib < deployment["disk_gib"]:
+                raise InvalidInput("The root disk can only be enlarged, never shrunk.")
+            unchanged = (
+                (request.name is None or request.name == deployment["name"])
+                and (request.disk_gib is None or request.disk_gib == deployment["disk_gib"])
+                and (request.power_state is None or request.power_state == current_power)
+            )
+            if unchanged:
+                raise InvalidInput("The request does not change anything.")
+            plan_id, job_id = self._enqueue_plan(
+                conn,
+                deployment,
+                "create",
+                provisioner,
+                payload_hash,
+                (scope, idempotency_key) if idempotency_key else None,
+                edit=edit,
+            )
+            record_audit(
+                conn,
+                actor=principal.subject,
+                action="update_plan.requested",
+                deployment_id=deployment_id,
+                plan_id=plan_id,
+                job_id=job_id,
+                request_id=request_id,
+                detail={key: value for key, value in edit.items()},
+            )
+            response = AcceptedResponse(
+                deployment_id=deployment_id, plan_id=plan_id, job_id=job_id, status="planning"
             ).model_dump()
             self._store_idempotency(
                 conn, principal, scope, idempotency_key, payload_hash, 202, response
@@ -681,6 +759,14 @@ class DeploymentService:
         return PlanPreview(
             plan_id=plan["id"],
             kind=plan["kind"],
+            operation=(
+                "delete"
+                if plan["kind"] == "destroy"
+                else "update"
+                if plan["request_json"]
+                else "create"
+            ),
+            request=json.loads(plan["request_json"]) if plan["request_json"] else None,
             status=status,
             plan_hash=plan["plan_hash"],
             expires_at=expires_at,
@@ -768,6 +854,8 @@ class DeploymentService:
             provisioner=row["provisioner"],
             status=row["status"],
             status_reason=row["status_reason"],
+            power_state=row["power_state"] or "running",
+            instance_state=row["instance_state"],
             created_at=from_db_time(row["created_at"]),
             updated_at=from_db_time(row["updated_at"]),
             current_plan=plan,

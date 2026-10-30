@@ -45,6 +45,7 @@ from unitcompute.provisioning.aws import (
 )
 from unitcompute.provisioning.base import (
     ApplyResult,
+    InstanceDetails,
     OwnedResource,
     ProvisioningError,
     Readiness,
@@ -79,6 +80,12 @@ class _AwsBacked(SimulatedProvisioner):
 
     def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[tuple[str, bool]]]:
         return self.aws.instance_volumes(instance_ids, CREDS)
+
+    def instance_details(self, instance_ids: list[str]) -> dict[str, InstanceDetails]:
+        return self.aws.instance_details(instance_ids, CREDS)
+
+    def managed_resources(self) -> list[tuple[OwnedResource, str | None]]:
+        return self.aws.managed_resources(CREDS)
 
 
 def _replan(h: Any, provisioner: SimulatedProvisioner, dep: str, route: str) -> Any:
@@ -157,6 +164,7 @@ def _settings(tmp_path: Path) -> Any:
 def _placeholders(settings: Any) -> dict[str, str]:
     return {
         "state_bucket": settings.state_bucket,
+        "region": settings.aws_region,
         "account_id": settings.aws_account_id,
         "subnet_id": settings.subnet_id,
         "vpc_id": settings.vpc_id,
@@ -700,7 +708,7 @@ def _schema_v1_deployment(
             "?, ?)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4, 5, 6, 7]
+    assert db.migrate() == [2, 3, 4, 5, 6, 7, 8]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
@@ -733,7 +741,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4, 5, 6, 7]
+    assert db.migrate() == [3, 4, 5, 6, 7, 8]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}
@@ -761,6 +769,7 @@ def _restore_terraform_state(h: Any, dep: str, instance_id: str, volume_id: str)
     state = provisioner._desired(Worker._spec(row), "ami-0123456789abcdef0")
     state["aws_instance.vm"]["id"] = instance_id
     state["aws_instance.vm"]["root_block_device"][0]["volume_id"] = volume_id
+    state["aws_ec2_instance_state.vm"].update(id=instance_id, instance_id=instance_id)
     provisioner._state_path(dep).write_text(json.dumps(state))
 
 

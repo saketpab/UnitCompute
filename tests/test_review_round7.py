@@ -87,7 +87,7 @@ def _failed_create_then_empty_delete(
             c.execute(
                 "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
                 "config_hash, region, state_key, template_version, preview_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 'simulated', 'h', 'us-east-1', 'k', 'ec2-vm/v1', ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'simulated', 'h', 'us-east-1', 'k', 'ec2-vm/v2', ?, ?)",
                 (plan, dep, owner, kind, plan_status, preview, day),
             )
             c.execute(
@@ -121,7 +121,7 @@ def test_r7_1_deleted_deployment_with_unproven_obligation_becomes_recovery_requi
     settings, db = _schema4(tmp_path, monkeypatch)
     dep = "dep_" + "a" * 32
     _failed_create_then_empty_delete(db, dep, "dev:alice", "deleted", "2026-10-01", "1")
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     assert _status(db, dep) == "recovery_required"
     assert _open_uncaptured(db) == [dep]
     service = DeploymentService(db, settings)
@@ -146,7 +146,7 @@ def test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_v
     old, new = "dep_" + "a" * 32, "dep_" + "b" * 32
     _failed_create_then_empty_delete(db, old, "dev:alice", "deleted", "2026-10-01", "1")
     _failed_create_then_empty_delete(db, new, "dev:alice", "active", "2026-10-02", "2")
-    assert db.migrate() == [5, 6, 7]  # no unique-index violation
+    assert db.migrate() == [5, 6, 7, 8]  # no unique-index violation
     assert _status(db, old) == "deleted" and _status(db, new) == "active"
     assert _open_uncaptured(db) == [old]
     from unitcompute import admin
@@ -173,7 +173,7 @@ def test_r7_1_only_one_row_per_owner_is_reopened(
     first, second = "dep_" + "a" * 32, "dep_" + "b" * 32
     _failed_create_then_empty_delete(db, first, "dev:alice", "deleted", "2026-10-01", "1")
     _failed_create_then_empty_delete(db, second, "dev:alice", "deleted", "2026-10-02", "2")
-    assert db.migrate() == [5, 6, 7]
+    assert db.migrate() == [5, 6, 7, 8]
     assert {_status(db, first), _status(db, second)} == {"deleted", "recovery_required"}
     assert _status(db, second) == "recovery_required"  # the newest holds the slot
     assert sorted(_open_uncaptured(db)) == [first, second]

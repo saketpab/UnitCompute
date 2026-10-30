@@ -115,7 +115,15 @@ def planned_creates(plan: sqlite3.Row) -> set[str] | None:
     changes = planned_changes(plan["preview_json"])
     if changes is None:
         return None
-    return {str(c.get("address")) for c in changes if c["action"] != "delete"}
+    return {str(c.get("address")) for c in changes if c["action"] == "create"}
+
+
+def edit_request(plan: sqlite3.Row | None) -> dict[str, Any]:
+    """The edit a plan was requested for ({} for create, repair and deletion plans)."""
+    if plan is None or not plan["request_json"]:
+        return {}
+    raw = json.loads(plan["request_json"])
+    return raw if isinstance(raw, dict) else {}
 
 
 def plan_launches_instance(plan: sqlite3.Row) -> bool:
@@ -131,6 +139,30 @@ def plan_may_create(plan: sqlite3.Row) -> bool:
     or no changes at all). Unreadable or unknown changes count as creating."""
     creates = planned_creates(plan)
     return creates is None or bool(creates)
+
+
+def _edit_warnings(changes: list[dict[str, Any]]) -> list[str]:
+    """Plain-language consequences of the edits in a preview (cost is shown separately)."""
+    warnings: list[str] = []
+    for change in changes:
+        if change["action"] != "update":
+            continue
+        diff = change["summary"].get("changes") or {}
+        if "disk_gib" in diff:
+            old, new = diff["disk_gib"]
+            warnings.append(
+                f"The root disk grows from {old} to {new} GiB and cannot be shrunk again. The "
+                "filesystem may need to be extended from inside the VM."
+            )
+        if diff.get("power_state", [None, None])[1] == "stopped":
+            warnings.append(
+                "Stopping shuts the VM down: running processes end and its public IPv4 "
+                "address is released (a new one is assigned on start). The disk and its data "
+                "are kept and still cost money."
+            )
+        if diff.get("power_state", [None, None])[1] == "running":
+            warnings.append("Starting resumes compute and public IPv4 charges.")
+    return list(dict.fromkeys(warnings))
 
 
 class WorkerLockHeld(RuntimeError):
@@ -415,14 +447,19 @@ class Worker:
         return deployment, plan
 
     @staticmethod
-    def _spec(deployment: sqlite3.Row) -> DeploymentSpec:
+    def _spec(deployment: sqlite3.Row, plan: sqlite3.Row | None = None) -> DeploymentSpec:
+        """What the plan should leave the deployment as: its recorded values, overridden by
+        the plan's own validated edit request (if it has one). The deployment row itself is
+        only changed after an edit has been applied and verified."""
+        edit = edit_request(plan)
         return DeploymentSpec(
             deployment_id=deployment["id"],
             owner_tag=owner_tag(deployment["owner_id"]),
-            name=deployment["name"],
-            disk_gib=deployment["disk_gib"],
+            name=edit.get("name", deployment["name"]),
+            disk_gib=edit.get("disk_gib", deployment["disk_gib"]),
             region=deployment["region"],
             instance_type=deployment["instance_type"],
+            power_state=edit.get("power_state") or deployment["power_state"] or "running",
         )
 
     def workdir(self, deployment_id: str, plan_id: str) -> Path:
@@ -468,12 +505,20 @@ class Worker:
             "AND discharged_at IS NULL AND evidence = 'uncaptured' LIMIT 1",
             (job["deployment_id"],),
         ).fetchone()
-        status = (
-            "recovery_required"
-            if open_uncaptured is not None
-            or (unresolved is not None and unresolved["status"] == "recovery_required")
-            else "plan_failed"
-        )
+        edited_vm = conn.execute(
+            "SELECT 1 FROM plans JOIN deployments d ON d.id = plans.deployment_id "
+            "WHERE plans.id = ? AND plans.request_json IS NOT NULL AND d.instance_id IS NOT NULL",
+            (job["plan_id"],),
+        ).fetchone()
+        if open_uncaptured is not None or (
+            unresolved is not None and unresolved["status"] == "recovery_required"
+        ):
+            status = "recovery_required"
+        elif edited_vm is not None:
+            # A rejected, failed or expired *edit* leaves the VM exactly as it was.
+            status = "active"
+        else:
+            status = "plan_failed"
         conn.execute(
             "UPDATE deployments SET status = ?, status_reason = ?, updated_at = ? "
             "WHERE id = ? AND current_plan_id = ?",
@@ -495,7 +540,7 @@ class Worker:
         try:
             if plan["status"] != "pending" or deployment["current_plan_id"] != plan["id"]:
                 raise JobFailure("plan_superseded", "A newer plan replaced this one.")
-            spec = self._spec(deployment)
+            spec = self._spec(deployment, plan)
             self._retry_uncaptured(deployment["id"])
             owner = deployment["owner_id"] if kind == "create" else None
             self._require_no_uncaptured(deployment["id"], owner)
@@ -545,6 +590,8 @@ class Worker:
 
         now_dt = self.clock()
         now = to_db_time(now_dt)
+        if edit_request(plan) and policy.allowed and not policy.changes:
+            policy.violations.append("the requested edit would change nothing")
         with self._tx() as conn:
             if not policy.allowed:
                 self._finish_plan_failure(
@@ -555,8 +602,15 @@ class Worker:
                     plan_status="rejected",
                 )
                 return
-            cost = estimate_monthly_cost(spec.disk_gib).model_dump() if kind == "create" else None
+            cost = (
+                estimate_monthly_cost(
+                    spec.disk_gib, region=spec.region, running=spec.power_state == "running"
+                ).model_dump()
+                if kind == "create"
+                else None
+            )
             warnings = list(policy.warnings)
+            warnings.extend(_edit_warnings(policy.changes))
             if kind == "destroy":
                 warnings.append("Deleting stops this VM's ongoing compute, IPv4 and disk charges.")
             if self.provisioner.kind == ProvisionerKind.SIMULATED:
@@ -753,7 +807,7 @@ class Worker:
 
     def process_apply(self, job: sqlite3.Row) -> None:
         deployment, plan = self._load(job)
-        spec = self._spec(deployment)
+        spec = self._spec(deployment, plan)
         try:
             plan_path = self._precheck_apply(job, deployment, plan)
             with self._tx() as conn:
@@ -844,11 +898,23 @@ class Worker:
                 )
                 return
             result.update(instance_id=instance_id)
+            observed_state: str | None = None
+            if plan["request_json"] or spec.power_state != "running":
+                # Terraform's word is not enough for an edit or a power change: read EC2.
+                problem = self._edit_problem(instance_id, spec)
+                if problem is not None:
+                    self._recovery_required(job, "verification_failed", problem)
+                    return
+                observed_state = spec.power_state
+            if plan["request_json"]:
+                result.update(name=spec.name, disk_gib=spec.disk_gib, power_state=spec.power_state)
             with self._tx() as conn:
                 conn.execute(
                     "UPDATE deployments SET status = 'active', status_reason = NULL, "
                     "instance_id = ?, security_group_id = ?, "
                     "root_volume_id = CASE WHEN ? THEN ? ELSE root_volume_id END, "
+                    "name = ?, disk_gib = ?, power_state = ?, "
+                    "instance_state = COALESCE(?, instance_state), "
                     "connection_ready = 0, ec2_status = NULL, ssm_ping_status = NULL, "
                     "readiness_checked_at = NULL, updated_at = ? WHERE id = ?",
                     (
@@ -856,14 +922,21 @@ class Worker:
                         outcome.outputs.get("security_group_id"),
                         int(plan_launches_instance(plan)),
                         outcome.outputs.get("root_volume_id"),
+                        spec.name,
+                        spec.disk_gib,
+                        spec.power_state,
+                        observed_state,
                         now,
                         deployment["id"],
                     ),
                 )
                 self._finish_apply_success(conn, job, plan, result, "deployment.active")
             # Infrastructure is applied and verified; connection readiness is observed
-            # separately (bounded here, then refreshed by housekeeping).
-            self.observe_readiness(deployment["id"], instance_id, wait=True)
+            # separately (bounded here, then refreshed by housekeeping). A stopped VM has no
+            # connection to wait for.
+            self.observe_readiness(
+                deployment["id"], instance_id, wait=spec.power_state == "running"
+            )
             return
 
         remaining = self._remaining_after_delete(deployment, plan, inventory)
@@ -893,6 +966,25 @@ class Worker:
                 (now, deployment["id"]),
             )
             self._finish_apply_success(conn, job, plan, result, "deployment.deleted")
+
+    def _edit_problem(self, instance_id: str, spec: DeploymentSpec) -> str | None:
+        """None when EC2 itself shows the VM in the requested power state with the requested
+        root disk size; otherwise what differs (the job then needs recovery)."""
+        try:
+            details = self.provisioner.instance_details([instance_id]).get(instance_id)
+        except ProvisioningError:
+            return "Apply finished but the VM's state and disk could not be read back."
+        if details is None:
+            return "Apply finished but the VM could not be found."
+        wanted = {"running": {"running", "pending"}, "stopped": {"stopped", "stopping"}}
+        if details.state not in wanted[spec.power_state]:
+            return f"Apply finished but the VM is {details.state}, not {spec.power_state}."
+        if details.root_volume_gib != spec.disk_gib:
+            return (
+                f"Apply finished but the root disk is {details.root_volume_gib} GiB, "
+                f"not {spec.disk_gib} GiB."
+            )
+        return None
 
     def _remaining_after_delete(
         self, deployment: sqlite3.Row, plan: sqlite3.Row, inventory: list[OwnedResource]
@@ -973,7 +1065,9 @@ class Worker:
             if errored.is_file():
                 document, source, complete = read_state_file(errored), "errored_state", False
             elif immediate and self._is_latest_apply(job) and workdir.is_dir():
-                document = self.provisioner.capture_stored_state(self._spec(deployment), workdir)
+                document = self.provisioner.capture_stored_state(
+                    self._spec(deployment, plan), workdir
+                )
                 source, complete = "stored_state", True
             else:
                 return fallback
@@ -1167,13 +1261,15 @@ class Worker:
             with self._tx() as conn:
                 conn.execute(
                     "UPDATE deployments SET ec2_status = ?, ssm_ping_status = ?, "
-                    "connection_ready = ?, readiness_checked_at = ? "
+                    "connection_ready = ?, readiness_checked_at = ?, "
+                    "instance_state = COALESCE(?, instance_state) "
                     "WHERE id = ? AND instance_id = ? AND status <> 'deleted'",
                     (
                         readiness.ec2_status,
                         readiness.ssm_status,
                         int(readiness.ready),
                         to_db_time(self.clock()),
+                        readiness.instance_state,
                         deployment_id,
                         instance_id,
                     ),
