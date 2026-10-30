@@ -37,12 +37,11 @@ from unitcompute.db.database import Database
 from unitcompute.errors import ServiceUnavailable
 from unitcompute.identities import IdentityLedger, identity
 from unitcompute.provisioning.base import ApplyResult, ProvisioningError
-from unitcompute.provisioning.simulated import SimulatedProvisioner
+from unitcompute.provisioning.simulated import SimulatedProvisioner, raw_state, simulated_lineage
 from unitcompute.provisioning.state_evidence import (
     AppliedState,
     StateEvidenceError,
-    from_raw_state,
-    from_show_json,
+    parse_raw_state,
 )
 from unitcompute.schemas import AgentMessageRequest
 from unitcompute.worker import Worker
@@ -66,33 +65,21 @@ def _quota_held(client: Any, user: str = "alice") -> bool:
     return bool(response.status_code == 409)
 
 
-def _raw_state(iid: str | None, vid: str | None, sg: str | None = None) -> dict[str, Any]:
-    resources: list[dict[str, Any]] = []
+def _raw_state(
+    iid: str | None,
+    vid: str | None,
+    sg: str | None = None,
+    *,
+    dep: str = "dep_" + "0" * 32,
+    terraform_version: str = "simulated",
+) -> dict[str, Any]:
+    """A complete raw state envelope (round 6), bound to ``dep``'s simulated lineage."""
+    resources: dict[str, dict[str, Any]] = {}
     if iid:
-        resources.append(
-            {
-                "mode": "managed",
-                "type": "aws_instance",
-                "name": "vm",
-                "provider": 'provider["registry.terraform.io/hashicorp/aws"]',
-                "instances": [
-                    {
-                        "schema_version": 1,
-                        "attributes": {"id": iid, "root_block_device": [{"volume_id": vid}]},
-                    }
-                ],
-            }
-        )
+        resources["aws_instance.vm"] = {"id": iid, "root_block_device": [{"volume_id": vid}]}
     if sg:
-        resources.append(
-            {
-                "mode": "managed",
-                "type": "aws_security_group",
-                "name": "vm",
-                "instances": [{"attributes": {"id": sg}}],
-            }
-        )
-    return {"version": 4, "terraform_version": "1.17.1", "resources": resources}
+        resources["aws_security_group.vm"] = {"id": sg}
+    return raw_state(simulated_lineage(dep), 1, resources, terraform_version)
 
 
 # ---------------------------------- R5-1: refreshed state is not launch evidence
@@ -225,7 +212,9 @@ class _BackendWriteFailure(_AwsBacked):
         }
         if self.errored:
             (workdir / "errored.tfstate").write_text(
-                json.dumps(_raw_state(self.created["iid"], self.created["vid"]))
+                json.dumps(
+                    _raw_state(self.created["iid"], self.created["vid"], dep=spec.deployment_id)
+                )
             )
         raise ProvisioningError("terraform_apply_failed", "Failed to save state")
 
@@ -321,24 +310,13 @@ def test_r5_2_stored_state_capture_recovers_evidence(harness: Harness, moto_env:
     failing = _BackendWriteFailure(h, ec2, errored=False)
 
     def stored(spec: Any, workdir: Path) -> dict[str, Any]:
-        return {
-            "values": {
-                "root_module": {
-                    "resources": [
-                        {
-                            "address": "aws_instance.vm",
-                            "mode": "managed",
-                            "type": "aws_instance",
-                            "name": "vm",
-                            "values": {
-                                "id": failing.created["iid"],
-                                "root_block_device": [{"volume_id": failing.created["vid"]}],
-                            },
-                        }
-                    ]
-                }
-            }
-        }
+        # Round 6: stored state is accepted only if it shows every resource the plan creates.
+        return _raw_state(
+            failing.created["iid"],
+            failing.created["vid"],
+            "sg-0123456789abcdef0",
+            dep=spec.deployment_id,
+        )
 
     failing.capture_stored_state = stored  # type: ignore[method-assign]
     Worker(h.settings, h.db, failing, clock=h.clock).run_once()
@@ -361,7 +339,7 @@ def _crash_mid_create_apply(h: Harness, write_errored: bool) -> tuple[dict[str, 
     outputs = h.provisioner.apply(Worker._spec(row), plan_path.parent, plan_path).outputs
     if write_errored:
         (plan_path.parent / "errored.tfstate").write_text(
-            json.dumps(_raw_state(outputs["instance_id"], outputs["root_volume_id"]))
+            json.dumps(_raw_state(outputs["instance_id"], outputs["root_volume_id"], dep=d["id"]))
         )
     return d, job["id"]
 
@@ -503,21 +481,30 @@ def test_r5_2_migration_backfills_obligations_for_earlier_failures(
             )
             if later_success:
                 conn.execute(
+                    "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
+                    "config_hash, region, state_key, template_version, created_at) VALUES "
+                    "(?, ?, 'dev:a', 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
+                    "'v', ?)",
+                    ("plan_ok" + dep[4:], dep, now),
+                )
+                conn.execute(
                     "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
                     "payload_hash, created_at) VALUES (?, 'dev:a', ?, ?, 'apply', "
                     "'succeeded', 'h', ?)",
-                    ("job_ok" + dep[4:], dep, plan, now),
+                    ("job_ok" + dep[4:], dep, "plan_ok" + dep[4:], now),
                 )
-    assert db.migrate() == [5]
+    assert db.migrate() == [5, 6]
     with db.read() as conn:
-        rows = {
-            r["deployment_id"]: (r["evidence"], r["discharged_at"] is not None)
+        rows = sorted(
+            (r["deployment_id"], r["reason"], r["evidence"], r["discharged_at"] is not None)
             for r in conn.execute("SELECT * FROM recovery_obligations")
-        }
-    assert rows == {
-        "dep_" + "1" * 32: ("uncaptured", False),
-        "dep_" + "2" * 32: ("not_needed", True),
-    }
+        )
+    # Round 6: a later success does not resolve the failed apply; it is revalidated.
+    assert rows == [
+        ("dep_" + "1" * 32, "legacy_unresolved_apply", "uncaptured", False),
+        ("dep_" + "2" * 32, "evidence_revalidation", "uncaptured", False),
+        ("dep_" + "2" * 32, "legacy_resolved_apply", "not_needed", True),
+    ]
 
 
 # ------------------------------------------- R5-2: real Terraform backend failure
@@ -597,7 +584,7 @@ def test_r5_2_real_terraform_backend_failure_leaves_errored_state(tmp_path: Path
     assert errored["version"] == 4
     assert errored["outputs"]["instance_id"]["value"] == "i-0123456789abcdef0"
     with pytest.raises(StateEvidenceError, match=r"unexpected resource terraform_data\.vm"):
-        from_raw_state(errored)
+        parse_raw_state(errored, terraform_version="1.17.1")
 
 
 @pytest.mark.parametrize(
@@ -607,13 +594,13 @@ def test_r5_2_real_terraform_backend_failure_leaves_errored_state(tmp_path: Path
             _raw_state("i-0aaaaaaaaaaaaaaa1", "vol-0aaaaaaaaaaaaaaa1", "sg-0aaaaaaaaaaaaaaa1"),
             AppliedState("i-0aaaaaaaaaaaaaaa1", "sg-0aaaaaaaaaaaaaaa1", "vol-0aaaaaaaaaaaaaaa1"),
         ),
-        ({"version": 4, "resources": []}, AppliedState(None, None, None)),
+        (_raw_state(None, None), AppliedState(None, None, None)),
     ],
 )
 def test_r5_2_raw_state_reader_accepts_template_state(
     document: dict[str, Any], expected: AppliedState
 ) -> None:
-    assert from_raw_state(document) == expected
+    assert parse_raw_state(document, terraform_version="simulated").applied == expected
 
 
 @pytest.mark.parametrize(
@@ -640,13 +627,7 @@ def test_r5_2_raw_state_reader_fails_closed(mutate: Any) -> None:
     document = _raw_state("i-0aaaaaaaaaaaaaaa1", "vol-0aaaaaaaaaaaaaaa1")
     mutate(document)
     with pytest.raises(StateEvidenceError):
-        from_raw_state(document)
-
-
-def test_r5_2_show_json_reader() -> None:
-    assert from_show_json({"format_version": "1.0"}) == AppliedState(None, None, None)
-    with pytest.raises(StateEvidenceError):
-        from_show_json({"values": {"root_module": {"child_modules": [{}]}}})
+        parse_raw_state(document, terraform_version="simulated")
 
 
 # ------------------------------- R5-3: corrupt evidence is isolated, never fatal

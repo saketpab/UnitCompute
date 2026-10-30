@@ -59,7 +59,14 @@ from unitcompute.provisioning.policy import (
     prior_resource_identities,
     prior_resource_ids,
 )
-from unitcompute.provisioning.state_evidence import from_raw_state, from_show_json
+from unitcompute.provisioning.state_evidence import (
+    AppliedState,
+    StateEvidenceError,
+    bind_to_plan,
+    observed_identities,
+    parse_raw_state,
+    read_state_file,
+)
 from unitcompute.services.deployments import (
     Clock,
     binding_problem,
@@ -75,6 +82,7 @@ ACTOR = "system:worker"
 HEARTBEAT_SECONDS = 15
 WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
 _ID = re.compile(r"^(dep|plan)_[0-9a-f]{32}$")
+ERRORED_STATE = "errored.tfstate"
 
 
 def _missing_root_message(instances: list[str]) -> str:
@@ -86,22 +94,40 @@ def _missing_root_message(instances: list[str]) -> str:
     )
 
 
-def _plan_changes(plan: sqlite3.Row) -> list[dict[str, Any]]:
-    preview = json.loads(plan["preview_json"] or "{}")
-    changes = preview.get("changes", []) if isinstance(preview, dict) else []
-    return [c for c in changes if isinstance(c, dict)]
+def planned_changes(preview_json: str | None) -> list[dict[str, Any]] | None:
+    """The plan's recorded resource changes, or None if they cannot be read exactly."""
+    try:
+        preview = json.loads(preview_json or "")
+    except ValueError:
+        return None
+    changes = preview.get("changes") if isinstance(preview, dict) else None
+    if not isinstance(changes, list) or not all(
+        isinstance(c, dict) and isinstance(c.get("action"), str) for c in changes
+    ):
+        return None
+    return changes
+
+
+def planned_creates(plan: sqlite3.Row) -> set[str] | None:
+    changes = planned_changes(plan["preview_json"])
+    if changes is None:
+        return None
+    return {str(c.get("address")) for c in changes if c["action"] != "delete"}
 
 
 def plan_launches_instance(plan: sqlite3.Row) -> bool:
     """True when this plan itself creates the VM, so its outputs/state name the launch root."""
     return any(
-        c.get("address") == "aws_instance.vm" and c.get("action") == "create"
-        for c in _plan_changes(plan)
+        c.get("address") == "aws_instance.vm" and c["action"] == "create"
+        for c in planned_changes(plan["preview_json"]) or []
     )
 
 
-def plan_creates_resources(plan: sqlite3.Row) -> bool:
-    return any(c.get("action") == "create" for c in _plan_changes(plan))
+def plan_may_create(plan: sqlite3.Row) -> bool:
+    """False only when the recorded changes show the plan creates nothing (deletions only,
+    or no changes at all). Unreadable or unknown changes count as creating."""
+    creates = planned_creates(plan)
+    return creates is None or bool(creates)
 
 
 class WorkerLockHeld(RuntimeError):
@@ -114,7 +140,7 @@ class WorkerLock:
         self.fd: int | None = None
 
     def acquire(self) -> int:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_directory(self.path.parent)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -247,12 +273,12 @@ class Worker:
             try:
                 self.import_identities(job["deployment_id"])
             except Exception:
+                # Not proof of corruption (a lock wait or database error is transient); only
+                # invalid records open an evidence_file_corrupt obligation. The apply's own
+                # obligation below still keeps the deployment fail-closed.
                 log.exception(
                     "evidence import failed during recovery",
                     extra={"fields": {"deployment_id": job["deployment_id"]}},
-                )
-                self._open_obligation(
-                    job["deployment_id"], None, None, "evidence_file_corrupt", "uncaptured"
                 )
             if job["kind"] == "plan":
                 with self._tx() as conn:
@@ -268,7 +294,7 @@ class Worker:
                 "worker_interrupted",
                 "The worker stopped while applying. AWS may hold partially created or "
                 "deleted resources; request a new preview to reconcile.",
-                state_final=False,
+                immediate=False,
             )
         return recovered
 
@@ -361,7 +387,7 @@ class Worker:
                 )
         else:
             self._recovery_required(
-                job, "internal_error", "Apply processing failed unexpectedly.", state_final=False
+                job, "internal_error", "Apply processing failed unexpectedly.", immediate=False
             )
 
     def _heartbeat(self, job_id: str, stop: threading.Event) -> None:
@@ -434,9 +460,15 @@ class Worker:
             "ORDER BY rowid DESC LIMIT 1",
             (job["deployment_id"],),
         ).fetchone()
+        open_uncaptured = conn.execute(
+            "SELECT 1 FROM recovery_obligations WHERE deployment_id = ? "
+            "AND discharged_at IS NULL AND evidence = 'uncaptured' LIMIT 1",
+            (job["deployment_id"],),
+        ).fetchone()
         status = (
             "recovery_required"
-            if unresolved is not None and unresolved["status"] == "recovery_required"
+            if open_uncaptured is not None
+            or (unresolved is not None and unresolved["status"] == "recovery_required")
             else "plan_failed"
         )
         conn.execute(
@@ -462,14 +494,7 @@ class Worker:
                 raise JobFailure("plan_superseded", "A newer plan replaced this one.")
             spec = self._spec(deployment)
             self._retry_uncaptured(deployment["id"])
-            if self._uncaptured_obligations(deployment["id"]):
-                raise JobFailure(
-                    "recovery_evidence_missing",
-                    "An earlier apply may have changed AWS, and what it created could not be "
-                    "read from its stored or errored state (or the evidence file is "
-                    "corrupt). Plans and verified deletion stay blocked; this needs a "
-                    "support decision.",
-                )
+            self._require_no_uncaptured(deployment["id"])
             frozen_ami = deployment["ami_id"] if deployment["apply_attempted"] else None
             result = self.provisioner.plan(
                 spec, kind, self.workdir(spec.deployment_id, plan["id"]), frozen_ami
@@ -483,6 +508,9 @@ class Worker:
             if actual != expected_versions(self.provisioner.kind):
                 raise JobFailure("plan_stale", "Tool or template versions changed; retry.")
             inventory = self._reconciled_inventory(spec.deployment_id, result.plan_json)
+            # Reconciliation can itself open an obligation (e.g. a corrupt evidence record);
+            # it must stop this plan, not just later ones.
+            self._require_no_uncaptured(deployment["id"])
             policy = evaluate_plan(
                 result.plan_json,
                 kind=kind,
@@ -695,6 +723,19 @@ class Worker:
             raise JobFailure("plan_missing", "The saved plan file is missing.")
         if sha256_file(plan_path) != plan["plan_hash"]:
             raise JobFailure("plan_hash_mismatch", "The saved plan changed after approval.")
+        if (workdir / ERRORED_STATE).exists():
+            # Any errored.tfstate found after the apply must be that apply's own.
+            raise JobFailure("plan_tampered", "The plan's work directory holds unexpected state.")
+        # Immediately before mutating: reconcile evidence, then re-check obligations, so an
+        # obligation opened since the plan was made (or by this import) stops the apply.
+        try:
+            self.import_identities(deployment["id"])
+        except Exception as exc:
+            log.warning("evidence import failed before apply", exc_info=True)
+            raise JobFailure(
+                "evidence_unavailable", "Identity evidence could not be read; retry later."
+            ) from exc
+        self._require_no_uncaptured(deployment["id"])
         return plan_path
 
     def process_apply(self, job: sqlite3.Row) -> None:
@@ -729,10 +770,8 @@ class Worker:
                 detail={"kind": plan["kind"], "plan_hash": plan["plan_hash"]},
             )
 
-        applied = False
         try:
             outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)
-            applied = True
             # Persist returned identities before anything else can fail. The root output is
             # launch evidence only if this apply created the instance.
             instance_output = outcome.outputs.get("instance_id")
@@ -755,20 +794,13 @@ class Worker:
                 [identity(r.resource_id, "tag_inventory") for r in inventory],
             )
         except ProvisioningError as exc:
-            # A non-zero Terraform exit means Terraform finished and persisted (or wrote
-            # errored.tfstate); a timeout kill or a failure to start does not.
-            self._recovery_required(
-                job,
-                exc.code,
-                exc.safe_message,
-                state_final=applied or exc.code == "terraform_apply_failed",
-            )
+            # Whatever the exit (error, signal, timeout), the outcome is established only by
+            # bound evidence; see _capture_apply_evidence.
+            self._recovery_required(job, exc.code, exc.safe_message)
             return
         except Exception:
             log.exception("unexpected apply failure", extra={"fields": {"job_id": job["id"]}})
-            self._recovery_required(
-                job, "internal_error", "Apply failed unexpectedly.", state_final=applied
-            )
+            self._recovery_required(job, "internal_error", "Apply failed unexpectedly.")
             return
 
         now = to_db_time(self.clock())
@@ -900,36 +932,44 @@ class Worker:
             job_id=job["id"],
         )
 
-    def _capture_apply_evidence(self, job: sqlite3.Row, *, state_final: bool) -> str:
-        """Read what this apply stored and record it. Returns the obligation's evidence state.
+    def _capture_apply_evidence(self, job: sqlite3.Row, *, immediate: bool) -> str:
+        """Establish what a failed apply did. Returns the obligation's evidence state.
 
-        errored.tfstate (Terraform's final state when the backend write failed) is preferred.
-        Otherwise the stored state is read without refreshing, but only when Terraform is
-        known to have finished (``state_final``) and this is the latest apply; after a crash,
-        kill or timeout the stored state may be incomplete. Anything unreadable, ambiguous or
-        unavailable fails closed ('uncaptured') if the plan could create resources."""
+        Accepted evidence is a validated raw state bound to this apply's saved plan (see
+        ``state_evidence``): ``errored.tfstate`` from the plan's work directory (Terraform's
+        final state when the backend write failed) or, only right after the apply
+        (``immediate``) and only if this is still the latest apply, the stored state, which
+        must then show every resource the plan creates. A process exit, normal or by
+        signal, proves nothing by itself. IDs in any state read are recorded as
+        observations even when it is not accepted. Otherwise: 'uncaptured' if the plan
+        could create resources, else 'not_needed'."""
         deployment, plan = self._load(job)
-        spec = self._spec(deployment)
-        creates = plan_creates_resources(plan)
+        fallback = "uncaptured" if plan_may_create(plan) else "not_needed"
         workdir = self.settings.workdir_root / deployment["id"] / plan["id"]
-        errored = workdir / "errored.tfstate"
+        errored = workdir / ERRORED_STATE
         try:
             if errored.is_file():
-                applied = from_raw_state(json.loads(errored.read_bytes()))
-                source = "errored_state"
-            elif state_final and self._is_latest_apply(job) and workdir.is_dir():
-                applied = from_show_json(self.provisioner.capture_stored_state(spec, workdir))
-                source = "stored_state"
+                document, source, complete = read_state_file(errored), "errored_state", False
+            elif immediate and self._is_latest_apply(job) and workdir.is_dir():
+                document = self.provisioner.capture_stored_state(self._spec(deployment), workdir)
+                source, complete = "stored_state", True
             else:
-                return "uncaptured" if creates else "not_needed"
-        except (ValueError, OSError, ProvisioningError):
+                return fallback
+            self.record_identities(
+                deployment["id"],
+                [
+                    identity(rid, f"{source}_seen", parent)
+                    for rid, parent in observed_identities(document)
+                ],
+            )
+            applied = self._bind_evidence(plan, workdir, document, require_all_creates=complete)
+        except (StateEvidenceError, OSError, ProvisioningError):
             log.warning(
-                "could not capture failed apply evidence",
+                "failed apply evidence not accepted",
                 exc_info=True,
                 extra={"fields": {"job_id": job["id"]}},
             )
-            return "uncaptured" if creates else "not_needed"
-        launched = plan_launches_instance(plan)
+            return fallback
         self.record_identities(
             deployment["id"],
             [
@@ -937,12 +977,33 @@ class Worker:
                 identity(applied.security_group_id, source),
                 identity(
                     applied.root_volume_id,
-                    LAUNCH_STATE if launched else f"{source}_seen",
+                    LAUNCH_STATE if plan_launches_instance(plan) else f"{source}_seen",
                     applied.instance_id,
                 ),
             ],
         )
         return "captured"
+
+    def _bind_evidence(
+        self, plan: sqlite3.Row, workdir: Path, document: object, *, require_all_creates: bool
+    ) -> AppliedState:
+        creates = planned_creates(plan)
+        if creates is None:
+            raise StateEvidenceError("the plan's changes are not recorded")
+        plan_path = workdir / "tfplan"
+        if not plan_path.is_file() or sha256_file(plan_path) != plan["plan_hash"]:
+            raise StateEvidenceError("the applied saved plan is missing or changed")
+        prior_ids = json.loads(plan["prior_resource_ids_json"] or "null")
+        if not isinstance(prior_ids, list):
+            raise StateEvidenceError("the plan's prior resource IDs are not recorded")
+        parsed = parse_raw_state(document, terraform_version=str(plan["terraform_version"]))
+        return bind_to_plan(
+            parsed,
+            prior=self.provisioner.prior_state(plan_path),
+            prior_ids=set(prior_ids),
+            creates=creates,
+            require_all_creates=require_all_creates,
+        )
 
     def _is_latest_apply(self, job: sqlite3.Row) -> bool:
         with self.db.read() as conn:
@@ -977,6 +1038,16 @@ class Worker:
                 (deployment_id, job_id, plan_id, reason, evidence, to_db_time(self.clock())),
             )
 
+    def _require_no_uncaptured(self, deployment_id: str) -> None:
+        if self._uncaptured_obligations(deployment_id):
+            raise JobFailure(
+                "recovery_evidence_missing",
+                "An earlier apply may have changed AWS, and what it did could not be "
+                "established from state bound to that apply (or an evidence record is "
+                "corrupt). Plans, applies and verified deletion stay blocked; this needs a "
+                "support decision.",
+            )
+
     def _uncaptured_obligations(self, deployment_id: str) -> list[sqlite3.Row]:
         with self.db.read() as conn:
             return list(
@@ -998,22 +1069,24 @@ class Worker:
                     "ON plans.id = jobs.plan_id WHERE jobs.id = ?",
                     (obligation["job_id"],),
                 ).fetchone()
-            if job is None or self._capture_apply_evidence(job, state_final=False) != "captured":
+            if job is None:
+                continue
+            evidence = self._capture_apply_evidence(job, immediate=False)
+            if evidence == "uncaptured":
                 continue
             with self._tx() as conn:
                 conn.execute(
-                    "UPDATE recovery_obligations SET evidence = 'captured' WHERE id = ?",
-                    (obligation["id"],),
+                    "UPDATE recovery_obligations SET evidence = ? WHERE id = ?",
+                    (evidence, obligation["id"]),
                 )
 
     def _recovery_required(
-        self, job: sqlite3.Row, code: str, message: str, *, state_final: bool = True
+        self, job: sqlite3.Row, code: str, message: str, *, immediate: bool = True
     ) -> None:
-        """``state_final``: Terraform ran to completion (or apply had already returned), so its
-        stored state is the apply's final state. False after a crash, kill or timeout, or
-        when it is unknown whether Terraform finished; then only errored.tfstate counts."""
+        """``immediate``: called right after this worker ran the apply, so stored state can
+        still be attributed to it. False after a crash or restart."""
         try:
-            evidence = self._capture_apply_evidence(job, state_final=state_final)
+            evidence = self._capture_apply_evidence(job, immediate=immediate)
         except Exception:
             log.exception("evidence capture crashed", extra={"fields": {"job_id": job["id"]}})
             evidence = "uncaptured"

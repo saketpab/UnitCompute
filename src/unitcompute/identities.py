@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from unitcompute.db.database import to_db_time, utcnow
 from unitcompute.durable import ensure_directory, fsync_chain
 
 EVIDENCE_FILE = "identities.jsonl"
+READ_LOCK_TIMEOUT_SECONDS = 30.0
 _ID = re.compile(r"^(i|vol|sg)-[0-9a-f]{8,17}$")
 _TYPES = {"i": "instance", "vol": "volume", "sg": "security_group"}
 _DEPLOYMENT = re.compile(r"^dep_[0-9a-f]{32}$")
@@ -41,8 +43,11 @@ LAUNCH_OUTPUT = "launch_output"
 LAUNCH_STATE = "launch_state"
 LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE})
 # Written by earlier versions (or copied by migrations) from apply outputs without recording
-# whether that apply launched the instance. They count as launch evidence only when job
-# history shows a single successful create apply, so they cannot be a later refreshed value.
+# which apply produced them. Earlier versions recorded outputs from every create-kind apply
+# that ran Terraform, including failed repairs, and those outputs are refreshed values. So
+# they count as launch evidence only when the deployment's history has exactly one
+# create-kind apply that ran Terraform, it succeeded, and its plan created the instance.
+# Success counts or a later no-op apply prove nothing.
 LEGACY_ROOT_SOURCES = frozenset({"apply_output", "deployment_record", "migration"})
 # Disks seen attached somewhere other than the root device are never root candidates.
 NON_ROOT_SOURCES = frozenset({ATTACHED_DEVICE, "instance_block_devices"})
@@ -92,6 +97,32 @@ def _parse_record(line: str) -> tuple[Identity | None, str]:
     return item, at if isinstance(at, str) else to_db_time(utcnow())
 
 
+class EvidenceBusy(TimeoutError):
+    """An append held the evidence file's lock too long. Transient: never corruption."""
+
+
+def _read_locked(path: Path, timeout: float = READ_LOCK_TIMEOUT_SECONDS) -> bytes:
+    """Read under a shared lock, so an append in progress (which holds the exclusive lock
+    through its short-write loop) is never mistaken for a torn or corrupt record."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise EvidenceBusy(f"evidence file {path.name} stayed locked") from None
+                time.sleep(0.05)
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 @dataclass(frozen=True)
 class KnownIdentities:
     instances: set[str]
@@ -109,6 +140,30 @@ class KnownIdentities:
         disk or any existing volume cannot stand in for the launch root; there is no
         waiver. Plans and deletion stay blocked until launch evidence is recorded."""
         return sorted(i for i in self.instances if not self.launch_roots.get(i))
+
+
+def _legacy_outputs_have_provenance(conn: sqlite3.Connection, deployment_id: str) -> bool:
+    ran = conn.execute(
+        "SELECT jobs.status, plans.preview_json FROM jobs JOIN plans ON plans.id = jobs.plan_id "
+        "WHERE jobs.deployment_id = ? AND jobs.kind = 'apply' AND plans.kind = 'create' "
+        # Jobs that reached Terraform: 'failed' apply jobs failed their pre-apply checks in
+        # every version, so never ran it; 'queued' ones have not run yet.
+        "AND jobs.status IN ('succeeded', 'recovery_required', 'running')",
+        (deployment_id,),
+    ).fetchall()
+    if len(ran) != 1 or ran[0]["status"] != "succeeded":
+        return False
+    try:
+        preview = json.loads(ran[0]["preview_json"] or "")
+    except ValueError:
+        return False
+    changes = preview.get("changes") if isinstance(preview, dict) else None
+    return isinstance(changes, list) and any(
+        isinstance(c, dict)
+        and c.get("address") == "aws_instance.vm"
+        and c.get("action") == "create"
+        for c in changes
+    )
 
 
 class IdentityLedger:
@@ -186,7 +241,7 @@ class IdentityLedger:
         path = self._path(deployment_id)
         if not path.exists():
             return Imported(rows, corrupt)
-        for line in path.read_bytes().decode("utf-8", errors="replace").splitlines():
+        for line in _read_locked(path).decode("utf-8", errors="replace").splitlines():
             item, recorded_at = _parse_record(line)
             if item is None:
                 corrupt += 1
@@ -250,13 +305,7 @@ class IdentityLedger:
             if r["resource_type"] == "volume":
                 # A volume can appear once without and once with its parent; keep the parent.
                 volumes[r["resource_id"]] = r["parent_id"] or volumes.get(r["resource_id"])
-        create_applies = conn.execute(
-            "SELECT COUNT(*) FROM jobs JOIN plans ON plans.id = jobs.plan_id "
-            "WHERE jobs.deployment_id = ? AND jobs.kind = 'apply' AND jobs.status = 'succeeded' "
-            "AND plans.kind = 'create'",
-            (deployment_id,),
-        ).fetchone()[0]
-        legacy_trusted = create_applies <= 1
+        legacy_trusted = _legacy_outputs_have_provenance(conn, deployment_id)
         launch_roots: dict[str, set[str]] = {}
         observed_roots: dict[str, set[str]] = {}
         for r in rows:

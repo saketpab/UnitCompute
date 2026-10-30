@@ -10,12 +10,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from unitcompute.durable import ensure_directory
 from unitcompute.logging_setup import redact
 from unitcompute.provisioning.base import ProvisioningError, ProvisioningTimeout
 
 log = logging.getLogger(__name__)
 
-ALLOWED_SUBCOMMANDS = frozenset({"version", "init", "validate", "plan", "show", "apply", "output"})
+ALLOWED_SUBCOMMANDS = frozenset(
+    {"version", "init", "validate", "plan", "show", "apply", "output", "state"}
+)
+# "state" is read-only here: only `state pull`. Push, rm, mv and import are never run.
+ALLOWED_STATE_ARGS = ("state", "pull")
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 64 * 1024
 KILL_GRACE_SECONDS = 30
@@ -45,7 +50,7 @@ class TerraformRunner:
 
     def base_env(self, workdir: Path) -> dict[str, str]:
         home = workdir / ".home"
-        home.mkdir(mode=0o700, exist_ok=True)
+        ensure_directory(home)
         env = {
             "PATH": SAFE_PATH,
             "HOME": str(home),
@@ -73,6 +78,8 @@ class TerraformRunner:
     ) -> RunResult:
         if not args or args[0] not in ALLOWED_SUBCOMMANDS:
             raise ValueError(f"terraform subcommand {args[:1]} is not allowed")
+        if args[0] == "state" and tuple(args) != ALLOWED_STATE_ARGS:
+            raise ValueError(f"terraform {' '.join(args[:2])} is not allowed (only `state pull`)")
         command = [str(self.binary), *args]
         try:
             process = subprocess.Popen(  # noqa: S603 - fixed argv, shell=False
@@ -125,7 +132,7 @@ class TerraformRunner:
         workdir: Path, name: str, stdout: bytes, stderr: bytes, secrets: Sequence[str]
     ) -> None:
         logs = workdir / "logs"
-        logs.mkdir(mode=0o700, exist_ok=True)
+        ensure_directory(logs)
         text = (
             stdout[-MAX_LOG_BYTES:].decode("utf-8", "replace")
             + "\n--- stderr ---\n"

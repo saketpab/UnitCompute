@@ -23,7 +23,7 @@ never allowed cross-origin.
 | Route | Purpose | Success |
 |---|---|---|
 | `POST /agent/messages` | Chat with the assistant; returns a reply, an optional server-validated `proposal`, and `clarifications` | 200 |
-| `POST /deployments` | `{name, disk_gib}`: reserve your single VM slot and queue a plan preview | 202 `{deployment_id, plan_id, job_id, status}` |
+| `POST /deployments` | `{name, disk_gib}`: reserve your single VM slot and queue a plan preview. The name is 3-32 lowercase letters, digits or hyphens, and must not look like a credential (rejected with 422, never altered) | 202 `{deployment_id, plan_id, job_id, status}` |
 | `GET /deployments` | Your deployments (up to 50, newest first) | 200 |
 | `GET /deployments/{id}` | Status, current plan preview (changes, warnings, cost, hash, expiry), latest job, resources and SSM access instructions | 200 |
 | `POST /deployments/{id}/plan` | Refresh the create/repair preview; supersedes any earlier plan and its approvability | 202 |

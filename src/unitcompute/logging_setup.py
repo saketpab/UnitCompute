@@ -21,11 +21,13 @@ _CREDENTIAL_FIELD_NAMES = (
     r"(?:aws_secret_access_key|secret_access_key|aws_session_token|session_token|password|"
     r"passwd|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key)"
 )
-# Quoted values honour backslash escapes (JSON/shell), so an escaped quote does not end the
-# value; an unterminated quoted value is redacted to the end of the line.
+# Values honour backslash escapes (JSON/shell), quoted or not, so an escaped quote, comma,
+# semicolon or space does not end the value; an unterminated quoted value is redacted to the
+# end of the line, and a trailing lone backslash is part of the value.
 _ASSIGNMENT = re.compile(
     rf"(?i)(\b{_CREDENTIAL_FIELD_NAMES}[\"']?\s*[=:]\s*)"
-    r"(\"(?:\\.|[^\"\\\n])*(?:\"|(?=\n)|$)|'(?:\\.|[^'\\\n])*(?:'|(?=\n)|$)|[^\s\"',;]+)"
+    r"(\"(?:\\.|[^\"\\\n])*(?:\"|(?=\n)|$)|'(?:\\.|[^'\\\n])*(?:'|(?=\n)|$)"
+    r"|(?:\\.|[^\s\"',;\\])+\\?|\\)"
 )
 _PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b"),

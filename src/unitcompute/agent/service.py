@@ -22,9 +22,13 @@ from datetime import timedelta
 from typing import Any, cast
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ModelCallLimitMiddleware,
+    ToolCallLimitMiddleware,
+)
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -63,6 +67,14 @@ MAX_REPLY_CHARS = 4000
 LEASE_GRACE_SECONDS = 60
 MARK_FAILED_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 MAX_TOOL_OUTPUT_CHARS = 4000
+TOOL_ERROR = (
+    "Error: the tool call failed; its arguments were missing, unexpected, of the wrong type "
+    "or out of range. Check the tool's argument names and types and try again."
+)
+UNKNOWN_TOOL_ERROR = "Error: that is not a valid tool; use only the tools provided."
+PROPOSAL_WITHHELD = (
+    "A stored proposal was withheld because it no longer passes validation; ask again."
+)
 APPROVAL_NOTE = (
     "The assistant cannot create, approve, apply or delete resources. Submit the proposal "
     "yourself, review the plan preview, then approve the exact plan ID and hash."
@@ -115,6 +127,73 @@ class _RunContext:
 
 def _dump(payload: Any) -> str:
     return json.dumps(payload, default=str)[:MAX_TOOL_OUTPUT_CHARS]
+
+
+def _redact_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return redact(content)
+    if isinstance(content, list):
+        return [
+            {**block, "text": redact(block["text"])}
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+            else redact(block)
+            if isinstance(block, str)
+            else block
+            for block in content
+        ]
+    return content
+
+
+class _RedactToolResults(AgentMiddleware):
+    """The one boundary between tools and the model: every tool result is redacted before the
+    model sees it, whichever tool produced it. Error results (LangChain's
+    argument-validation and exception messages echo the raw arguments, which redaction
+    cannot always recognise) are replaced by a fixed message."""
+
+    @staticmethod
+    def _clean(result: Any) -> Any:
+        if not isinstance(result, ToolMessage):
+            return result
+        if result.status == "error":
+            unknown = "not a valid tool" in str(result.content)
+            return result.model_copy(
+                update={"content": UNKNOWN_TOOL_ERROR if unknown else TOOL_ERROR}
+            )
+        return result.model_copy(update={"content": _redact_content(result.content)})
+
+    def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        return self._clean(handler(request))
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        return self._clean(await handler(request))
+
+
+def sanitize_reply(reply: AgentReply) -> AgentReply:
+    """The credential policy for every reply that leaves the service, fresh or replayed (a
+    stored reply may predate current redaction). Free text is redacted. The structured
+    proposal is validated where it enters (the tool, or ``_stored_reply``) and withheld if it
+    fails, because redacting a name or size would change what the user would submit."""
+    return reply.model_copy(
+        update={
+            "reply": redact(reply.reply)[:MAX_REPLY_CHARS],
+            "clarifications": [redact(c) for c in reply.clarifications],
+        }
+    )
+
+
+def _stored_reply(response_json: str) -> AgentReply:
+    """Load a stored reply without trusting its proposal to satisfy current validation."""
+    raw = json.loads(response_json)
+    proposal = raw.pop("proposal", None) if isinstance(raw, dict) else None
+    reply = AgentReply.model_validate({**raw, "proposal": None})
+    if proposal is not None:
+        try:
+            reply = reply.model_copy(update={"proposal": Proposal.model_validate(proposal)})
+        except ValidationError:
+            reply = reply.model_copy(
+                update={"clarifications": [*reply.clarifications, PROPOSAL_WITHHELD]}
+            )
+    return sanitize_reply(reply)
 
 
 def build_tools(
@@ -429,7 +508,7 @@ class AgentService:
                 code="idempotency_key_reused",
             )
         if prior["status"] == "succeeded":
-            return AgentReply.model_validate_json(prior["response_json"])
+            return _stored_reply(prior["response_json"])
         # Expired when either the recorded lease or creation + the current lease has passed.
         expires = from_db_time(prior["created_at"]) + self._lease()
         if prior["lease_expires_at"]:
@@ -533,6 +612,7 @@ class AgentService:
             ToolCallLimitMiddleware(
                 run_limit=self._settings.agent_max_tool_calls, exit_behavior="continue"
             ),
+            _RedactToolResults(),
         ]
         agent = create_agent(
             model,
@@ -573,25 +653,28 @@ class AgentService:
             if final
             else ("I could not produce an answer within my limits. Please rephrase.")
         )
-        response = AgentReply(
-            session_id=session_id,
-            reply=reply,
-            model=self.model_label,
-            proposal=ctx.proposal,
-            clarifications=[
-                *(
-                    [
-                        "A credential-like value was removed from your message. Never share "
-                        "credentials with the assistant."
-                    ]
-                    if credential_removed
-                    else []
-                ),
-                *ctx.clarifications,
-            ],
-            tool_calls=ctx.tool_calls,
-            approval_note=APPROVAL_NOTE,
+        response = sanitize_reply(
+            AgentReply(
+                session_id=session_id,
+                reply=reply,
+                model=self.model_label,
+                proposal=ctx.proposal,
+                clarifications=[
+                    *(
+                        [
+                            "A credential-like value was removed from your message. Never share "
+                            "credentials with the assistant."
+                        ]
+                        if credential_removed
+                        else []
+                    ),
+                    *ctx.clarifications,
+                ],
+                tool_calls=ctx.tool_calls,
+                approval_note=APPROVAL_NOTE,
+            )
         )
+        reply = response.reply
         with self._db.transaction() as conn:
             now = to_db_time(utcnow())
             # Fence: publish only while this attempt still owns its reservation. If its lease

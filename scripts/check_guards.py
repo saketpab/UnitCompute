@@ -132,17 +132,6 @@ MUTATIONS = [
         ("tests/test_worker_recovery.py::test_single_worker_lock",),
     ),
     Mutation(
-        "recovery-sticky",
-        (
-            (
-                WORKER,
-                '            "recovery_required"\n            if unresolved',
-                '            "plan_failed"\n            if unresolved',
-            ),
-        ),
-        ("tests/test_worker_recovery.py::test_failed_repair_preview_keeps_recovery_status",),
-    ),
-    Mutation(
         "agent-daily-cap",
         (
             (
@@ -561,17 +550,6 @@ MUTATIONS = [
         ("tests/test_review_round4.py::test_r4_4_recording_fails_loudly_if_evidence_is_absent",),
     ),
     Mutation(
-        "r4-quoted-assignment",
-        (
-            (
-                "logging_setup.py",
-                'r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
-                'r"([^\\s\\"\',;]+)"',
-            ),
-        ),
-        ("tests/test_review_round4.py::test_r4_3_redaction_preserves_quotes_and_bounds",),
-    ),
-    Mutation(
         "r4-new-ancestor-fsync",
         (
             (
@@ -622,30 +600,6 @@ MUTATIONS = [
         ),
     ),
     Mutation(
-        "r5-legacy-single-create",
-        (
-            (
-                "identities.py",
-                "legacy_trusted = create_applies <= 1",
-                "legacy_trusted = True",
-            ),
-        ),
-        ("tests/test_review_round5.py::test_r5_1_legacy_root_ids_need_single_create_history",),
-    ),
-    Mutation(
-        "r5-capture-on-failure",
-        (
-            (
-                "worker.py",
-                "evidence = self._capture_apply_evidence(job, state_final=state_final)",
-                'evidence = "captured"',
-            ),
-        ),
-        (
-            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
-        ),
-    ),
-    Mutation(
         "r5-errored-state-capture",
         (
             (
@@ -659,37 +613,10 @@ MUTATIONS = [
         ),
     ),
     Mutation(
-        "r5-stored-state-only-when-final",
-        (
-            (
-                "worker.py",
-                "elif state_final and self._is_latest_apply(job) and workdir.is_dir():",
-                "elif self._is_latest_apply(job) and workdir.is_dir():",
-            ),
-        ),
-        (
-            "tests/test_review_round5.py::test_r5_2_crash_mid_apply_without_errored_state_fails_closed",
-            "tests/test_review_round5.py::test_r5_2_later_retry_never_trusts_stored_state",
-        ),
-    ),
-    Mutation(
-        "r5-plan-gate",
-        (
-            (
-                "worker.py",
-                '            if self._uncaptured_obligations(deployment["id"]):\n                raise JobFailure(',
-                "            if False:\n                raise JobFailure(",
-            ),
-        ),
-        (
-            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
-        ),
-    ),
-    Mutation(
         "r5-obligations-forward-only",
         (
             (
-                "db/migrations/0005_recovery_obligations.sql",
+                "db/migrations/0006_obligation_revalidation.sql",
                 "BEFORE UPDATE ON recovery_obligations WHEN NOT (",
                 "BEFORE UPDATE ON recovery_obligations WHEN 0 AND NOT (",
             ),
@@ -759,17 +686,6 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
-    ),
-    Mutation(
-        "r5-escaped-delimiters",
-        (
-            (
-                "logging_setup.py",
-                'r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
-                'r"(\\"[^\\"\\n]*(?:\\"|(?=\\n)|$)|\'[^\'\\n]*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
-            ),
-        ),
-        ("tests/test_review_round5.py::test_r5_5_escaped_quotes_do_not_leak_at_any_boundary",),
     ),
     Mutation(
         "r2-1-append-only",
@@ -847,6 +763,556 @@ MUTATIONS = [
         ),
         (
             "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "recovery-sticky",
+        (
+            (
+                "worker.py",
+                '            "recovery_required"\n            if open_uncaptured',
+                '            "plan_failed"\n            if open_uncaptured',
+            ),
+        ),
+        ("tests/test_worker_recovery.py::test_failed_repair_preview_keeps_recovery_status",),
+    ),
+    Mutation(
+        "r4-quoted-assignment",
+        (
+            (
+                "logging_setup.py",
+                '    r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)"\n    r"|(?:\\\\.|[^\\s\\"\',;\\\\])+\\\\?|\\\\)"',
+                '    r"([^\\s\\"\',;]+)"',
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_3_redaction_preserves_quotes_and_bounds",),
+    ),
+    Mutation(
+        "r5-escaped-delimiters",
+        (
+            (
+                "logging_setup.py",
+                '    r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)"\n    r"|(?:\\\\.|[^\\s\\"\',;\\\\])+\\\\?|\\\\)"',
+                '    r"(\\"[^\\"\\n]*(?:\\"|(?=\\n)|$)|\'[^\'\\n]*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_5_escaped_quotes_do_not_leak_at_any_boundary",),
+    ),
+    Mutation(
+        "r5-legacy-single-create",
+        (
+            (
+                "identities.py",
+                "legacy_trusted = _legacy_outputs_have_provenance(conn, deployment_id)",
+                "legacy_trusted = True",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_1_legacy_root_ids_need_single_create_history",
+            "tests/test_review_round6.py::test_r6_2_legacy_trust_rule",
+        ),
+    ),
+    Mutation(
+        "r5-capture-on-failure",
+        (
+            (
+                "worker.py",
+                "evidence = self._capture_apply_evidence(job, immediate=immediate)",
+                'evidence = "captured"',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "r5-stored-state-only-when-final",
+        (
+            (
+                "worker.py",
+                "elif immediate and self._is_latest_apply(job) and workdir.is_dir():",
+                "elif self._is_latest_apply(job) and workdir.is_dir():",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_crash_mid_apply_without_errored_state_fails_closed",
+            "tests/test_review_round5.py::test_r5_2_later_retry_never_trusts_stored_state",
+            "tests/test_review_round6.py::test_r6_1_unaccepted_stored_state_after_crash_is_not_read",
+        ),
+    ),
+    Mutation(
+        "r5-plan-gate",
+        (
+            (
+                "worker.py",
+                '            self._retry_uncaptured(deployment["id"])\n            self._require_no_uncaptured(deployment["id"])\n',
+                '            self._retry_uncaptured(deployment["id"])\n',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "r6-gate-helper",
+        (
+            (
+                "worker.py",
+                '        if self._uncaptured_obligations(deployment_id):\n            raise JobFailure(\n                "recovery_evidence_missing",',
+                '        if False:\n            raise JobFailure(\n                "recovery_evidence_missing",',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_3_corruption_found_while_planning_stops_that_plan",
+            "tests/test_review_round6.py::test_r6_3_obligation_opened_after_planning_stops_the_apply",
+        ),
+    ),
+    Mutation(
+        "r6-recheck-after-reconcile",
+        (
+            (
+                "worker.py",
+                '            self._require_no_uncaptured(deployment["id"])\n            policy = evaluate_plan(',
+                "            policy = evaluate_plan(",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_corruption_found_while_planning_stops_that_plan",),
+    ),
+    Mutation(
+        "r6-recheck-before-apply",
+        (
+            (
+                "worker.py",
+                '        self._require_no_uncaptured(deployment["id"])\n        return plan_path',
+                "        return plan_path",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_3_obligation_opened_after_planning_stops_the_apply",
+        ),
+    ),
+    Mutation(
+        "r6-reconcile-before-apply",
+        (
+            (
+                "worker.py",
+                '        try:\n            self.import_identities(deployment["id"])\n        except Exception as exc:',
+                "        try:\n            pass\n        except Exception as exc:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_3_obligation_opened_after_planning_stops_the_apply",
+        ),
+    ),
+    Mutation(
+        "r6-plan-failure-keeps-recovery",
+        (
+            (
+                "worker.py",
+                "            if open_uncaptured is not None\n            or (unresolved",
+                "            if (unresolved",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_corruption_found_while_planning_stops_that_plan",),
+    ),
+    Mutation(
+        "r6-envelope-complete",
+        (
+            (
+                "provisioning/state_evidence.py",
+                'resources, raw_outputs = document.get("resources"), document.get("outputs")',
+                'resources, raw_outputs = document.get("resources", []), document.get("outputs", {})',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_unproven_state_never_resolves_an_unknown_mutation",
+            "tests/test_review_round6.py::test_r6_1_state_envelope_is_validated",
+        ),
+    ),
+    Mutation(
+        "r6-version-pinned",
+        (
+            (
+                "provisioning/state_evidence.py",
+                'if document.get("terraform_version") != terraform_version:',
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_unproven_state_never_resolves_an_unknown_mutation",
+        ),
+    ),
+    Mutation(
+        "r6-outputs-agree",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if expected[key] != value:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_unproven_state_never_resolves_an_unknown_mutation",
+            "tests/test_review_round6.py::test_r6_1_state_envelope_is_validated",
+        ),
+    ),
+    Mutation(
+        "r6-bind-lineage",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if prior.lineage and document.lineage != prior.lineage:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_unproven_state_never_resolves_an_unknown_mutation",
+            "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
+        ),
+    ),
+    Mutation(
+        "r6-bind-serial",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if document.serial < prior.serial:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
+        ),
+    ),
+    Mutation(
+        "r6-bind-prior-ids",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if resource_id in prior_ids:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
+        ),
+    ),
+    Mutation(
+        "r6-bind-shows-something",
+        (
+            (
+                "provisioning/state_evidence.py",
+                "if creates and all(present.get(address) is None for address in creates):",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_binding_requires_the_plans_creates_and_rejects_prior_ids",
+            "tests/test_review_round6.py::test_r6_1_partial_final_state_is_accepted_and_empty_final_state_is_not",
+        ),
+    ),
+    Mutation(
+        "r6-stored-needs-all-creates",
+        (
+            (
+                "worker.py",
+                "require_all_creates=complete",
+                "require_all_creates=False",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_stored_snapshot_must_show_every_planned_resource",
+        ),
+    ),
+    Mutation(
+        "r6-evidence-bound-to-plan-file",
+        (
+            (
+                "worker.py",
+                'if not plan_path.is_file() or sha256_file(plan_path) != plan["plan_hash"]:',
+                "if not plan_path.is_file():",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_1_tampered_saved_plan_voids_the_binding",),
+    ),
+    Mutation(
+        "r6-unaccepted-ids-observed",
+        (
+            (
+                "worker.py",
+                '                    identity(rid, f"{source}_seen", parent)\n                    for rid, parent in observed_identities(document)\n',
+                '                    identity(rid, f"{source}_seen", parent)\n                    for rid, parent in []\n',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_ids_in_unaccepted_state_are_recorded_as_observations",
+        ),
+    ),
+    Mutation(
+        "r6-signal-classified",
+        (
+            (
+                "provisioning/terraform.py",
+                "if result.returncode < 0:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_signal_exit_is_classified_not_reported_as_a_plain_failure",
+        ),
+    ),
+    Mutation(
+        "r6-state-command-read-only",
+        (
+            (
+                "provisioning/runner.py",
+                'if args[0] == "state" and tuple(args) != ALLOWED_STATE_ARGS:',
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_1_state_command_is_read_only",
+            "tests/test_runner_and_terraform.py::test_disallowed_subcommands",
+        ),
+    ),
+    Mutation(
+        "r6-legacy-single-ran",
+        (
+            (
+                "identities.py",
+                'if len(ran) != 1 or ran[0]["status"] != "succeeded":',
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_2_legacy_trust_rule",
+            "tests/test_review_round6.py::test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance",
+        ),
+    ),
+    Mutation(
+        "r6-legacy-counts-failed-runs",
+        (
+            (
+                "identities.py",
+                "AND jobs.status IN ('succeeded', 'recovery_required', 'running')",
+                "AND jobs.status IN ('succeeded')",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance",
+            "tests/test_review_round6.py::test_r6_2_legacy_trust_rule",
+        ),
+    ),
+    Mutation(
+        "r6-migration-revalidates-resolved",
+        (
+            (
+                "db/migrations/0006_obligation_revalidation.sql",
+                "'evidence_revalidation', 'uncaptured'",
+                "'evidence_revalidation', 'not_needed'",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance",
+        ),
+    ),
+    Mutation(
+        "r6-migration-classifies-destroy",
+        (
+            (
+                "db/migrations/0006_obligation_revalidation.sql",
+                "UPDATE recovery_obligations SET evidence = 'not_needed' WHERE",
+                "UPDATE recovery_obligations SET evidence = 'uncaptured' WHERE",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_2_failed_destroy_needs_no_capture_after_upgrade",),
+    ),
+    Mutation(
+        "r6-trigger-not-needed-only-for-deletes",
+        (
+            (
+                "db/migrations/0006_obligation_revalidation.sql",
+                "AND EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id",
+                "AND NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = NEW.plan_id",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_2_not_needed_is_only_reachable_for_plans_that_create_nothing",
+        ),
+    ),
+    Mutation(
+        "r6-runtime-classifies-destroy",
+        (
+            (
+                "worker.py",
+                '            evidence = self._capture_apply_evidence(job, immediate=False)\n            if evidence == "uncaptured":\n                continue',
+                '            evidence = self._capture_apply_evidence(job, immediate=False)\n            if evidence != "captured":\n                continue',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_2_failed_destroy_is_classified_at_runtime_when_still_uncaptured",
+        ),
+    ),
+    Mutation(
+        "r6-evidence-read-locked",
+        (
+            (
+                "identities.py",
+                "fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)",
+                "pass",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_import_waits_for_an_append_in_progress",),
+    ),
+    Mutation(
+        "r6-busy-is-not-corruption",
+        (
+            (
+                "worker.py",
+                '                log.exception(\n                    "evidence import failed during recovery",',
+                '                self._open_obligation(job["deployment_id"], None, None, "evidence_file_corrupt", "uncaptured")\n                log.exception(\n                    "evidence import failed during recovery",',
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_startup_recovery_survives_a_busy_evidence_file",),
+    ),
+    Mutation(
+        "r6-storage-root-durable",
+        (
+            (
+                "db/database.py",
+                "        ensure_directory(self.path.parent)\n",
+                "        self.path.parent.mkdir(parents=True, exist_ok=True)\n",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_3_initial_storage_ancestors_are_fsynced",
+            "tests/test_review_round6.py::test_r6_3_every_directory_creation_goes_through_the_durable_helpers",
+        ),
+    ),
+    Mutation(
+        "r6-runner-dirs-durable",
+        (
+            (
+                "provisioning/runner.py",
+                "        ensure_directory(home)\n",
+                "        home.mkdir(mode=0o700, exist_ok=True)\n",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_simulator_and_runner_directories_are_durable",),
+    ),
+    Mutation(
+        "r6-simulator-dir-durable",
+        (
+            (
+                "provisioning/simulated.py",
+                "        ensure_directory(self._state_dir)\n",
+                "        self._state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)\n",
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_3_simulator_and_runner_directories_are_durable",),
+    ),
+    Mutation(
+        "r6-lock-dir-durable",
+        (
+            (
+                "worker.py",
+                "        ensure_directory(self.path.parent)\n",
+                "        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)\n",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_3_every_directory_creation_goes_through_the_durable_helpers",
+        ),
+    ),
+    Mutation(
+        "r6-escaped-unquoted",
+        (
+            (
+                "logging_setup.py",
+                '    r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)"\n    r"|(?:\\\\.|[^\\s\\"\',;\\\\])+\\\\?|\\\\)"',
+                '    r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)"\n    r"|[^\\s\\"\',;]+)"',
+            ),
+        ),
+        ("tests/test_review_round6.py::test_r6_4_escaped_delimiters_do_not_leak_at_any_boundary",),
+    ),
+    Mutation(
+        "r6-replay-sanitized",
+        (
+            (
+                "agent/service.py",
+                'return _stored_reply(prior["response_json"])',
+                'return AgentReply.model_validate_json(prior["response_json"])',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_legacy_cached_replies_are_redacted_and_validated_on_replay",
+        ),
+    ),
+    Mutation(
+        "r6-replay-proposal-revalidated",
+        (
+            (
+                "agent/service.py",
+                'reply = reply.model_copy(update={"proposal": Proposal.model_validate(proposal)})',
+                'reply = reply.model_copy(update={"proposal": Proposal.model_construct(**proposal)})',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_legacy_cached_replies_are_redacted_and_validated_on_replay",
+        ),
+    ),
+    Mutation(
+        "r6-reply-text-sanitized",
+        (
+            (
+                "agent/service.py",
+                '"reply": redact(reply.reply)[:MAX_REPLY_CHARS],',
+                '"reply": reply.reply,',
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_legacy_cached_replies_are_redacted_and_validated_on_replay",
+        ),
+    ),
+    Mutation(
+        "r6-tool-results-middleware",
+        (
+            (
+                "agent/service.py",
+                "            _RedactToolResults(),\n",
+                "",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_tool_errors_that_echo_arguments_are_replaced",
+            "tests/test_review_round6.py::test_r6_4_unknown_tool_error_does_not_echo_the_model_supplied_name",
+            "tests/test_review_round6.py::test_r6_4_legacy_credential_shaped_deployment_name_does_not_reach_the_model",
+        ),
+    ),
+    Mutation(
+        "r6-name-rejects-credentials",
+        (
+            (
+                "schemas.py",
+                "if redact(value) != value:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_credential_shaped_name_is_rejected_not_silently_altered",
+            "tests/test_review_round6.py::test_r6_4_typed_validation_and_proposal_bounds_are_unchanged",
+        ),
+    ),
+    Mutation(
+        "r6-proposal-typed",
+        (
+            (
+                "schemas.py",
+                "class Proposal(BaseModel):\n    name: DeploymentName\n    disk_gib: DiskGiB",
+                "class Proposal(BaseModel):\n    name: str\n    disk_gib: int",
+            ),
+        ),
+        (
+            "tests/test_review_round6.py::test_r6_4_typed_validation_and_proposal_bounds_are_unchanged",
         ),
     ),
     Mutation(

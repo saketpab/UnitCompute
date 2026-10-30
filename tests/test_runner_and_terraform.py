@@ -86,6 +86,9 @@ def test_disallowed_subcommands(tmp_path: Path, fake_tf: Path) -> None:
     for args in (
         ["destroy"],
         ["state", "rm", "x"],
+        ["state", "push", "errored.tfstate"],
+        ["state", "pull", "extra"],
+        ["state"],
         ["force-unlock", "id"],
         ["import"],
         ["console"],

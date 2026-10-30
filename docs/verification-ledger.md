@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). Round-5 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). Round-6 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -364,7 +364,7 @@ Changed test expectations (each is stricter):
   `r5-retain-open-obligations`. `r2-2-persist-outputs` and `r4-new-file-dir-fsync` were
   retargeted to the new code.
 
-## Round 5 fix commit (parent `33602aa`)
+## Round 5 fix commit: `b5341db9ceb6122eae65c00fc8bc0ec3f70c865a` (parent `33602aa`)
 
 | Check | Result |
 |---|---|
@@ -380,3 +380,116 @@ Residual limits: redaction is pattern-based. Whether real AWS reports root mappi
 retains replaced roots and accepts the IAM policies, and how real Terraform behaves when
 killed mid-apply against S3, are part of the blocked live gate. An `uncaptured` obligation
 can only be resolved by a support decision outside the application.
+
+## Candidate 6: `b5341db9ceb6122eae65c00fc8bc0ec3f70c865a`
+
+| Check | Result |
+|---|---|
+| Safe CI on the exact commit | passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)) |
+| Sol Medium security review | **not clean**: six findings |
+| Sol Medium reliability review | **not clean**: six findings |
+
+Round 6 was implemented by native Claude Opus 5.5 (medium) until the run was interrupted,
+and finished by native Claude Sonnet 5.5 (high) after the user changed the implementation
+model to stretch usage. Reviews remain GPT-6.1-Sol, medium.
+
+## Round 6 findings → fixes → tests
+
+Reviewer reproductions (`test_security6_independent.py`, `test_reliability6_independent.py`,
+`reproduce_backend_failure6.py`) were kept outside the repository and run unchanged in
+isolated copies:
+
+- On `b5341db` all 18 tests pass (12 security including the JWT control, 6 reliability), so the
+  defects reproduce. The real-Terraform script prints `ACCEPTED AS EMPTY`.
+- On the fix tree 17 fail and the JWT control passes. Failures that were only incidental
+  (the reviewers' scripts call the renamed `_capture_apply_evidence(state_final=...)`, replay
+  only migration 5, or release a paused writer after the importer returns) are *not* counted
+  as fixes: each defect is re-proven by a test in `tests/test_review_round6.py` written for
+  the intended invariant, and by a mutant that reverts it.
+
+Design changes (invariants, not counterexamples):
+
+- **A process exit proves nothing about what was persisted.** An apply's outcome is
+  established only by a *raw state document bound to that apply*
+  (`provisioning/state_evidence.py`): complete envelope (format 4, the pinned Terraform
+  version, lineage, serial, explicit `resources` and `outputs`), confined to the template,
+  outputs agreeing with resources, the saved plan file unchanged since approval, lineage equal
+  to the plan's prior state, serial not older, at least one planned resource shown, and no
+  created ID that was already in the prior state. Stored state (read-only `terraform state
+  pull`, never `show -json`) is used only right after the apply and must show every planned
+  resource; after a crash or on retry only `errored.tfstate` counts. IDs in any state that is
+  read but not accepted are still recorded as observations. A signal exit is its own error
+  (`terraform_signalled`). `terraform state` accepts `pull` only; no push, import or
+  force-unlock exists anywhere.
+- **Legacy launch provenance** (`identities.py`): legacy root IDs are launch evidence only when
+  the deployment has exactly one create-kind apply that reached Terraform, it succeeded and
+  its recorded plan created the VM. Failed launches, failed repairs and later no-op successes
+  can no longer justify or erase uncertainty.
+- **Migration 0006** revalidates history: every earlier failed apply of a plan that could
+  create resources gets a new `uncaptured` obligation (0005 had discharged some merely because
+  a later apply succeeded); obligations of deletion-only plans become `not_needed`, and the
+  forward-only trigger allows that move only for such plans. The worker applies the same
+  classification at runtime.
+- **Gates**: the open-obligation check runs when a plan starts, after reconciliation, and in
+  the apply precheck after a fresh evidence import. Evidence reads take a bounded shared lock
+  so a write in progress is never read as corruption; a lock timeout or I/O error is
+  transient and never opens a corruption obligation.
+- **Durability**: all directory creation (data directory and ancestors, worker lock, work
+  directories, runner home and logs, simulator, Terraform version scratch) goes through
+  `durable.py`; an audit test fails on any direct `mkdir`.
+- **Credential policy** at one boundary per data flow: escaped delimiters in unquoted values;
+  tool results (and tool errors, replaced by fixed messages because LangChain echoes raw
+  arguments) redacted in one middleware; replies redacted and the stored proposal
+  revalidated on replay; `DeploymentName` rejects credential-shaped names (REST 422, tool
+  invalid) and `Proposal` is typed, so unsafe structured values are rejected or withheld,
+  never silently rewritten.
+
+| ID | Finding | Regression tests (`tests/test_review_round6.py`) | Mutants |
+|---|---|---|---|
+| R6-1 (P1 ×3, both reviews) | Empty, incomplete or stale state, a signalled or backend-failed Terraform, and unread raw outputs resolved an unknown mutation, allowing verified deletion | `test_r6_1_*` (8 unproven-state variants through the worker with moto, observed-ID recording, stored-snapshot rules, tampered plan, crash path, envelope/binder unit cases, **real Terraform**: SIGKILL after an external effect, and backend plus fallback write failure, read-only `state`) | `r6-envelope-complete`, `r6-version-pinned`, `r6-outputs-agree`, `r6-bind-lineage`, `r6-bind-serial`, `r6-bind-prior-ids`, `r6-bind-shows-something`, `r6-stored-needs-all-creates`, `r6-evidence-bound-to-plan-file`, `r6-unaccepted-ids-observed`, `r6-signal-classified`, `r6-state-command-read-only`, `r5-capture-on-failure`, `r5-stored-state-only-when-final` |
+| R6-2 (P1 ×2) | Legacy success counts and failed repairs supplied false launch-root provenance; migration discharged failed launches | `test_r6_2_*` (failed launch + no-op success and failed repair after launch, both ending in blocked deletion with the original disk alive; trust-rule table) | `r5-legacy-single-create`, `r6-legacy-single-ran`, `r6-legacy-counts-failed-runs`, `r6-migration-revalidates-resolved` |
+| R6-2b (P2) | Migration blocked failed destroys that need no capture | `test_r6_2_failed_destroy_*`, `test_r6_2_not_needed_is_only_reachable_for_plans_that_create_nothing` | `r6-migration-classifies-destroy`, `r6-trigger-not-needed-only-for-deletes`, `r6-runtime-classifies-destroy` |
+| R6-3 (P2 ×3) | Obligation found during planning did not stop that plan's apply; imports raced locked writers; fresh storage ancestors were not synced | `test_r6_3_*` | `r6-gate-helper`, `r6-recheck-after-reconcile`, `r6-recheck-before-apply`, `r6-reconcile-before-apply`, `r6-plan-failure-keeps-recovery`, `r6-evidence-read-locked`, `r6-busy-is-not-corruption`, `r6-storage-root-durable`, `r6-runner-dirs-durable`, `r6-simulator-dir-durable`, `r6-lock-dir-durable` |
+| R6-4 (P2 ×3) | Escaped unquoted delimiters, cached legacy replies and structured proposals/tool results bypassed redaction | `test_r6_4_*` (8 escaped forms through ingress/provider/storage/reply/replay, legacy replay, name rejection, legacy stored name via tools, tool errors) | `r6-escaped-unquoted`, `r6-replay-sanitized`, `r6-replay-proposal-revalidated`, `r6-reply-text-sanitized`, `r6-tool-results-middleware`, `r6-name-rejects-credentials`, `r6-proposal-typed` |
+
+Changed test expectations (each stricter or equivalent):
+
+- `FailingApply` (worker recovery tests) now writes Terraform's final state as
+  `errored.tfstate` for the partial-apply scenario; a variant without it (only a stored
+  snapshot lacking the planned VM) must fail closed for an error, a signal and a timeout.
+- `test_r2_2_apply_outputs_persist_when_inventory_fails` now expects the deletion preview to
+  stop with `recovery_evidence_missing` (the apply's outcome is unproven).
+- Round-4 legacy fixtures seed a real single successful launch history
+  (`seed_launch_history`), as the new provenance rule requires.
+- The round-5 raw-state tests use complete envelopes; the `show -json` reader is gone.
+- Migration lists include schema 6; `test_disallowed_subcommands` also rejects `state push`,
+  `state pull <arg>` and bare `state`.
+- Tool error messages are fixed strings (`TOOL_ERROR`, `UNKNOWN_TOOL_ERROR`) that keep the
+  words the existing agent tests assert.
+- Mutant inventory: all 96 earlier mutants are retained (seven retargeted to the new code);
+  37 added; one (`r6-tool-output-redacted`) was dropped when a first full run showed it
+  redundant with the single redaction middleware, which is now the only boundary. The first
+  full run also found five survivors (an obsolete migration target, a tamper test that was
+  rejected for a different reason, an audit test that scanned the checkout instead of the
+  imported package, and two redundant validation layers); each was fixed, not excused.
+
+## Round 6 fix commit (parent `b5341db`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check`, `uv sync --locked` | passed |
+| `pytest` with offline Terraform tests required | 449 passed |
+| `scripts/check_guards.py` | 132/132 mutants killed in one full run. All referenced test IDs collect and every mutation applies exactly once |
+| Reviewer reproductions against `b5341db` and the fix tree | see above |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–6) and an **upgrade** of a copy of the round-5 data dir from schema 5 to 6 (`applied: [6]`). Both: `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; a chat message `export PASSWORD=prefix\;…` was not stored and its tail never reached the reply; a credential-shaped REST name returned 422; no open obligations; second worker refused; worker stopped on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+
+Residual limits: a failed apply whose Terraform both failed to persist state and left no
+`errored.tfstate` (or was killed before persisting) stays `uncaptured`. Quota is held and
+verified deletion is refused, by design, until a support decision outside the application. A
+legacy deployment whose history includes a failed repair also stays `identity_incomplete`
+even if its recorded root was in fact the launch root. Redaction is pattern-based. Real AWS
+behaviour of root mappings, replaced roots, `terraform state pull` against S3 and Terraform
+being killed mid-apply remains part of the blocked live gate. Offline Terraform, simulator
+and moto evidence do not prove AWS behaviour.

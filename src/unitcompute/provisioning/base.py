@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from unitcompute.provisioning.state_evidence import PriorState
+
 TEMPLATE_VERSION = "ec2-vm/v1"
 TAG_MANAGED_BY = "ManagedBy"
 TAG_DEPLOYMENT = "UnitComputeDeployment"
@@ -120,9 +122,15 @@ class Provisioner(Protocol):
 
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult: ...
 
-    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
-        """``terraform show -json`` of the stored state, read without refreshing, from a plan's
-        initialized work directory. Raises ProvisioningError if it cannot be read."""
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> object:
+        """The stored state as a raw state document (``terraform state pull``: read-only, no
+        refresh), from a plan's initialized work directory. Raises ProvisioningError if it
+        cannot be read."""
+        ...
+
+    def prior_state(self, plan_path: Path) -> PriorState:
+        """Lineage and serial of the state the saved plan was computed against. Raises
+        StateEvidenceError if the saved plan does not show them."""
         ...
 
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:

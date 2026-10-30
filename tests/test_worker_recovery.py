@@ -16,7 +16,11 @@ from unitcompute.provisioning.base import (
     ProvisioningError,
     ProvisioningTimeout,
 )
-from unitcompute.provisioning.simulated import SimulatedProvisioner
+from unitcompute.provisioning.simulated import (
+    SimulatedProvisioner,
+    raw_state,
+    simulated_lineage,
+)
 from unitcompute.worker import Worker, WorkerLock, WorkerLockHeld
 
 
@@ -26,19 +30,28 @@ def detail(h: Harness, dep: str) -> dict[str, Any]:
 
 
 class FailingApply(SimulatedProvisioner):
-    """Applies part of the plan (security group only), then fails like Terraform would."""
+    """Applies part of the plan (security group only), then fails like Terraform would.
 
-    def __init__(self, data_dir: Path, error: ProvisioningError, partial: bool) -> None:
+    ``final_state``: Terraform's final state is available as ``errored.tfstate`` (its
+    backend write failed), which establishes the partial outcome. Without it only the
+    stored snapshot exists, and a snapshot without the planned VM proves nothing."""
+
+    def __init__(
+        self, data_dir: Path, error: ProvisioningError, partial: bool, final_state: bool = True
+    ) -> None:
         super().__init__(data_dir)
         self.error = error
         self.partial = partial
+        self.final_state = final_state
 
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult:
         intent = json.loads(plan_path.read_bytes())
         if self.partial and intent["kind"] == "create":
-            sg = intent["desired"]["aws_security_group.vm"]
-            path = self._state_path(spec.deployment_id)
-            path.write_text(json.dumps({"aws_security_group.vm": sg}))
+            partial = {"aws_security_group.vm": intent["desired"]["aws_security_group.vm"]}
+            self._state_path(spec.deployment_id).write_text(json.dumps(partial))
+            if self.final_state:
+                document = raw_state(simulated_lineage(spec.deployment_id), 1, partial)
+                (workdir / "errored.tfstate").write_text(json.dumps(document))
         raise self.error
 
 
@@ -50,16 +63,18 @@ def _worker(h: Harness, provisioner: SimulatedProvisioner) -> Worker:
     "error",
     [
         ProvisioningError("terraform_apply_failed", "terraform apply failed; see the job log."),
+        ProvisioningError("terraform_signalled", "terraform apply was terminated by a signal."),
         ProvisioningTimeout("terraform_timeout", "terraform apply exceeded its 1800s limit."),
     ],
 )
+@pytest.mark.parametrize("final_state", [True, False])
 def test_partial_apply_requires_recovery_then_reconciles(
-    harness: Harness, error: ProvisioningError
+    harness: Harness, error: ProvisioningError, final_state: bool
 ) -> None:
     h = harness
     d = create_and_plan(h)
     approve_current(h, d)
-    failing = FailingApply(h.settings.data_dir, error, partial=True)
+    failing = FailingApply(h.settings.data_dir, error, partial=True, final_state=final_state)
     assert _worker(h, failing).run_once()
     after = detail(h, d["id"])
     assert after["status"] == "recovery_required"
@@ -69,16 +84,17 @@ def test_partial_apply_requires_recovery_then_reconciles(
     # The security group really exists (billable/partial state) ...
     assert [r.resource_type for r in h.provisioner.owned_resources(d["id"])] == ["security_group"]
 
-    # ... and a new preview reconciles from state: SG is a no-op, the VM is created.
     assert h.client.post(f"/deployments/{d['id']}/plan", headers=auth()).status_code == 202
     h.drain()
     repaired = detail(h, d["id"])
-    if isinstance(error, ProvisioningTimeout):
-        # Terraform was killed: stored state is not final and no errored.tfstate exists,
-        # so what the apply created is unknown. Fail closed (round 5).
+    if not final_state:
+        # Only a stored snapshot without the planned VM: it may be stale or intermediate,
+        # whatever the exit (error, signal or timeout). Fail closed (round 6).
         assert repaired["status"] == "recovery_required"
         assert repaired["current_plan"]["error"]["code"] == "recovery_evidence_missing"
         return
+    # ... Terraform's final state establishes the partial outcome, and a new preview
+    # reconciles from state: SG is a no-op, the VM is created.
     assert repaired["status"] == "awaiting_approval"
     assert [c["address"] for c in repaired["current_plan"]["resource_changes"]] == [
         "aws_instance.vm"

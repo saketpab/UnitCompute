@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from unitcompute.durable import create_directory
+from unitcompute.durable import create_directory, ensure_directory
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     ApplyResult,
@@ -35,6 +35,7 @@ from unitcompute.provisioning.policy import (
     INSTANCE_CREATE_VALUES,
     expected_tags,
 )
+from unitcompute.provisioning.state_evidence import PriorState
 
 SIMULATED_AMI = "ami-0000000000000000a"
 SIMULATED_TARGETS = NetworkTargets(
@@ -55,6 +56,48 @@ def _write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
         handle.write(data)
 
 
+def simulated_lineage(deployment_id: str) -> str:
+    return f"simulated-{deployment_id}"
+
+
+def raw_state(
+    lineage: str,
+    serial: int,
+    resources: dict[str, dict[str, Any]],
+    terraform_version: str = "simulated",
+) -> dict[str, Any]:
+    """A raw (format 4) state document for ``address -> attributes``, with template outputs."""
+    outputs: dict[str, Any] = {}
+    instance = resources.get("aws_instance.vm")
+    group = resources.get("aws_security_group.vm")
+    if instance is not None:
+        outputs["instance_id"] = {"value": instance["id"], "type": "string"}
+        outputs["root_volume_id"] = {
+            "value": instance["root_block_device"][0]["volume_id"],
+            "type": "string",
+        }
+    if group is not None:
+        outputs["security_group_id"] = {"value": group["id"], "type": "string"}
+    return {
+        "version": 4,
+        "terraform_version": terraform_version,
+        "serial": serial,
+        "lineage": lineage,
+        "outputs": outputs,
+        "resources": [
+            {
+                "mode": "managed",
+                "type": address.split(".")[0],
+                "name": "vm",
+                "provider": f'provider["{AWS_PROVIDER}"]',
+                "instances": [{"schema_version": 1, "attributes": attributes}],
+            }
+            for address, attributes in resources.items()
+        ],
+        "check_results": None,
+    }
+
+
 def _expressions(address: str) -> dict[str, Any]:
     expressions: dict[str, Any] = {
         name: {"constant_value": "simulated"} for name in CONFIGURED_ARGUMENTS[address]
@@ -69,7 +112,7 @@ class SimulatedProvisioner:
 
     def __init__(self, data_dir: Path) -> None:
         self._state_dir = data_dir / "simulated-aws"
-        self._state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_directory(self._state_dir)
 
     def runtime_versions(self) -> RuntimeVersions:
         return RuntimeVersions(
@@ -298,27 +341,13 @@ class SimulatedProvisioner:
             }
         )
 
-    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> object:
         state = self._load(spec.deployment_id)
-        if not state:
-            return {"format_version": "1.0"}
-        return {
-            "format_version": "1.0",
-            "values": {
-                "root_module": {
-                    "resources": [
-                        {
-                            "address": a,
-                            "mode": "managed",
-                            "type": a.split(".")[0],
-                            "name": "vm",
-                            "values": v,
-                        }
-                        for a, v in state.items()
-                    ]
-                }
-            },
-        }
+        return raw_state(simulated_lineage(spec.deployment_id), 1 if state else 0, state)
+
+    def prior_state(self, plan_path: Path) -> PriorState:
+        intent = json.loads(plan_path.read_bytes())
+        return PriorState(simulated_lineage(str(intent.get("deployment_id"))), 0)
 
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
         state = self._load(deployment_id)

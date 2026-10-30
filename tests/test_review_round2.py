@@ -632,10 +632,11 @@ def test_r2_2_apply_outputs_persist_when_inventory_fails(harness: Harness, moto_
             )
         ]
     assert iid in ids
-    # State and tags never held the VM: the recorded ID still blocks a false deletion.
+    # State and tags never held the VM: the apply's outcome is unproven (round 6), so a
+    # false deletion is blocked before planning; the recorded ID is kept for verification.
     _, pending = _replan(h, _AwsBacked(h), d["id"], "deletion-plan")
     assert pending["status"] == "recovery_required"
-    assert iid in pending["current_plan"]["error"]["message"]
+    assert pending["current_plan"]["error"]["code"] == "recovery_evidence_missing"
 
 
 def test_r2_2_evidence_file_survives_database_contention(
@@ -699,7 +700,7 @@ def _schema_v1_deployment(
             "?, ?)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4, 5]
+    assert db.migrate() == [2, 3, 4, 5, 6]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
@@ -732,7 +733,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4, 5]
+    assert db.migrate() == [3, 4, 5, 6]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}

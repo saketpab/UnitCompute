@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+
+from unitcompute.logging_setup import redact
 
 NAME_PATTERN = r"^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
 MIN_DISK_GIB = 8
@@ -18,7 +20,18 @@ SESSION_ID_PATTERN = r"^chat_[0-9a-f]{32}$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9._:-]{8,128}$"
 
-DeploymentName = Annotated[str, StringConstraints(pattern=NAME_PATTERN)]
+
+def _not_credential_like(value: str) -> str:
+    # A name is stored, tagged on AWS resources and shown to the assistant. Redacting it would
+    # change its meaning, so a name the credential detector recognises is rejected instead.
+    if redact(value) != value:
+        raise ValueError("name must not look like a credential")
+    return value
+
+
+DeploymentName = Annotated[
+    str, StringConstraints(pattern=NAME_PATTERN), AfterValidator(_not_credential_like)
+]
 DiskGiB = Annotated[int, Field(ge=MIN_DISK_GIB, le=MAX_DISK_GIB)]
 
 DeploymentStatus = Literal[
@@ -148,8 +161,8 @@ class DeploymentList(BaseModel):
 
 
 class Proposal(BaseModel):
-    name: str
-    disk_gib: int
+    name: DeploymentName
+    disk_gib: DiskGiB
     region: str
     instance_type: str
     estimated_monthly_usd: str

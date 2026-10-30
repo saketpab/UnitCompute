@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from unitcompute.config import Settings
-from unitcompute.durable import create_directory
+from unitcompute.durable import create_directory, ensure_directory
 from unitcompute.provisioning.aws import (
     AwsEnvironment,
     TemporaryCredentials,
@@ -33,6 +33,12 @@ from unitcompute.provisioning.base import (
     template_hash,
 )
 from unitcompute.provisioning.runner import RunResult, TerraformRunner
+from unitcompute.provisioning.state_evidence import (
+    PriorState,
+    StateEvidenceError,
+    load_state_bytes,
+    prior_state_from_planfile,
+)
 
 PINNED_TERRAFORM_VERSION = "1.17.1"
 PLAN_FILE = "tfplan"
@@ -94,7 +100,7 @@ class TerraformProvisioner:
     @cached_property
     def _versions(self) -> RuntimeVersions:
         scratch = self._settings.workdir_root / "_version"
-        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_directory(scratch)
         result = self._runner.run(
             ["version", "-json"],
             workdir=scratch,
@@ -141,6 +147,13 @@ class TerraformProvisioner:
             log_name=log_name,
             secrets=creds.secrets(),
         )
+        if result.returncode < 0:
+            # Killed by a signal: whatever Terraform had done was not reported or persisted
+            # as a final state.
+            raise ProvisioningError(
+                "terraform_signalled",
+                f"terraform {args[0]} was terminated by a signal; its outcome is unknown.",
+            )
         if result.returncode != 0:
             raise ProvisioningError(error_code, f"terraform {args[0]} failed; see the job log.")
         return result
@@ -243,23 +256,25 @@ class TerraformProvisioner:
         }
         return ApplyResult(outputs=outputs)
 
-    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> object:
         creds = self._aws.credentials(
             "plan", f"uc-capture-{spec.deployment_id[4:20]}", spec.deployment_id
         )
-        shown = self._run(
-            ["show", "-json", "-no-color"],
+        pulled = self._run(
+            ["state", "pull"],
             workdir,
             creds,
             300,
-            "show-state",
+            "state-pull",
             "state_capture_failed",
         )
         try:
-            document: dict[str, Any] = json.loads(shown.stdout)
-        except ValueError as exc:
+            return load_state_bytes(pulled.stdout.encode())
+        except StateEvidenceError as exc:
             raise ProvisioningError("state_capture_failed", "Stored state was unreadable.") from exc
-        return document
+
+    def prior_state(self, plan_path: Path) -> PriorState:
+        return prior_state_from_planfile(plan_path)
 
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
         creds = self._aws.credentials("plan", f"uc-inventory-{deployment_id[4:20]}")

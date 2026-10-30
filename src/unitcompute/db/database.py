@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
+from unitcompute.durable import ensure_directory, fsync_directory
 from unitcompute.errors import ServiceUnavailable
 
 BUSY_TIMEOUT_MS = 5000
@@ -88,15 +89,19 @@ class Database:
             conn.close()
 
     def initialise_storage(self) -> None:
-        """Create the data directory with private permissions and enable WAL."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """Create the data directory (and missing ancestors) durably with private
+        permissions, and enable WAL."""
+        ensure_directory(self.path.parent)
         os.chmod(self.path.parent, 0o700)
+        created = not self.path.exists()
         conn = self.connect()
         try:
             conn.execute("PRAGMA journal_mode = WAL")
         finally:
             conn.close()
         os.chmod(self.path, 0o600)
+        if created:
+            fsync_directory(self.path.parent)
 
     def migrate(self) -> list[int]:
         self.initialise_storage()

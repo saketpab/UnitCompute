@@ -216,35 +216,55 @@ Whenever an apply fails, times out, crashes or is found interrupted at startup, 
 records a recovery obligation for it. Obligations can never be deleted, and each one has
 an evidence state that only moves forward:
 
-- `captured`: what the apply created was read and recorded as launch evidence. The
-  worker reads the `errored.tfstate` Terraform left in the plan's work directory if there
-  is one, and otherwise the stored state (`terraform show -json`, no refresh). Stored
-  state is read only when Terraform itself reported the failure for the latest apply;
-  after a crash, a kill or a timeout, or on a later retry, only `errored.tfstate` is
-  trusted. Either file is validated (state version 4, no modules or `count`/`for_each`,
-  only the template's instance and security group, at most one of each, well-formed IDs)
-  and refused otherwise.
-- `not_needed`: the plan creates no resources (for example a deletion), so the apply
-  could not have created anything.
-- `uncaptured`: neither file existed or was valid. Empty state, empty tags and no known
-  IDs do not prove that nothing was created. The worker retries the `errored.tfstate`
-  read before every plan.
+- `captured`: what the apply did was established from state **bound to that apply** and
+  recorded. Terraform exiting, normally or by signal, proves nothing about what it
+  persisted, so the worker accepts only a raw state document that is:
+  - a complete envelope: format 4, the pinned Terraform version, a lineage, a serial,
+    and explicit `resources` and `outputs`; a document with a missing field, or with
+    outputs that disagree with its resources, is refused;
+  - confined to the template (one `aws_instance.vm`, at most one `aws_security_group.vm`,
+    well-formed IDs, no modules, `count`/`for_each` or deposed objects);
+  - tied to the saved plan that ran: the plan file is unchanged since approval, the lineage
+    matches the plan's prior state, the serial is not older, the state shows at least one
+    resource the plan creates, and every created ID is new (not in the plan's prior state).
+  Sources: `errored.tfstate` in the plan's work directory (Terraform's final state, which
+  may show a partial outcome), or, only right after the apply and only for the latest
+  apply, the stored state from the read-only `terraform state pull`, which must show
+  every resource the plan creates because a stored snapshot can be stale. After a crash
+  or on a later retry only `errored.tfstate` is read. If both the backend write and the
+  `errored.tfstate` write fail, the stored state is empty and nothing is accepted. Any
+  well-formed ID in a state that is read but not accepted is still recorded as an
+  observation that must be verified gone.
+- `not_needed`: the plan's recorded changes show it creates nothing (deletions only), so
+  the apply could not have created anything. Unreadable changes count as creating.
+- `uncaptured`: nothing acceptable was found. Empty state, empty tags and no known IDs do
+  not prove that nothing was created. The worker retries the `errored.tfstate` read before
+  every plan.
 
 An obligation is discharged only by the next successful apply for the deployment, and
 only if it is `captured` or `not_needed`. An `uncaptured` obligation is never discharged:
 every later plan fails with `recovery_evidence_missing`, including an empty one. A corrupt
 or malformed record in a deployment's `identities.jsonl` opens an `uncaptured` obligation
 for that deployment only (reason `evidence_file_corrupt`). Other deployments and jobs
-keep running.
+keep running. Open obligations are checked when a plan starts, again after its
+reconciliation (which can open one), and again immediately before `terraform apply`, so an
+obligation opened after a plan was approved still stops the apply. A read that merely waits
+on a writer, or fails transiently, is not corruption.
+
+Migration 0006 revalidates history: every earlier failed apply of a plan that could create
+resources gets a new `uncaptured` obligation (migration 0005 had discharged some merely
+because a later apply succeeded), which the worker clears only from a retained, valid
+`errored.tfstate`. Obligations of plans that only delete are marked `not_needed`.
 
 ### Resource identity evidence
 
 Every resource ID the worker learns is appended to `data/work/<deployment>/identities.jsonl`
 and then imported into the `deployment_resources` table. Neither can be updated or deleted.
-Appends are serialized across processes with an exclusive `flock`. Short writes are
+Appends are serialized across processes with an exclusive `flock`; imports take the shared lock (bounded wait) so a write in progress is never read as a torn record. Short writes are
 completed, and a record torn by a crash is terminated before the next append. The file is
-fsynced. Every directory the worker, the Terraform runner, the simulator or the ledger
-creates is fsynced together with its parents up to the data directory. Evidence is kept
+fsynced. Every directory any component creates (the data directory and its missing ancestors, the
+worker lock, work directories, the Terraform runner's home and logs, the simulator) goes
+through one helper that fsyncs the parent of each directory it creates. Evidence is kept
 per source, so the same volume can be recorded as attached, as an observed root and from
 an apply. Recording only succeeds once the exact rows are present in the table.
 
@@ -254,8 +274,10 @@ Two kinds of evidence are kept apart:
   recorded from the apply that launched the instance: that apply's outputs
   (`launch_output`) or its errored or stored state, read without a refresh
   (`launch_state`). Root IDs written by earlier versions (`apply_output`,
-  `deployment_record`, `migration`) count only while the deployment has had at most one
-  successful create apply.
+  `deployment_record`, `migration`) record outputs of any create-kind apply, including
+  failed repairs and refreshed values, so they count only when the deployment's history
+  has exactly one create-kind apply that ran Terraform, it succeeded, and its recorded plan
+  created the VM. Counts of successful jobs, or a later no-op success, prove nothing.
 - **Observations** never complete identity: refreshed plan state (`terraform_state`),
   outputs of an apply that did not launch the instance, the volume currently at the
   instance's root device name (possibly a replacement), other attached disks, and tag

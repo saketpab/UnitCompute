@@ -149,6 +149,32 @@ def test_r4_2_replacement_root_does_not_complete_historical_identity(
         assert _quota_held(client)
 
 
+def seed_launch_history(db: Database, dep: str, owner: str = "dev:alice") -> None:
+    """The legacy provenance round 6 requires: the deployment's only create-kind apply that
+    ran Terraform succeeded and its plan created the VM."""
+    now = "2026-10-01T00:00:00+00:00"
+    plan_id = "plan_" + "7" * 32
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO plans (id, deployment_id, owner_id, kind, status, provisioner, "
+            "config_hash, region, state_key, template_version, preview_json, created_at) "
+            "VALUES (?, ?, ?, 'create', 'applied', 'simulated', 'h', 'us-east-1', 'k', "
+            "'ec2-vm/v1', ?, ?)",
+            (
+                plan_id,
+                dep,
+                owner,
+                json.dumps({"changes": [{"address": "aws_instance.vm", "action": "create"}]}),
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO jobs (id, owner_id, deployment_id, plan_id, kind, status, "
+            "payload_hash, created_at) VALUES (?, ?, ?, ?, 'apply', 'succeeded', 'h', ?)",
+            ("job_" + "7" * 32, owner, dep, plan_id, now),
+        )
+
+
 def test_r4_2_launch_evidence_plus_replacement_requires_both_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
@@ -165,6 +191,7 @@ def test_r4_2_launch_evidence_plus_replacement_requires_both_gone(
     )["Instances"][0]
     iid, original = vm["InstanceId"], vm["BlockDeviceMappings"][0]["Ebs"]["VolumeId"]
     settings, db, dep = _schema_v1_deployment(tmp_path, monkeypatch, iid, volume=original)
+    seed_launch_history(db, dep)
     ec2.stop_instances(InstanceIds=[iid])
     ec2.detach_volume(VolumeId=original, InstanceId=iid, Device="/dev/sda1")
     replacement = ec2.create_volume(AvailabilityZone=vm["Placement"]["AvailabilityZone"], Size=8)[
@@ -247,6 +274,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
             "'us-east-1', 't3.micro', 'simulated', 'active', ?, ?)",
             (dep, now, now),
         )
+    seed_launch_history(db, dep, "dev:a")
     ledger = IdentityLedger(settings.workdir_root)
     ledger.append_evidence(
         dep,
@@ -259,7 +287,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {}  # shadowed under schema 3
-    assert db.migrate() == [4, 5]
+    assert db.migrate() == [4, 5, 6]
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {iid: {vid}}

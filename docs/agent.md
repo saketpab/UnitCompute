@@ -25,9 +25,14 @@ rejected.
 
 - User messages, chat history, deployment names, tool output and model output are all
   untrusted. The `proposal` comes only from a successful server-side validation, never
-  from model text. Model replies are length-capped and redacted. Redaction is applied to
-  user input, stored history, model output and replayed history, and covers quoted
-  credential values with escaped quotes or a missing closing quote.
+  from model text. Model replies are length-capped and redacted. One credential policy applies at every boundary: user input, stored history, model
+  output, replayed replies (including ones stored before the current rules), tool results,
+  and the structured proposal. It covers quoted values with escaped quotes or a missing
+  closing quote and unquoted values with escaped delimiters. Structured values that
+  redaction would change in meaning are rejected instead: a deployment name that looks like
+  a credential fails validation (REST `422`, and the assistant's tool), and a stored proposal
+  that no longer validates is withheld on replay. Tool error text is replaced by a fixed
+  message because it would otherwise echo model-supplied arguments.
 - Approval requires `POST /deployments/{id}/approve` with the exact plan ID and hash. The
   model claiming "approved", or the user typing "yes", does nothing.
 - Each request is admitted atomically before the provider is called: the daily per-user
