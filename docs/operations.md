@@ -180,9 +180,11 @@ happens when the worker died mid-apply, an apply failed or timed out, or the
 post-apply verification failed.
 
 1. `unitcompute-admin recovery-report --inventory` lists affected deployments, their last
-   job, every identity ever recorded for them, any instance whose root disk was never
-   identified, and the AWS resources currently tagged for each one (read-only).
-2. Do not force-unlock state, delete state, or re-run old plans. The worker lock guarantees
+   job, every identity ever recorded for them, any instance whose launch root was never
+   identified, open recovery obligations, and the AWS resources currently tagged for each
+   one (read-only).
+2. Do not force-unlock, push, import or delete state, and do not re-run old plans.
+   UnitCompute never does any of these automatically either. The worker lock guarantees
    no earlier Terraform process is still running once a new worker starts.
 3. The owner, or an operator acting through the API as the owner, requests a new preview.
    Use `POST /plan` to finish or repair the VM, or `POST /deletion-plan` to clean up. The
@@ -192,23 +194,48 @@ post-apply verification failed.
    `terraform import` them into that deployment's state or delete them by hand. Afterwards,
    request a new preview. Never let the application guess. A recorded VM that is still
    running therefore always blocks a repair preview from launching a second VM.
-5. `identity_incomplete` means an instance is known, but its **launch root** was never
+5. `recovery_evidence_missing` means an apply may have changed AWS but what it created
+   could not be read (see Recovery obligations), or an evidence file is corrupt. Every
+   repair and deletion preview is refused, and deletion cannot be verified.
+6. `identity_incomplete` means an instance is known, but its **launch root** was never
    recorded by UnitCompute. Typical causes are a deployment created before identities
-   were tracked whose Terraform state is lost, or an apply that crashed before its state
-   was saved. The original root disk may still exist and be billable (AWS root
-   replacement, for example, can keep the original volume). So every repair and deletion
-   preview is refused. There is no waiver, and no operator command can assert which
-   volume was the root.
+   were tracked, or an instance seen only by tag or in refreshed state. The original root
+   disk may still exist and be billable (AWS root replacement, for example, can keep the
+   original volume). So every repair and deletion preview is refused. There is no waiver,
+   and no operator command can assert which volume was the root. Restoring or importing
+   Terraform state does not help: a preview refreshes it from AWS, so it only shows what
+   exists now, which is an observation, not launch evidence.
 
-   The recovery route is to recover launch evidence. Restore the deployment's Terraform
-   state, either an earlier version of `deployments/<id>/terraform.tfstate` from the
-   versioned state bucket, or the `errored.tfstate` that Terraform leaves in the failed
-   apply's work directory, which is retained (see Retention). The next preview records the
-   state's root volume as `terraform_state` evidence. Every recorded resource must then be
-   confirmed gone by lookup before the deployment can be `deleted`.
+In both cases the deployment stays in recovery and keeps its quota. Resolving it is a
+deliberate support decision outside the application, made with the retained work
+directory, the identity evidence and the AWS inventory.
 
-   If no launch evidence can be recovered, the deployment stays in recovery and keeps its
-   quota. Resolving it is a deliberate support decision outside the application.
+### Recovery obligations
+
+Whenever an apply fails, times out, crashes or is found interrupted at startup, the worker
+records a recovery obligation for it. Obligations can never be deleted, and each one has
+an evidence state that only moves forward:
+
+- `captured`: what the apply created was read and recorded as launch evidence. The
+  worker reads the `errored.tfstate` Terraform left in the plan's work directory if there
+  is one, and otherwise the stored state (`terraform show -json`, no refresh). Stored
+  state is read only when Terraform itself reported the failure for the latest apply;
+  after a crash, a kill or a timeout, or on a later retry, only `errored.tfstate` is
+  trusted. Either file is validated (state version 4, no modules or `count`/`for_each`,
+  only the template's instance and security group, at most one of each, well-formed IDs)
+  and refused otherwise.
+- `not_needed`: the plan creates no resources (for example a deletion), so the apply
+  could not have created anything.
+- `uncaptured`: neither file existed or was valid. Empty state, empty tags and no known
+  IDs do not prove that nothing was created. The worker retries the `errored.tfstate`
+  read before every plan.
+
+An obligation is discharged only by the next successful apply for the deployment, and
+only if it is `captured` or `not_needed`. An `uncaptured` obligation is never discharged:
+every later plan fails with `recovery_evidence_missing`, including an empty one. A corrupt
+or malformed record in a deployment's `identities.jsonl` opens an `uncaptured` obligation
+for that deployment only (reason `evidence_file_corrupt`). Other deployments and jobs
+keep running.
 
 ### Resource identity evidence
 
@@ -216,20 +243,24 @@ Every resource ID the worker learns is appended to `data/work/<deployment>/ident
 and then imported into the `deployment_resources` table. Neither can be updated or deleted.
 Appends are serialized across processes with an exclusive `flock`. Short writes are
 completed, and a record torn by a crash is terminated before the next append. The file is
-fsynced, and so is the directory of every newly created file or directory. Evidence is kept
+fsynced. Every directory the worker, the Terraform runner, the simulator or the ledger
+creates is fsynced together with its parents up to the data directory. Evidence is kept
 per source, so the same volume can be recorded as attached, as an observed root and from
-Terraform state. Recording only succeeds once the exact rows are present in the table.
+an apply. Recording only succeeds once the exact rows are present in the table.
 
 Two kinds of evidence are kept apart:
 
-- **Launch-root evidence** completes an instance's identity. It is what UnitCompute
-  recorded from Terraform for the instance it launched: apply outputs, Terraform
-  `root_block_device` state, the root ID stored on the deployment, and migrated copies of
-  those.
-- **Observations** never complete identity: the volume currently at the instance's root
-  device name (possibly a replacement), other attached disks, and tag inventory. Every
-  observed resource is still reconciled against Terraform state and must be confirmed gone
-  before deletion.
+- **Launch-root evidence** completes an instance's identity. It is the root volume
+  recorded from the apply that launched the instance: that apply's outputs
+  (`launch_output`) or its errored or stored state, read without a refresh
+  (`launch_state`). Root IDs written by earlier versions (`apply_output`,
+  `deployment_record`, `migration`) count only while the deployment has had at most one
+  successful create apply.
+- **Observations** never complete identity: refreshed plan state (`terraform_state`),
+  outputs of an apply that did not launch the instance, the volume currently at the
+  instance's root device name (possibly a replacement), other attached disks, and tag
+  inventory. Every observed resource is still reconciled against Terraform state and must
+  be confirmed gone before deletion. A source label alone is not provenance.
 
 Planning, for both repair and deletion, refuses to proceed while any known instance lacks
 launch-root evidence. Deletion is complete only when every known instance, volume and
@@ -243,9 +274,9 @@ preview.
 
 - Plan work directories (saved plan, tfvars, logs, `.terraform`) are deleted by the worker
   `UNITCOMPUTE_WORKDIR_RETENTION_DAYS` days (default 7) after creation, once the plan is
-  terminal. The work directory of a failed or uncertain apply is kept, whatever previews
-  are requested in between, until a later apply for that deployment succeeds. It may hold
-  Terraform's `errored.tfstate`.
+  terminal. The work directory of a failed or uncertain apply is kept until every recovery
+  obligation for that plan is discharged. An `uncaptured` one keeps it forever. It may
+  hold Terraform's `errored.tfstate`.
 - Deployment, plan, job and audit rows are kept, and deleted deployments keep their audit
   history. Audit details hold only identifiers and short redacted values.
 - Chat history is stored per session and owner, and only the last

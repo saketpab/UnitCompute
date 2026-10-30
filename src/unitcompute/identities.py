@@ -8,7 +8,6 @@ evidence, and it is imported again before any plan, verification or recovery dec
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import json
 import os
@@ -19,26 +18,35 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from unitcompute.db.database import to_db_time, utcnow
+from unitcompute.durable import ensure_directory, fsync_chain
 
 EVIDENCE_FILE = "identities.jsonl"
 _ID = re.compile(r"^(i|vol|sg)-[0-9a-f]{8,17}$")
 _TYPES = {"i": "instance", "vol": "volume", "sg": "security_group"}
 _DEPLOYMENT = re.compile(r"^dep_[0-9a-f]{32}$")
 
-# Launch-root evidence: what UnitCompute itself recorded from Terraform for the root block
-# device of an instance it launched (apply outputs, Terraform root_block_device state, the
-# root ID kept on the deployment row, and the migrated copies of those). Only this completes
-# an instance's identity.
+# Launch-root evidence: the root volume recorded from the very apply that launched the
+# instance (its outputs, or the state that apply stored, read without a refresh). Only this
+# completes an instance's identity.
 #
-# Everything else is an observation of the present and never completes identity: the
-# volume currently mapped at the root device name (which may be a replacement root, while
-# the original survives detached), other attached disks, tag inventory. Observations are
-# still recorded, so every observed resource must be verified gone before deletion.
+# Everything else is an observation and never completes identity:
+# - Terraform plan prior_state ("terraform_state"): it is refreshed from AWS, so after an
+#   out-of-band root replacement it names the replacement, not the launch disk;
+# - the volume currently at the root device name, other attached disks, tag inventory;
+# - outputs/state of an apply that did not itself create the instance.
+# Observations are still recorded, so every observed resource must be verified gone.
 ROOT_DEVICE = "root_device"
 ATTACHED_DEVICE = "attached_device"
-LAUNCH_ROOT_SOURCES = frozenset(
-    {"apply_output", "terraform_state", "deployment_record", "migration"}
-)
+LAUNCH_OUTPUT = "launch_output"
+LAUNCH_STATE = "launch_state"
+LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE})
+# Written by earlier versions (or copied by migrations) from apply outputs without recording
+# whether that apply launched the instance. They count as launch evidence only when job
+# history shows a single successful create apply, so they cannot be a later refreshed value.
+LEGACY_ROOT_SOURCES = frozenset({"apply_output", "deployment_record", "migration"})
+# Disks seen attached somewhere other than the root device are never root candidates.
+NON_ROOT_SOURCES = frozenset({ATTACHED_DEVICE, "instance_block_devices"})
+_SOURCE = re.compile(r"^[a-z_]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -61,12 +69,36 @@ def identity(resource_id: object, source: str, parent_id: object = None) -> Iden
 
 
 @dataclass(frozen=True)
+class Imported:
+    rows: int
+    corrupt: int
+
+
+def _parse_record(line: str) -> tuple[Identity | None, str]:
+    try:
+        raw = json.loads(line)
+    except ValueError:
+        return None, ""
+    if not isinstance(raw, dict):
+        return None, ""
+    source, parent, at = raw.get("source"), raw.get("parent"), raw.get("at")
+    if not isinstance(source, str) or not _SOURCE.fullmatch(source):
+        return None, ""
+    if parent is not None and not isinstance(parent, str):
+        return None, ""
+    item = identity(raw.get("id"), source, parent)
+    if item is None or (parent is not None and item.parent_id is None):
+        return None, ""
+    return item, at if isinstance(at, str) else to_db_time(utcnow())
+
+
+@dataclass(frozen=True)
 class KnownIdentities:
     instances: set[str]
     volumes: dict[str, str | None]  # volume -> parent instance (if known)
     groups: set[str]
     launch_roots: dict[str, set[str]]  # instance -> root volumes recorded at/after its launch
-    observed_roots: dict[str, set[str]]  # instance -> volumes seen at its root device name
+    observed_roots: dict[str, set[str]]  # instance -> root volumes seen but not at launch
 
     @property
     def all_ids(self) -> list[str]:
@@ -75,8 +107,7 @@ class KnownIdentities:
     def instances_without_root_disk(self) -> list[str]:
         """Instances without launch-root evidence. A current or replacement root, an attached
         disk or any existing volume cannot stand in for the launch root; there is no
-        waiver. Plans and deletion stay blocked until launch evidence is recovered (for
-        example by restoring the deployment's Terraform state)."""
+        waiver. Plans and deletion stay blocked until launch evidence is recorded."""
         return sorted(i for i in self.instances if not self.launch_roots.get(i))
 
 
@@ -89,25 +120,12 @@ class IdentityLedger:
             raise ValueError("invalid deployment id")
         return self._root / deployment_id / EVIDENCE_FILE
 
-    def _ensure_directory(self, directory: Path) -> None:
-        """Create missing directories and fsync each new entry's parent (fsync(2): syncing
-        a file does not make its directory entry durable)."""
-        missing = []
-        current = directory
-        while not current.exists():
-            missing.append(current)
-            current = current.parent
-        for path in reversed(missing):
-            with contextlib.suppress(FileExistsError):
-                path.mkdir(mode=0o700)
-            _fsync_directory(path.parent)
-
     def append_evidence(self, deployment_id: str, identities: Iterable[Identity | None]) -> int:
         rows = [i for i in identities if i is not None]
         if not rows:
             return 0
         path = self._path(deployment_id)
-        self._ensure_directory(path.parent)
+        ensure_directory(path.parent)
         now = to_db_time(utcnow())
         payload = "".join(
             json.dumps({"id": i.resource_id, "parent": i.parent_id, "source": i.source, "at": now})
@@ -136,7 +154,9 @@ class IdentityLedger:
         finally:
             os.close(fd)  # also releases the lock
         if created:
-            _fsync_directory(path.parent)
+            # The new file's entry, and every directory entry above it up to the data
+            # directory, must survive a crash even if an earlier creator did not sync them.
+            fsync_chain(path.parent, self._root.parent)
         return len(rows)
 
     @staticmethod
@@ -157,20 +177,21 @@ class IdentityLedger:
                 absent.append(item)
         return absent
 
-    def import_evidence(self, conn: sqlite3.Connection, deployment_id: str) -> int:
-        imported = self._import_deployment_record(conn, deployment_id)
+    def import_evidence(self, conn: sqlite3.Connection, deployment_id: str) -> Imported:
+        """Import every valid record. Invalid records (torn writes, corruption, wrong shapes)
+        are counted, never guessed at; the caller treats any as missing evidence for this
+        deployment only."""
+        rows = self._import_deployment_record(conn, deployment_id)
+        corrupt = 0
         path = self._path(deployment_id)
         if not path.exists():
-            return imported
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                raw = json.loads(line)
-            except ValueError:
-                continue  # a torn final line from a crash; earlier lines are intact
-            item = identity(raw.get("id"), str(raw.get("source", "evidence")), raw.get("parent"))
+            return Imported(rows, corrupt)
+        for line in path.read_bytes().decode("utf-8", errors="replace").splitlines():
+            item, recorded_at = _parse_record(line)
             if item is None:
+                corrupt += 1
                 continue
-            imported += conn.execute(
+            rows += conn.execute(
                 "INSERT OR IGNORE INTO deployment_resources (deployment_id, resource_type, "
                 "resource_id, parent_id, source, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -179,10 +200,10 @@ class IdentityLedger:
                     item.resource_id,
                     item.parent_id,
                     item.source,
-                    str(raw.get("at") or to_db_time(utcnow())),
+                    recorded_at,
                 ),
             ).rowcount
-        return imported
+        return Imported(rows, corrupt)
 
     @staticmethod
     def _import_deployment_record(conn: sqlite3.Connection, deployment_id: str) -> int:
@@ -229,21 +250,23 @@ class IdentityLedger:
             if r["resource_type"] == "volume":
                 # A volume can appear once without and once with its parent; keep the parent.
                 volumes[r["resource_id"]] = r["parent_id"] or volumes.get(r["resource_id"])
+        create_applies = conn.execute(
+            "SELECT COUNT(*) FROM jobs JOIN plans ON plans.id = jobs.plan_id "
+            "WHERE jobs.deployment_id = ? AND jobs.kind = 'apply' AND jobs.status = 'succeeded' "
+            "AND plans.kind = 'create'",
+            (deployment_id,),
+        ).fetchone()[0]
+        legacy_trusted = create_applies <= 1
         launch_roots: dict[str, set[str]] = {}
         observed_roots: dict[str, set[str]] = {}
         for r in rows:
             if r["resource_type"] != "volume" or not r["parent_id"]:
                 continue
-            if r["source"] in LAUNCH_ROOT_SOURCES:
+            launch = r["source"] in LAUNCH_ROOT_SOURCES or (
+                legacy_trusted and r["source"] in LEGACY_ROOT_SOURCES
+            )
+            if launch:
                 launch_roots.setdefault(r["parent_id"], set()).add(r["resource_id"])
-            elif r["source"] == ROOT_DEVICE:
+            elif r["source"] not in NON_ROOT_SOURCES:
                 observed_roots.setdefault(r["parent_id"], set()).add(r["resource_id"])
         return KnownIdentities(instances, volumes, groups, launch_roots, observed_roots)
-
-
-def _fsync_directory(directory: Path) -> None:
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)

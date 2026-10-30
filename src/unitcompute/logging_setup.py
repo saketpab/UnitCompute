@@ -21,8 +21,11 @@ _CREDENTIAL_FIELD_NAMES = (
     r"(?:aws_secret_access_key|secret_access_key|aws_session_token|session_token|password|"
     r"passwd|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key)"
 )
+# Quoted values honour backslash escapes (JSON/shell), so an escaped quote does not end the
+# value; an unterminated quoted value is redacted to the end of the line.
 _ASSIGNMENT = re.compile(
-    rf"(?i)(\b{_CREDENTIAL_FIELD_NAMES}[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)"
+    rf"(?i)(\b{_CREDENTIAL_FIELD_NAMES}[\"']?\s*[=:]\s*)"
+    r"(\"(?:\\.|[^\"\\\n])*(?:\"|(?=\n)|$)|'(?:\\.|[^'\\\n])*(?:'|(?=\n)|$)|[^\s\"',;]+)"
 )
 _PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b"),
@@ -40,7 +43,8 @@ REDACTED = "[REDACTED]"
 def _redact_assignment(match: re.Match[str]) -> str:
     value = match.group(2)
     quote = value[0] if value[0] in "\"'" else ""
-    return f"{match.group(1)}{quote}{REDACTED}{quote}"
+    closed = bool(quote) and len(value) > 1 and value.endswith(quote)
+    return f"{match.group(1)}{quote}{REDACTED}{quote if closed else ''}"
 
 
 def redact(text: str, secrets: Iterable[str] = ()) -> str:

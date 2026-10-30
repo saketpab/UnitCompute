@@ -29,9 +29,12 @@ from typing import Any
 
 from unitcompute.config import ProvisionerKind, Settings, load_settings
 from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
+from unitcompute.durable import ensure_directory
 from unitcompute.errors import ServiceUnavailable
 from unitcompute.identities import (
     ATTACHED_DEVICE,
+    LAUNCH_OUTPUT,
+    LAUNCH_STATE,
     ROOT_DEVICE,
     Identity,
     IdentityLedger,
@@ -56,6 +59,7 @@ from unitcompute.provisioning.policy import (
     prior_resource_identities,
     prior_resource_ids,
 )
+from unitcompute.provisioning.state_evidence import from_raw_state, from_show_json
 from unitcompute.services.deployments import (
     Clock,
     binding_problem,
@@ -75,11 +79,29 @@ _ID = re.compile(r"^(dep|plan)_[0-9a-f]{32}$")
 
 def _missing_root_message(instances: list[str]) -> str:
     return (
-        "The root disk of " + ", ".join(instances) + " has never been identified (it cannot be "
-        "discovered once detached or terminated) and may still exist. An operator must find "
-        "it and record it with `unitcompute-admin record-root-volume`; it is then verified "
-        "like every other resource."
+        "The launch root disk of " + ", ".join(instances) + " was never recorded from the "
+        "apply that launched it and may still exist. Refreshed state and current mappings "
+        "cannot prove it, so repair and deletion stay blocked; this needs a support decision "
+        "(see the operations guide)."
     )
+
+
+def _plan_changes(plan: sqlite3.Row) -> list[dict[str, Any]]:
+    preview = json.loads(plan["preview_json"] or "{}")
+    changes = preview.get("changes", []) if isinstance(preview, dict) else []
+    return [c for c in changes if isinstance(c, dict)]
+
+
+def plan_launches_instance(plan: sqlite3.Row) -> bool:
+    """True when this plan itself creates the VM, so its outputs/state name the launch root."""
+    return any(
+        c.get("address") == "aws_instance.vm" and c.get("action") == "create"
+        for c in _plan_changes(plan)
+    )
+
+
+def plan_creates_resources(plan: sqlite3.Row) -> bool:
+    return any(c.get("action") == "create" for c in _plan_changes(plan))
 
 
 class WorkerLockHeld(RuntimeError):
@@ -210,51 +232,44 @@ class Worker:
         context.__exit__(None, None, None)
 
     def recover_interrupted(self) -> list[str]:
-        """Call only while holding the worker lock: any 'running' job is orphaned."""
-        now = to_db_time(self.clock())
-        recovered: list[str] = []
-        with self._tx() as conn:
+        """Call only while holding the worker lock: any 'running' job is orphaned.
+
+        Each job is recovered on its own; a problem with one deployment's evidence never
+        stops recovery (or service) for the others."""
+        with self.db.read() as conn:
             rows = conn.execute(
                 "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
                 "ON plans.id = jobs.plan_id WHERE jobs.status = 'running'"
             ).fetchall()
-            for job in rows:
-                recovered.append(job["id"])
-                self.identities.import_evidence(conn, job["deployment_id"])
-                if job["kind"] == "plan":
+        recovered: list[str] = []
+        for job in rows:
+            recovered.append(job["id"])
+            try:
+                self.import_identities(job["deployment_id"])
+            except Exception:
+                log.exception(
+                    "evidence import failed during recovery",
+                    extra={"fields": {"deployment_id": job["deployment_id"]}},
+                )
+                self._open_obligation(
+                    job["deployment_id"], None, None, "evidence_file_corrupt", "uncaptured"
+                )
+            if job["kind"] == "plan":
+                with self._tx() as conn:
                     self._finish_plan_failure(
                         conn,
                         job,
                         "worker_interrupted",
                         "Planning was interrupted; request a new preview.",
                     )
-                    continue
-                reason = (
-                    "The worker stopped while applying. AWS may hold partially created "
-                    "or deleted resources; request a new preview to reconcile."
-                )
-                conn.execute(
-                    "UPDATE jobs SET status = 'recovery_required', finished_at = ?, "
-                    "error_code = 'worker_interrupted', error_message = ? WHERE id = ?",
-                    (now, reason, job["id"]),
-                )
-                conn.execute(
-                    "UPDATE plans SET status = 'apply_failed' WHERE id = ?", (job["plan_id"],)
-                )
-                conn.execute(
-                    "UPDATE deployments SET status = 'recovery_required', status_reason = ?, "
-                    "updated_at = ? WHERE id = ?",
-                    (reason, now, job["deployment_id"]),
-                )
-                record_audit(
-                    conn,
-                    actor=ACTOR,
-                    action="job.recovery_required",
-                    deployment_id=job["deployment_id"],
-                    plan_id=job["plan_id"],
-                    job_id=job["id"],
-                    detail={"reason": "worker_interrupted"},
-                )
+                continue
+            self._recovery_required(
+                job,
+                "worker_interrupted",
+                "The worker stopped while applying. AWS may hold partially created or "
+                "deleted resources; request a new preview to reconcile.",
+                state_final=False,
+            )
         return recovered
 
     def run_forever(self) -> None:
@@ -345,7 +360,9 @@ class Worker:
                     "Planning failed unexpectedly; request a new preview.",
                 )
         else:
-            self._recovery_required(job, "internal_error", "Apply processing failed unexpectedly.")
+            self._recovery_required(
+                job, "internal_error", "Apply processing failed unexpectedly.", state_final=False
+            )
 
     def _heartbeat(self, job_id: str, stop: threading.Event) -> None:
         while not stop.wait(HEARTBEAT_SECONDS):
@@ -382,12 +399,12 @@ class Worker:
     def workdir(self, deployment_id: str, plan_id: str) -> Path:
         if not (_ID.fullmatch(deployment_id) and _ID.fullmatch(plan_id)):
             raise JobFailure("invalid_identifier", "Invalid deployment or plan identifier.")
-        self.settings.workdir_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_directory(self.settings.workdir_root)
         root = self.settings.workdir_root.resolve()
         path = (root / deployment_id / plan_id).resolve()
         if not path.is_relative_to(root):
             raise JobFailure("invalid_identifier", "Invalid work directory.")
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_directory(path.parent)
         return path
 
     def _finish_plan_failure(
@@ -444,6 +461,15 @@ class Worker:
             if plan["status"] != "pending" or deployment["current_plan_id"] != plan["id"]:
                 raise JobFailure("plan_superseded", "A newer plan replaced this one.")
             spec = self._spec(deployment)
+            self._retry_uncaptured(deployment["id"])
+            if self._uncaptured_obligations(deployment["id"]):
+                raise JobFailure(
+                    "recovery_evidence_missing",
+                    "An earlier apply may have changed AWS, and what it created could not be "
+                    "read from its stored or errored state (or the evidence file is "
+                    "corrupt). Plans and verified deletion stay blocked; this needs a "
+                    "support decision.",
+                )
             frozen_ami = deployment["ami_id"] if deployment["apply_attempted"] else None
             result = self.provisioner.plan(
                 spec, kind, self.workdir(spec.deployment_id, plan["id"]), frozen_ami
@@ -563,8 +589,10 @@ class Worker:
         if not self.identities.append_evidence(deployment_id, identities):
             return
         with self._tx() as conn:
-            self.identities.import_evidence(conn, deployment_id)
+            imported = self.identities.import_evidence(conn, deployment_id)
             absent = self.identities.missing(conn, deployment_id, identities)
+        if imported.corrupt:
+            self._open_obligation(deployment_id, None, None, "evidence_file_corrupt", "uncaptured")
         if absent:
             # Never report evidence as recorded unless the exact rows are present.
             raise RuntimeError(
@@ -574,8 +602,11 @@ class Worker:
 
     def import_identities(self, deployment_id: str) -> KnownIdentities:
         with self._tx() as conn:
-            self.identities.import_evidence(conn, deployment_id)
-            return self.identities.known(conn, deployment_id)
+            imported = self.identities.import_evidence(conn, deployment_id)
+            known = self.identities.known(conn, deployment_id)
+        if imported.corrupt:
+            self._open_obligation(deployment_id, None, None, "evidence_file_corrupt", "uncaptured")
+        return known
 
     def _discover_volumes(self, deployment_id: str, instance_ids: list[str]) -> None:
         if not instance_ids:
@@ -698,17 +729,23 @@ class Worker:
                 detail={"kind": plan["kind"], "plan_hash": plan["plan_hash"]},
             )
 
+        applied = False
         try:
             outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)
-            # Persist returned identities before anything else can fail.
+            applied = True
+            # Persist returned identities before anything else can fail. The root output is
+            # launch evidence only if this apply created the instance.
             instance_output = outcome.outputs.get("instance_id")
+            launched = plan_launches_instance(plan)
             self.record_identities(
                 spec.deployment_id,
                 [
-                    identity(instance_output, "apply_output"),
-                    identity(outcome.outputs.get("security_group_id"), "apply_output"),
+                    identity(instance_output, "apply_output_seen"),
+                    identity(outcome.outputs.get("security_group_id"), "apply_output_seen"),
                     identity(
-                        outcome.outputs.get("root_volume_id"), "apply_output", instance_output
+                        outcome.outputs.get("root_volume_id"),
+                        LAUNCH_OUTPUT if launched else "apply_output_seen",
+                        instance_output,
                     ),
                 ],
             )
@@ -718,11 +755,20 @@ class Worker:
                 [identity(r.resource_id, "tag_inventory") for r in inventory],
             )
         except ProvisioningError as exc:
-            self._recovery_required(job, exc.code, exc.safe_message)
+            # A non-zero Terraform exit means Terraform finished and persisted (or wrote
+            # errored.tfstate); a timeout kill or a failure to start does not.
+            self._recovery_required(
+                job,
+                exc.code,
+                exc.safe_message,
+                state_final=applied or exc.code == "terraform_apply_failed",
+            )
             return
         except Exception:
             log.exception("unexpected apply failure", extra={"fields": {"job_id": job["id"]}})
-            self._recovery_required(job, "internal_error", "Apply failed unexpectedly.")
+            self._recovery_required(
+                job, "internal_error", "Apply failed unexpectedly.", state_final=applied
+            )
             return
 
         now = to_db_time(self.clock())
@@ -747,12 +793,14 @@ class Worker:
             with self._tx() as conn:
                 conn.execute(
                     "UPDATE deployments SET status = 'active', status_reason = NULL, "
-                    "instance_id = ?, security_group_id = ?, root_volume_id = ?, "
+                    "instance_id = ?, security_group_id = ?, "
+                    "root_volume_id = CASE WHEN ? THEN ? ELSE root_volume_id END, "
                     "connection_ready = 0, ec2_status = NULL, ssm_ping_status = NULL, "
                     "readiness_checked_at = NULL, updated_at = ? WHERE id = ?",
                     (
                         instance_id,
                         outcome.outputs.get("security_group_id"),
+                        int(plan_launches_instance(plan)),
                         outcome.outputs.get("root_volume_id"),
                         now,
                         deployment["id"],
@@ -773,6 +821,14 @@ class Worker:
                 job,
                 "resources_remaining",
                 "Delete ran but owned resources still exist: " + ", ".join(remaining),
+            )
+            return
+        if self._uncaptured_obligations(deployment["id"]):
+            self._recovery_required(
+                job,
+                "recovery_evidence_missing",
+                "An earlier failed apply's evidence was never captured; deletion cannot be "
+                "verified.",
             )
             return
         with self._tx() as conn:
@@ -823,6 +879,14 @@ class Worker:
     ) -> None:
         now = to_db_time(self.clock())
         conn.execute("UPDATE plans SET status = 'applied' WHERE id = ?", (plan["id"],))
+        # A verified apply discharges obligations whose evidence was captured (and so was
+        # reconciled by this plan). Uncaptured ones can never be discharged this way.
+        conn.execute(
+            "UPDATE recovery_obligations SET discharged_at = ?, discharged_by_job_id = ? "
+            "WHERE deployment_id = ? AND discharged_at IS NULL "
+            "AND evidence IN ('captured', 'not_needed')",
+            (now, job["id"], job["deployment_id"]),
+        )
         conn.execute(
             "UPDATE jobs SET status = 'succeeded', finished_at = ?, result_json = ? WHERE id = ?",
             (now, json.dumps(result), job["id"]),
@@ -836,7 +900,124 @@ class Worker:
             job_id=job["id"],
         )
 
-    def _recovery_required(self, job: sqlite3.Row, code: str, message: str) -> None:
+    def _capture_apply_evidence(self, job: sqlite3.Row, *, state_final: bool) -> str:
+        """Read what this apply stored and record it. Returns the obligation's evidence state.
+
+        errored.tfstate (Terraform's final state when the backend write failed) is preferred.
+        Otherwise the stored state is read without refreshing, but only when Terraform is
+        known to have finished (``state_final``) and this is the latest apply; after a crash,
+        kill or timeout the stored state may be incomplete. Anything unreadable, ambiguous or
+        unavailable fails closed ('uncaptured') if the plan could create resources."""
+        deployment, plan = self._load(job)
+        spec = self._spec(deployment)
+        creates = plan_creates_resources(plan)
+        workdir = self.settings.workdir_root / deployment["id"] / plan["id"]
+        errored = workdir / "errored.tfstate"
+        try:
+            if errored.is_file():
+                applied = from_raw_state(json.loads(errored.read_bytes()))
+                source = "errored_state"
+            elif state_final and self._is_latest_apply(job) and workdir.is_dir():
+                applied = from_show_json(self.provisioner.capture_stored_state(spec, workdir))
+                source = "stored_state"
+            else:
+                return "uncaptured" if creates else "not_needed"
+        except (ValueError, OSError, ProvisioningError):
+            log.warning(
+                "could not capture failed apply evidence",
+                exc_info=True,
+                extra={"fields": {"job_id": job["id"]}},
+            )
+            return "uncaptured" if creates else "not_needed"
+        launched = plan_launches_instance(plan)
+        self.record_identities(
+            deployment["id"],
+            [
+                identity(applied.instance_id, source),
+                identity(applied.security_group_id, source),
+                identity(
+                    applied.root_volume_id,
+                    LAUNCH_STATE if launched else f"{source}_seen",
+                    applied.instance_id,
+                ),
+            ],
+        )
+        return "captured"
+
+    def _is_latest_apply(self, job: sqlite3.Row) -> bool:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT id FROM jobs WHERE deployment_id = ? AND kind = 'apply' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (job["deployment_id"],),
+            ).fetchone()
+        return row is not None and row["id"] == job["id"]
+
+    def _open_obligation(
+        self,
+        deployment_id: str,
+        job_id: str | None,
+        plan_id: str | None,
+        reason: str,
+        evidence: str,
+    ) -> None:
+        with self._tx() as conn:
+            if (
+                job_id is None
+                and conn.execute(
+                    "SELECT 1 FROM recovery_obligations WHERE deployment_id = ? AND reason = ? "
+                    "AND discharged_at IS NULL",
+                    (deployment_id, reason),
+                ).fetchone()
+            ):
+                return
+            conn.execute(
+                "INSERT INTO recovery_obligations (deployment_id, job_id, plan_id, reason, "
+                "evidence, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (deployment_id, job_id, plan_id, reason, evidence, to_db_time(self.clock())),
+            )
+
+    def _uncaptured_obligations(self, deployment_id: str) -> list[sqlite3.Row]:
+        with self.db.read() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM recovery_obligations WHERE deployment_id = ? "
+                    "AND discharged_at IS NULL AND evidence = 'uncaptured' ORDER BY id",
+                    (deployment_id,),
+                ).fetchall()
+            )
+
+    def _retry_uncaptured(self, deployment_id: str) -> None:
+        """Try again to capture evidence for open obligations (e.g. migrated ones)."""
+        for obligation in self._uncaptured_obligations(deployment_id):
+            if not obligation["job_id"]:
+                continue  # e.g. a corrupt evidence file: nothing to capture from
+            with self.db.read() as conn:
+                job = conn.execute(
+                    "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
+                    "ON plans.id = jobs.plan_id WHERE jobs.id = ?",
+                    (obligation["job_id"],),
+                ).fetchone()
+            if job is None or self._capture_apply_evidence(job, state_final=False) != "captured":
+                continue
+            with self._tx() as conn:
+                conn.execute(
+                    "UPDATE recovery_obligations SET evidence = 'captured' WHERE id = ?",
+                    (obligation["id"],),
+                )
+
+    def _recovery_required(
+        self, job: sqlite3.Row, code: str, message: str, *, state_final: bool = True
+    ) -> None:
+        """``state_final``: Terraform ran to completion (or apply had already returned), so its
+        stored state is the apply's final state. False after a crash, kill or timeout, or
+        when it is unknown whether Terraform finished; then only errored.tfstate counts."""
+        try:
+            evidence = self._capture_apply_evidence(job, state_final=state_final)
+        except Exception:
+            log.exception("evidence capture crashed", extra={"fields": {"job_id": job["id"]}})
+            evidence = "uncaptured"
+        self._open_obligation(job["deployment_id"], job["id"], job["plan_id"], code, evidence)
         message = redact(message)[:2000]
         now = to_db_time(self.clock())
         reason = (
@@ -937,16 +1118,14 @@ class Worker:
         with self.db.read() as conn:
             # A failed or uncertain apply's work directory can hold the only recovery state
             # (Terraform writes errored.tfstate there if the backend write fails). Keep it
-            # until a later apply for the deployment has succeeded, whatever previews were
-            # requested in between.
+            # while any obligation for that apply is open, whatever happened since.
             rows = conn.execute(
                 "SELECT plans.id, plans.deployment_id FROM plans WHERE plans.created_at < ? AND ("
                 "plans.status IN ('superseded', 'expired', 'rejected', 'failed', 'applied') "
-                "OR (plans.status = 'apply_failed' AND EXISTS ("
-                "  SELECT 1 FROM jobs later WHERE later.deployment_id = plans.deployment_id "
-                "  AND later.kind = 'apply' AND later.status = 'succeeded' AND later.rowid > ("
-                "    SELECT MAX(attempt.rowid) FROM jobs attempt WHERE attempt.plan_id = plans.id"
-                "  ))))",
+                "OR (plans.status = 'apply_failed' "
+                "  AND EXISTS (SELECT 1 FROM recovery_obligations o WHERE o.plan_id = plans.id) "
+                "  AND NOT EXISTS (SELECT 1 FROM recovery_obligations o "
+                "    WHERE o.plan_id = plans.id AND o.discharged_at IS NULL)))",
                 (cutoff,),
             ).fetchall()
         for row in rows:

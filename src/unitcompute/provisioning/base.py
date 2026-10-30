@@ -120,6 +120,11 @@ class Provisioner(Protocol):
 
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult: ...
 
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
+        """``terraform show -json`` of the stored state, read without refreshing, from a plan's
+        initialized work directory. Raises ProvisioningError if it cannot be read."""
+        ...
+
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
         """Resources currently carrying this deployment's tag."""
         ...

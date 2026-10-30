@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from unitcompute.config import Settings
+from unitcompute.durable import create_directory
 from unitcompute.provisioning.aws import (
     AwsEnvironment,
     TemporaryCredentials,
@@ -45,7 +46,7 @@ def state_key(deployment_id: str) -> str:
 def prepare_workdir(workdir: Path, tfvars: dict[str, Any], source: Path | None = None) -> None:
     """Copy the reviewed template into a fresh private directory with validated tfvars."""
     source = source or template_dir()
-    workdir.mkdir(mode=0o700, parents=True, exist_ok=False)
+    create_directory(workdir)
     for path in sorted(source.iterdir()):
         if path.is_file() and (path.suffix == ".tf" or path.name == ".terraform.lock.hcl"):
             shutil.copyfile(path, workdir / path.name)
@@ -241,6 +242,24 @@ class TerraformProvisioner:
             if isinstance(value, dict) and isinstance(value.get("value"), str)
         }
         return ApplyResult(outputs=outputs)
+
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
+        creds = self._aws.credentials(
+            "plan", f"uc-capture-{spec.deployment_id[4:20]}", spec.deployment_id
+        )
+        shown = self._run(
+            ["show", "-json", "-no-color"],
+            workdir,
+            creds,
+            300,
+            "show-state",
+            "state_capture_failed",
+        )
+        try:
+            document: dict[str, Any] = json.loads(shown.stdout)
+        except ValueError as exc:
+            raise ProvisioningError("state_capture_failed", "Stored state was unreadable.") from exc
+        return document
 
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
         creds = self._aws.credentials("plan", f"uc-inventory-{deployment_id[4:20]}")

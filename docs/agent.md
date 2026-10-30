@@ -25,7 +25,9 @@ rejected.
 
 - User messages, chat history, deployment names, tool output and model output are all
   untrusted. The `proposal` comes only from a successful server-side validation, never
-  from model text. Model replies are length-capped and redacted.
+  from model text. Model replies are length-capped and redacted. Redaction is applied to
+  user input, stored history, model output and replayed history, and covers quoted
+  credential values with escaped quotes or a missing closing quote.
 - Approval requires `POST /deployments/{id}/approve` with the exact plan ID and hash. The
   model claiming "approved", or the user typing "yes", does nothing.
 - Each request is admitted atomically before the provider is called: the daily per-user

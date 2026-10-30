@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from unitcompute.durable import create_directory
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     ApplyResult,
@@ -176,7 +177,7 @@ class SimulatedProvisioner:
         self, spec: DeploymentSpec, kind: PlanKind, workdir: Path, frozen_ami_id: str | None
     ) -> PlanResult:
         ami_id = frozen_ami_id or SIMULATED_AMI
-        workdir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        create_directory(workdir)
         current = self._load(spec.deployment_id)
         desired = self._desired(spec, ami_id)
         changes: list[dict[str, Any]] = []
@@ -296,6 +297,28 @@ class SimulatedProvisioner:
                 "root_volume_id": instance["root_block_device"][0]["volume_id"],
             }
         )
+
+    def capture_stored_state(self, spec: DeploymentSpec, workdir: Path) -> dict[str, Any]:
+        state = self._load(spec.deployment_id)
+        if not state:
+            return {"format_version": "1.0"}
+        return {
+            "format_version": "1.0",
+            "values": {
+                "root_module": {
+                    "resources": [
+                        {
+                            "address": a,
+                            "mode": "managed",
+                            "type": a.split(".")[0],
+                            "name": "vm",
+                            "values": v,
+                        }
+                        for a, v in state.items()
+                    ]
+                }
+            },
+        }
 
     def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
         state = self._load(deployment_id)

@@ -404,30 +404,12 @@ MUTATIONS = [
         ("tests/test_review_round2.py::test_r2_1_known_live_vm_blocks_second_vm",),
     ),
     Mutation(
-        "r2-1-append-only",
-        (
-            (
-                "db/migrations/0003_resource_identity_ledger.sql",
-                "CREATE TRIGGER deployment_resources_no_delete BEFORE DELETE ON "
-                "deployment_resources BEGIN SELECT RAISE(ABORT, "
-                "'deployment_resources is append-only'); END;\n",
-                "",
-            ),
-        ),
-        ("tests/test_review_round2.py::test_r2_1_identity_rows_are_append_only",),
-    ),
-    Mutation(
-        "r2-2-persist-outputs",
-        (("worker.py", 'identity(instance_output, "apply_output"),', "None,"),),
-        ("tests/test_review_round2.py::test_r2_2_apply_outputs_persist_when_inventory_fails",),
-    ),
-    Mutation(
         "r2-2-import-on-recovery",
         (
             (
                 "worker.py",
-                '                self.identities.import_evidence(conn, job["deployment_id"])\n',
-                "",
+                '                self.import_identities(job["deployment_id"])\n',
+                "                pass\n",
             ),
         ),
         ("tests/test_review_round2.py::test_r2_2_evidence_file_survives_database_contention",),
@@ -479,26 +461,12 @@ MUTATIONS = [
         ("tests/test_review_round3.py::test_r3_1_policy_requires_launch_time_volume_tags",),
     ),
     Mutation(
-        "r3-1-template-tag-on-create",
-        (
-            (
-                "provisioning/templates/ec2_vm_v1/main.tf",
-                '  volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })\n',
-                "",
-            ),
-        ),
-        (
-            "tests/test_review_round3.py::test_r3_1_template_uses_volume_tags_not_root_block_tags",
-            "tests/test_review_round3.py::test_r3_1_pinned_provider_tags_root_volume_in_run_instances",
-        ),
-    ),
-    Mutation(
         "r3-2-root-sources-only",
         (
             (
                 "identities.py",
-                'if r["source"] in LAUNCH_ROOT_SOURCES:',
-                "if True:",
+                'launch = r["source"] in LAUNCH_ROOT_SOURCES or (',
+                "launch = True or (",
             ),
         ),
         ("tests/test_review_round3.py::test_r3_2_attached_data_disk_is_not_root_evidence",),
@@ -551,24 +519,12 @@ MUTATIONS = [
         ("tests/test_review_round3.py::test_r3_7_credentials_removed_before_provider_and_history",),
     ),
     Mutation(
-        "r3-7-redact-history",
-        (
-            (
-                "agent/service.py",
-                'HumanMessage(content=redact(r["content"]))',
-                'HumanMessage(content=r["content"])',
-            ),
-        ),
-        ("tests/test_review_round3.py::test_r3_7_legacy_history_is_redacted_before_the_provider",),
-    ),
-    Mutation(
         "r4-observation-not-launch-root",
         (
             (
                 "identities.py",
-                '{"apply_output", "terraform_state", "deployment_record", "migration"}',
-                '{"apply_output", "terraform_state", "deployment_record", "migration", '
-                '"root_device"}',
+                "LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE})",
+                'LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE, "root_device"})',
             ),
         ),
         (
@@ -605,55 +561,293 @@ MUTATIONS = [
         ("tests/test_review_round4.py::test_r4_4_recording_fails_loudly_if_evidence_is_absent",),
     ),
     Mutation(
+        "r4-quoted-assignment",
+        (
+            (
+                "logging_setup.py",
+                'r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
+                'r"([^\\s\\"\',;]+)"',
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_3_redaction_preserves_quotes_and_bounds",),
+    ),
+    Mutation(
+        "r4-new-ancestor-fsync",
+        (
+            (
+                "durable.py",
+                "            continue  # created concurrently; its creator syncs the parent\n        fsync_directory(path.parent)\n",
+                "            continue  # created concurrently; its creator syncs the parent\n",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
+    ),
+    Mutation(
+        "r5-refreshed-state-not-launch",
+        (
+            (
+                "identities.py",
+                "LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE})",
+                'LAUNCH_ROOT_SOURCES = frozenset({LAUNCH_OUTPUT, LAUNCH_STATE, "terraform_state"})',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_1_refreshed_state_with_replacement_does_not_complete_identity",
+        ),
+    ),
+    Mutation(
+        "r5-repair-output-not-launch",
+        (
+            (
+                "worker.py",
+                'LAUNCH_OUTPUT if launched else "apply_output_seen",',
+                "LAUNCH_OUTPUT,",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_1_repair_outputs_of_existing_instance_are_not_launch_evidence",
+        ),
+    ),
+    Mutation(
+        "r5-row-root-kept-on-repair",
+        (
+            (
+                "worker.py",
+                "int(plan_launches_instance(plan)),",
+                "1,",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_1_repair_outputs_of_existing_instance_are_not_launch_evidence",
+        ),
+    ),
+    Mutation(
+        "r5-legacy-single-create",
+        (
+            (
+                "identities.py",
+                "legacy_trusted = create_applies <= 1",
+                "legacy_trusted = True",
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_1_legacy_root_ids_need_single_create_history",),
+    ),
+    Mutation(
+        "r5-capture-on-failure",
+        (
+            (
+                "worker.py",
+                "evidence = self._capture_apply_evidence(job, state_final=state_final)",
+                'evidence = "captured"',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "r5-errored-state-capture",
+        (
+            (
+                "worker.py",
+                "            if errored.is_file():",
+                "            if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_errored_state_is_captured_and_blocks_false_deletion",
+        ),
+    ),
+    Mutation(
+        "r5-stored-state-only-when-final",
+        (
+            (
+                "worker.py",
+                "elif state_final and self._is_latest_apply(job) and workdir.is_dir():",
+                "elif self._is_latest_apply(job) and workdir.is_dir():",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_crash_mid_apply_without_errored_state_fails_closed",
+            "tests/test_review_round5.py::test_r5_2_later_retry_never_trusts_stored_state",
+        ),
+    ),
+    Mutation(
+        "r5-plan-gate",
+        (
+            (
+                "worker.py",
+                '            if self._uncaptured_obligations(deployment["id"]):\n                raise JobFailure(',
+                "            if False:\n                raise JobFailure(",
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "r5-obligations-forward-only",
+        (
+            (
+                "db/migrations/0005_recovery_obligations.sql",
+                "BEFORE UPDATE ON recovery_obligations WHEN NOT (",
+                "BEFORE UPDATE ON recovery_obligations WHEN 0 AND NOT (",
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_2_obligation_rows_only_move_forward",),
+    ),
+    Mutation(
+        "r5-retain-open-obligations",
+        (
+            (
+                "worker.py",
+                '"  AND NOT EXISTS (SELECT 1 FROM recovery_obligations o "',
+                '"  AND EXISTS (SELECT 1 FROM recovery_obligations o "',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
+        ),
+    ),
+    Mutation(
+        "r5-corruption-isolation",
+        (
+            (
+                "identities.py",
+                '    if not isinstance(raw, dict):\n        return None, ""\n',
+                "",
+            ),
+            (
+                "worker.py",
+                '                self.import_identities(job["deployment_id"])\n            except Exception:',
+                '                self.import_identities(job["deployment_id"])\n            except ZeroDivisionError:',
+            ),
+        ),
+        (
+            "tests/test_review_round5.py::test_r5_3_malformed_evidence_does_not_stop_worker_recovery",
+        ),
+    ),
+    Mutation(
+        "r5-corrupt-obligation",
+        (
+            (
+                "worker.py",
+                "            known = self.identities.known(conn, deployment_id)\n        if imported.corrupt:",
+                "            known = self.identities.known(conn, deployment_id)\n        if False:",
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_3_torn_record_marks_only_that_deployment",),
+    ),
+    Mutation(
+        "r5-worker-dirs-durable",
+        (
+            (
+                "worker.py",
+                "        ensure_directory(path.parent)",
+                "        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)",
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_4_plan_workdirs_are_created_durably",),
+    ),
+    Mutation(
+        "r5-evidence-chain-fsync",
+        (
+            (
+                "identities.py",
+                "            fsync_chain(path.parent, self._root.parent)",
+                "            pass",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
+    ),
+    Mutation(
+        "r5-escaped-delimiters",
+        (
+            (
+                "logging_setup.py",
+                'r"(\\"(?:\\\\.|[^\\"\\\\\\n])*(?:\\"|(?=\\n)|$)|\'(?:\\\\.|[^\'\\\\\\n])*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
+                'r"(\\"[^\\"\\n]*(?:\\"|(?=\\n)|$)|\'[^\'\\n]*(?:\'|(?=\\n)|$)|[^\\s\\"\',;]+)"',
+            ),
+        ),
+        ("tests/test_review_round5.py::test_r5_5_escaped_quotes_do_not_leak_at_any_boundary",),
+    ),
+    Mutation(
+        "r2-1-append-only",
+        (
+            (
+                "db/migrations/0003_resource_identity_ledger.sql",
+                "CREATE TRIGGER deployment_resources_no_delete BEFORE DELETE ON "
+                "deployment_resources BEGIN SELECT RAISE(ABORT, "
+                "'deployment_resources is append-only'); END;\n",
+                "",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_1_identity_rows_are_append_only",),
+    ),
+    Mutation(
+        "r3-1-template-tag-on-create",
+        (
+            (
+                "provisioning/templates/ec2_vm_v1/main.tf",
+                '  volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })\n',
+                "",
+            ),
+        ),
+        (
+            "tests/test_review_round3.py::test_r3_1_template_uses_volume_tags_not_root_block_tags",
+            "tests/test_review_round3.py::test_r3_1_pinned_provider_tags_root_volume_in_run_instances",
+        ),
+    ),
+    Mutation(
+        "r3-7-redact-history",
+        (
+            (
+                "agent/service.py",
+                'HumanMessage(content=redact(r["content"]))',
+                'HumanMessage(content=r["content"])',
+            ),
+        ),
+        ("tests/test_review_round3.py::test_r3_7_legacy_history_is_redacted_before_the_provider",),
+    ),
+    Mutation(
         "r4-append-lock",
         (("identities.py", "            fcntl.flock(fd, fcntl.LOCK_EX)\n", ""),),
         ("tests/test_review_round4.py::test_r4_5_concurrent_short_appends_keep_every_record",),
+    ),
+    Mutation(
+        "r2-2-persist-outputs",
+        (
+            (
+                "worker.py",
+                'identity(instance_output, "apply_output_seen"),',
+                "None,",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_2_apply_outputs_persist_when_inventory_fails",),
     ),
     Mutation(
         "r4-new-file-dir-fsync",
         (
             (
                 "identities.py",
-                "        if created:\n            _fsync_directory(path.parent)",
-                "        if False:\n            _fsync_directory(path.parent)",
+                "        if created:\n",
+                "        if False:\n",
             ),
         ),
         ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
     ),
     Mutation(
-        "r4-new-ancestor-fsync",
+        "r5-report-obligations",
         (
             (
-                "identities.py",
-                "                path.mkdir(mode=0o700)\n            _fsync_directory(path.parent)",
-                "                path.mkdir(mode=0o700)",
-            ),
-        ),
-        ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
-    ),
-    Mutation(
-        "r4-retain-unresolved-apply",
-        (
-            (
-                "worker.py",
-                "\"OR (plans.status = 'apply_failed' AND EXISTS (\"",
-                "\"OR (plans.status = 'apply_failed' AND NOT EXISTS (\"",
+                "admin.py",
+                "WHERE deployment_id = ? AND discharged_at IS NULL ORDER BY id",
+                "WHERE deployment_id = ? AND 0 ORDER BY id",
             ),
         ),
         (
-            "tests/test_review_round4.py::test_r4_7_failed_apply_workdir_kept_until_a_later_apply_succeeds",
+            "tests/test_review_round5.py::test_r5_2_uncaptured_failed_apply_blocks_everything_and_is_never_discharged",
         ),
-    ),
-    Mutation(
-        "r4-quoted-assignment",
-        (
-            (
-                "logging_setup.py",
-                "(\\\"[^\\\"\\n]*\\\"|'[^'\\n]*'|[^\\s\\\"',;]+)",
-                "([^\\s\\\"',;]+)",
-            ),
-        ),
-        ("tests/test_review_round4.py::test_r4_3_redaction_preserves_quotes_and_bounds",),
     ),
     Mutation(
         "policy-imdsv2",

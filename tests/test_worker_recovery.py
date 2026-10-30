@@ -73,6 +73,12 @@ def test_partial_apply_requires_recovery_then_reconciles(
     assert h.client.post(f"/deployments/{d['id']}/plan", headers=auth()).status_code == 202
     h.drain()
     repaired = detail(h, d["id"])
+    if isinstance(error, ProvisioningTimeout):
+        # Terraform was killed: stored state is not final and no errored.tfstate exists,
+        # so what the apply created is unknown. Fail closed (round 5).
+        assert repaired["status"] == "recovery_required"
+        assert repaired["current_plan"]["error"]["code"] == "recovery_evidence_missing"
+        return
     assert repaired["status"] == "awaiting_approval"
     assert [c["address"] for c in repaired["current_plan"]["resource_changes"]] == [
         "aws_instance.vm"

@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         entry = dict(row)
         with db.read() as conn:
             known = IdentityLedger.known(conn, row["id"])
+            obligations = conn.execute(
+                "SELECT job_id, plan_id, reason, evidence, created_at FROM recovery_obligations "
+                "WHERE deployment_id = ? AND discharged_at IS NULL ORDER BY id",
+                (row["id"],),
+            ).fetchall()
+        entry["open_recovery_obligations"] = [dict(o) for o in obligations]
         entry["known_identities"] = known.all_ids
         entry["instances_without_root_disk"] = known.instances_without_root_disk()
         entry["observed_root_volumes"] = {k: sorted(v) for k, v in known.observed_roots.items()}

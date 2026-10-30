@@ -699,7 +699,7 @@ def _schema_v1_deployment(
             "?, ?)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4]
+    assert db.migrate() == [2, 3, 4, 5]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
@@ -732,7 +732,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4]
+    assert db.migrate() == [3, 4, 5]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}
@@ -763,11 +763,11 @@ def _restore_terraform_state(h: Any, dep: str, instance_id: str, volume_id: str)
     provisioner._state_path(dep).write_text(json.dumps(state))
 
 
-def test_r2_3_unknown_root_disk_blocks_until_launch_evidence_recovered(
+def test_r2_3_unknown_root_disk_stays_blocked_when_only_refreshed_state_is_restored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
-    """Rounds 3-4 tightened this: no operator claim can complete identity. Only recovered
-    launch evidence (restored Terraform state) does, and the disk must then be verified gone."""
+    """Round 5 tightened this: restored backend state is refreshed on every plan, so it is an
+    observation; it cannot prove which disk the VM was launched with."""
     ec2 = moto_env
     vm = ec2.run_instances(
         ImageId="ami-12345678",
@@ -779,36 +779,25 @@ def test_r2_3_unknown_root_disk_blocks_until_launch_evidence_recovered(
     )["Instances"][0]
     iid, vid = vm["InstanceId"], vm["BlockDeviceMappings"][0]["Ebs"]["VolumeId"]
     settings, db, dep = _schema_v1_deployment(tmp_path, monkeypatch, iid)
-    ec2.terminate_instances(InstanceIds=[iid])  # root-disk mapping is gone after this
-    clock = FakeClock()
-    client, h = _client(settings, db, clock)
+    ec2.terminate_instances(InstanceIds=[iid])
+    client, h = _client(settings, db, FakeClock())
     with client:
+        _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
+        assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
+        _restore_terraform_state(h, dep, iid, vid)
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
         assert pending["status"] == "plan_failed"
         assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
+        with db.read() as conn:
+            known = IdentityLedger.known(conn, dep)
+        assert known.launch_roots == {}
+        assert known.observed_roots == {iid: {vid}}
         assert (
             client.post(
                 "/deployments", json={"name": "next", "disk_gib": 8}, headers=auth()
             ).status_code
             == 409
         )
-
-        _restore_terraform_state(h, dep, iid, vid)
-        _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
-        assert pending["status"] == "awaiting_deletion_approval", pending
-        with db.read() as conn:
-            assert IdentityLedger.known(conn, dep).launch_roots == {iid: {vid}}
-        approve_current(h, pending)
-        Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
-        # Terraform's state is gone but AWS still has the disk: not deleted.
-        stuck = _detail(h, dep)
-        assert stuck["status"] == "recovery_required"
-        assert vid in stuck["latest_job"]["error"]["message"]
-        ec2.delete_volume(VolumeId=vid)
-        _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
-        approve_current(h, pending)
-        Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
-        assert _detail(h, dep)["status"] == "deleted"
 
 
 def test_r2_3_live_root_observation_is_recorded_but_not_launch_evidence(

@@ -204,6 +204,9 @@ def test_r4_4_later_sources_are_kept_for_the_same_volume(harness: Harness) -> No
     worker.record_identities(dep, [identity(vid, "root_device", iid)])
     worker.record_identities(dep, [identity(vid, "terraform_state", iid)])
     with harness.db.read() as conn:
+        assert IdentityLedger.known(conn, dep).launch_roots == {}  # observations only
+    worker.record_identities(dep, [identity(vid, "launch_output", iid)])
+    with harness.db.read() as conn:
         rows = {
             tuple(r)
             for r in conn.execute(
@@ -212,7 +215,12 @@ def test_r4_4_later_sources_are_kept_for_the_same_volume(harness: Harness) -> No
             )
         }
         known = IdentityLedger.known(conn, dep)
-    assert {(vid, "instance_block_devices"), (vid, "root_device"), (vid, "terraform_state")} <= rows
+    assert {
+        (vid, "instance_block_devices"),
+        (vid, "root_device"),
+        (vid, "terraform_state"),
+        (vid, "launch_output"),
+    } <= rows
     assert known.launch_roots == {iid: {vid}}
     assert known.instances_without_root_disk() == []
 
@@ -245,13 +253,13 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
         [
             identity(iid, "tag_inventory"),
             identity(vid, "attached_device", iid),
-            identity(vid, "terraform_state", iid),
+            identity(vid, "apply_output", iid),
         ],
     )
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {}  # shadowed under schema 3
-    assert db.migrate() == [4]
+    assert db.migrate() == [4, 5]
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {iid: {vid}}
@@ -267,7 +275,9 @@ def test_r4_4_recording_fails_loudly_if_evidence_is_absent(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     d = create_and_plan(harness)
-    monkeypatch.setattr(IdentityLedger, "import_evidence", lambda self, conn, dep: 0)
+    from unitcompute.identities import Imported
+
+    monkeypatch.setattr(IdentityLedger, "import_evidence", lambda self, conn, dep: Imported(0, 0))
     with pytest.raises(RuntimeError, match="not present after import"):
         harness.worker().record_identities(
             d["id"], [identity("i-0aaaaaaaaaaaaaaa1", "apply_output")]
@@ -368,9 +378,11 @@ def test_r4_6_new_evidence_file_and_directories_are_fsynced(
         new_dirs += 1
         path = path.parent
     IdentityLedger(root).append_evidence(dep, [identity("i-0123456789abcdef0", "apply_output")])
-    # the parent of every newly created directory, then the file, then its directory
+    # the parent of every newly created directory, then the file, then every directory
+    # from the file's up to the data directory (root.parent here)
+    chain = len((root / dep).relative_to(root.parent).parts) + 1  # stop dir included
     assert new_dirs >= 2
-    assert synced == ["dir"] * new_dirs + ["file", "dir"]
+    assert synced == ["dir"] * new_dirs + ["file"] + ["dir"] * chain
     synced.clear()
     IdentityLedger(root).append_evidence(dep, [identity("i-0123456789abcdef1", "apply_output")])
     assert synced == ["file"]  # existing entries need no further directory sync
