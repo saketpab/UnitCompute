@@ -27,6 +27,7 @@ from unitcompute.provisioning.base import (
     ProvisioningError,
     Readiness,
     RuntimeVersions,
+    check_dispatch,
     lock_provider_versions,
     sha256_file,
     template_dir,
@@ -138,11 +139,17 @@ class TerraformProvisioner:
         timeout: float,
         log_name: str,
         error_code: str,
+        mutating: bool = False,
     ) -> RunResult:
+        env = self._env(workdir, creds)
+        if mutating:
+            # The last point at which the approved plan can still be refused: after the
+            # credential exchange and every other preparation, immediately before the spawn.
+            check_dispatch()
         result = self._runner.run(
             args,
             workdir=workdir,
-            env=self._env(workdir, creds),
+            env=env,
             timeout=timeout,
             log_name=log_name,
             secrets=creds.secrets(),
@@ -236,6 +243,7 @@ class TerraformProvisioner:
             timeout,
             "apply",
             "terraform_apply_failed",
+            mutating=True,
         )
         shown = self._run(
             ["output", "-json", "-no-color"],

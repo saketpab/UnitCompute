@@ -159,8 +159,13 @@ access to that prefix, and nothing in this repository applies them.
    hash, versions, execution binding and job state. Expiry is judged against a clock read
    after every wait that precedes the action: after the database write lock is acquired at
    approval, and in the worker after its evidence and database preparation, inside the
-   transaction that records the start and once more immediately before dispatch. Apply
-   runs exactly `terraform apply -input=false tfplan` with apply-role credentials.
+   transaction that records the start and once more immediately before dispatch. The
+   provisioner repeats it at the real boundary: the worker installs a dispatch guard, and
+   `TerraformProvisioner` calls it after the AWS credential exchange and all other
+   preparation, immediately before spawning `terraform apply`. There is no expiry
+   tolerance: a plan that is expired at that moment is never dispatched and the job fails
+   as `plan_expired` (nothing ran, so there is nothing to recover). Apply runs exactly
+   `terraform apply -input=false tfplan` with apply-role credentials.
 5. A create is marked `active` only after the instance is found by its tags and by direct
    ID lookup. Its instance, security group and root volume IDs are recorded. Connection
    readiness (both EC2 status checks plus SSM `Online` for that exact instance) is then
@@ -223,6 +228,10 @@ owner already has a newer live deployment, the one-live-VM unique index keeps th
 `deleted`; its obligation stays open, `unitcompute-admin recovery-report` lists it, and
 `POST /deployments` refuses with `409 recovery_required` (`details.deployment_id` names it)
 whenever any of the owner's deployments has an open `uncaptured` obligation.
+The same owner-wide rule covers work that already exists: a newer deployment reserved before
+the obligation was found cannot plan, be approved or apply anything that creates or repairs
+(`recovery_evidence_missing` from the worker, `409 recovery_required` from approval), while
+planning and applying its *deletion* is never blocked by another deployment's obligation.
 
 ### Recovery obligations
 

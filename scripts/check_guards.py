@@ -856,8 +856,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '            self._retry_uncaptured(deployment["id"])\n            self._require_no_uncaptured(deployment["id"])\n',
-                '            self._retry_uncaptured(deployment["id"])\n',
+                '            self._require_no_uncaptured(deployment["id"], owner)\n            frozen_ami',
+                "            frozen_ami",
             ),
         ),
         (
@@ -869,8 +869,8 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '        if self._uncaptured_obligations(deployment_id):\n            raise JobFailure(\n                "recovery_evidence_missing",',
-                '        if False:\n            raise JobFailure(\n                "recovery_evidence_missing",',
+                "        blocked = bool(self._uncaptured_obligations(deployment_id))",
+                "        blocked = False",
             ),
         ),
         (
@@ -894,7 +894,7 @@ MUTATIONS = [
         (
             (
                 "worker.py",
-                '        self._require_no_uncaptured(deployment["id"])\n        return plan_path',
+                '        self._require_no_uncaptured(deployment["id"], owner)\n        return plan_path',
                 "        return plan_path",
             ),
         ),
@@ -1388,8 +1388,8 @@ MUTATIONS = [
         (
             (
                 "services/deployments.py",
-                "            if unproven is not None:",
-                "            if False:",
+                "            if unproven is not None:\n                # An earlier apply's effects",
+                "            if False:\n                # An earlier apply's effects",
             ),
         ),
         (
@@ -1474,6 +1474,173 @@ MUTATIONS = [
             "tests/test_review_round7.py::test_r7_3_a_lingering_grandchild_holding_the_pipes_is_a_timeout",
         ),
         expect="DID NOT RAISE",
+    ),
+    Mutation(
+        "r8-owner-wide-plan-gate",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if kind == "create" else None',
+                "owner = None",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_queued_reservation_cannot_plan_while_an_older_create_is_unproven",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+            "tests/test_review_round8.py::test_r8_1_schema4_upgrade_with_a_preexisting_reservation",
+        ),
+    ),
+    Mutation(
+        "r8-owner-wide-apply-gate",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if plan["kind"] == "create" else None',
+                "owner = None",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_an_approved_and_queued_apply_is_refused_by_the_worker",
+        ),
+    ),
+    Mutation(
+        "r8-owner-wide-helper",
+        (
+            (
+                "worker.py",
+                "if not blocked and owner_id is not None:",
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_queued_reservation_cannot_plan_while_an_older_create_is_unproven",
+            "tests/test_review_round8.py::test_r8_1_an_approved_and_queued_apply_is_refused_by_the_worker",
+        ),
+    ),
+    Mutation(
+        "r8-cleanup-plan-not-blocked",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if kind == "create" else None',
+                'owner = deployment["owner_id"]',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+            "tests/test_review_round8.py::test_r8_1_schema4_upgrade_with_a_preexisting_reservation",
+        ),
+    ),
+    Mutation(
+        "r8-cleanup-apply-not-blocked",
+        (
+            (
+                "worker.py",
+                'owner = deployment["owner_id"] if plan["kind"] == "create" else None',
+                'owner = deployment["owner_id"]',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+        ),
+    ),
+    Mutation(
+        "r8-approval-gate",
+        (
+            (
+                "services/deployments.py",
+                'if plan["kind"] == "create":\n                # Cleanup stays approvable',
+                "if False:\n                # Cleanup stays approvable",
+            ),
+        ),
+        ("tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",),
+    ),
+    Mutation(
+        "r8-approval-gate-blocks-cleanup",
+        (
+            (
+                "services/deployments.py",
+                'if plan["kind"] == "create":\n                # Cleanup stays approvable',
+                "if True:\n                # Cleanup stays approvable",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_1_a_ready_plan_cannot_be_approved_but_cleanup_can",
+            "tests/test_review_round8.py::test_r8_1_repair_of_a_running_vm_is_blocked_but_its_deletion_is_not",
+        ),
+    ),
+    Mutation(
+        "r8-dispatch-check-at-boundary",
+        (
+            (
+                "provisioning/terraform.py",
+                "            check_dispatch()\n        result = self._runner.run(",
+                "            pass\n        result = self._runner.run(",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_the_provisioner_checks_after_the_credential_exchange",
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+        ),
+    ),
+    Mutation(
+        "r8-dispatch-check-before-credentials",
+        (
+            (
+                "provisioning/terraform.py",
+                "            check_dispatch()\n        result = self._runner.run(",
+                "            pass\n        result = self._runner.run(",
+            ),
+            (
+                "provisioning/terraform.py",
+                '        creds = self._aws.credentials(\n            "apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id\n        )',
+                '        check_dispatch()\n        creds = self._aws.credentials(\n            "apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id\n        )',
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_the_provisioner_checks_after_the_credential_exchange",
+            "tests/test_review_round8.py::test_r8_2_the_check_comes_after_preparation_and_before_the_spawn",
+        ),
+    ),
+    Mutation(
+        "r8-not-started-is-a-plain-failure",
+        (
+            (
+                "worker.py",
+                "        except NotStarted as exc:",
+                "        except KeyError as exc:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+        ),
+    ),
+    Mutation(
+        "r8-simulator-honours-guard",
+        (
+            (
+                "provisioning/simulated.py",
+                "        check_dispatch()\n        intent = json.loads",
+                "        intent = json.loads",
+            ),
+        ),
+        ("tests/test_review_round8.py::test_r8_2_the_simulator_honours_the_guard",),
+    ),
+    Mutation(
+        "r8-guard-installed-by-worker",
+        (
+            (
+                "worker.py",
+                "with dispatch_guard(lambda: self._refuse_expired_dispatch(plan)):",
+                "if True:",
+            ),
+        ),
+        (
+            "tests/test_review_round8.py::test_r8_2_worker_to_provisioner_to_runner_never_dispatches_an_expired_plan",
+            "tests/test_review_round8.py::test_r8_2_a_real_binary_is_never_spawned_for_an_expired_plan",
+        ),
     ),
     Mutation(
         "policy-imdsv2",

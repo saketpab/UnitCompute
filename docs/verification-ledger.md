@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7 on `5756293`: **not clean**. Round 8: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). `5756293`: passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)). Round-7 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7 on `5756293`: **not clean**. Round 8 on `256356c`: **not clean**. Round 9: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). `5756293`: passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)). `256356c`: passed ([run 41106001355](https://github.com/saketpab/UnitCompute/actions/runs/41106001355)). Round-8 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -535,14 +535,14 @@ indexed `None` after the guard was removed; both tests now assert cleanly),
 their subject). `worker-expiry` also survived once the early duplicate check was removed and was
 retargeted to the single helper. A first pass at the new mutants found `r7-expiry-before-dispatch`
 survived because the test's clock advanced one transaction too early; the test now advances time
-precisely after the in-transaction check. All 132 earlier mutants are retained; 11 are new.
+precisely after the in-transaction check. All 132 earlier mutants are retained and 10 are new (142).
 
 Changed test expectations: migration lists include schema 7; `_precheck_apply` no longer takes a
 clock argument (one caller in the round-1 tests); `test_worker_rejects_approval_by_someone_else`
 and `test_worker_rejects_plan_that_expired_in_queue` assert `(error or {}).get("code")` so a
 removed guard fails cleanly.
 
-## Round 7 fix commit (parent `5756293`)
+## Round 7 fix commit: `256356c75f0b56bfe81b36ec15c205694d414143` (parent `5756293`)
 
 | Check | Result |
 |---|---|
@@ -553,8 +553,56 @@ removed guard fails cleanly.
 | Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–7), and an **upgrade** of a schema-6 data dir seeded with a deleted deployment holding an open `uncaptured` obligation (`applied: [7]`): it became `recovery_required`, its owner's new reservation was refused, `recovery-report` listed it, another owner's lifecycle exited 0. In all runs `/readyz` was 503 without a worker and 200 with one, a second worker was refused and the worker stopped on SIGTERM |
 | CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
 
-Residual limits: unchanged from round 6. In addition, the final pre-dispatch expiry check
-cannot cover time that passes between that check and `terraform apply` starting; a plan that
-expires in that interval still applies, which the 15-minute window tolerates. For an owner
-with a newer live deployment, the old unproven deletion is visible to operators and blocks new
+Residual limits: unchanged from round 6. *Correction (round 8):* this row originally said the
+dispatch check could not cover time before `terraform apply` starts and that the 15-minute
+window tolerated a late dispatch. That was wrong: the check sat before the credential
+exchange (STS) in `TerraformProvisioner.apply`, so a slow exchange dispatched an expired plan
+(R8-2). There is no expiry tolerance. For an owner with a newer live deployment, the old unproven deletion is visible to operators and blocks new
 reservations but is not shown as a status of the old row.
+
+## Candidate 8: `256356c75f0b56bfe81b36ec15c205694d414143`
+
+| Check | Result |
+|---|---|
+| Safe CI on the exact commit | passed ([run 41106001355](https://github.com/saketpab/UnitCompute/actions/runs/41106001355)) |
+| Sol Medium security review | **not clean** |
+| Sol Medium reliability review | **not clean** |
+
+Two required defects; both reviewers independently confirmed the frozen HEAD, the CI run,
+472 tests and 142 valid mutant kills. Implementation: native Claude Sonnet 5.5 (high).
+
+## Round 8 findings → fixes → tests
+
+Reviewer reproductions (`test_independent_r8.py`, `test_round8_independent.py`) were run
+unchanged in isolated copies. On `256356c` the upgrade case ends `active` with a running VM
+while the older create is `uncaptured`, and the real `TerraformProvisioner.apply` spawns
+`terraform apply` 1 s (injected) and 119 s after the plan expired. On the fix tree the
+upgrade case ends `plan_failed` with no resources, the expired plan's binary is never spawned
+(the reviewer's `delay=120` case now fails because its marker file is never written, which is
+the intended outcome), and `delay=0` still dispatches.
+
+| ID | Finding | Fix | Regression tests (`tests/test_review_round8.py`) | Mutants |
+|---|---|---|---|---|
+| R8-1 (P1) | Obligations were checked per deployment, so a newer reservation made before an older create became `uncaptured` could plan, be approved and apply | One owner-wide invariant: while any of the owner's deployments (any status) has an open `uncaptured` obligation, no create or repair work proceeds. Enforced at reservation, at approval (`409 recovery_required`), when the worker plans a create/repair, and in the apply precheck, so already queued reservations, ready plans and approved jobs are all stopped. Deletion plans and applies check only the deployment's own obligations, so cleanup is never blocked by someone else's | `test_r8_1_*` (queued reservation; ready plan; approved-and-queued apply; repair of a running VM; deletion still approvable and completing in each; other owners unaffected; a real schema-4 upgrade with a legacy-style queued reservation) | `r8-owner-wide-plan-gate`, `r8-owner-wide-apply-gate`, `r8-owner-wide-helper`, `r8-cleanup-plan-not-blocked`, `r8-cleanup-apply-not-blocked`, `r8-approval-gate`, `r8-approval-gate-blocks-cleanup` |
+| R8-2 (P2) | `TerraformProvisioner.apply` exchanged credentials (STS) after the worker's last expiry check, so an expired approved plan was dispatched | The worker installs a dispatch guard (a context variable); `TerraformProvisioner._run` calls it for mutating commands after the environment and credentials are ready, immediately before `runner.run`; the simulator calls it at the start of `apply`. The guard raises `NotStarted`, which the worker records as a plain `plan_expired` failure (nothing ran, so no recovery obligation). The worker keeps its own in-transaction and post-transaction checks for provisioners that ignore the guard | `test_r8_2_*` (the boundary on its own with a 119 s exchange; ordering `credentials, check, run`; time left still applies; guard scope; simulator; worker to provisioner to runner; a real synthetic binary never spawned) | `r8-dispatch-check-at-boundary`, `r8-dispatch-check-before-credentials`, `r8-not-started-is-a-plain-failure`, `r8-simulator-honours-guard`, `r8-guard-installed-by-worker` |
+
+The second plan-time recheck (after reconciliation) stays own-deployment only: it exists for
+obligations that reconciliation itself opens, which are the deployment's own.
+
+## Round 8 fix commit (parent `256356c`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check`, `uv sync --locked` | passed |
+| `pytest` with offline Terraform tests required | 486 passed |
+| `scripts/check_guards.py --verbose` | 154/154 mutants killed for the intended reason in one full run (142 earlier, all retained, plus 12 new). All referenced test IDs collect and every mutation applies exactly once. Retargeted because the code moved: `r5-plan-gate`, `r6-gate-helper`, `r6-recheck-before-apply`, `r7-quota-unproven-obligation` (found by the static inventory audit) |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–7), client walkthrough exit 0. Upgrade of a schema-6 data dir seeded with an older unproven create and a legacy-style queued reservation for the same owner (`applied: [7]`): the reservation's plan failed `recovery_evidence_missing`, its deletion was planned, approved and completed, the next reservation was refused with `recovery_required`, `recovery-report` listed the older deployment. In all runs `/readyz` was 503 without a worker and 200 with one, a second worker was refused and the worker stopped on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+
+Residual limits: unchanged from round 7 (the corrected statement above replaces the earlier
+one about expiry). The dispatch check runs in the provisioner immediately before
+`runner.run`; the interval from that call to the operating system starting the process is
+not controllable from Python. A different `Provisioner` implementation must call
+`check_dispatch()` at its own spawn boundary; the worker's checks before it remain as the
+backstop. Live AWS behaviour, including real STS latency, remains part of the blocked live gate.
