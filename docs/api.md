@@ -53,7 +53,8 @@ remains. Recorded resources include instance, root volume and security group IDs
 Terraform state, and disks discovered on live instances. If that cannot be established, the
 deployment stays `recovery_required` (`verification_failed` or `identity_incomplete`). A
 preview is rejected if a recorded or tagged resource exists that Terraform state does not
-track.
+track. Any preview, for repair or deletion, also fails with `identity_incomplete` while a
+known VM's root disk has not been positively identified.
 
 ### Connection readiness
 
@@ -120,8 +121,9 @@ Mutating routes accept an optional `Idempotency-Key` header: 8–128 characters 
   `409 idempotency_in_progress`, and the model is never called twice for one key. If the first
   attempt failed, the key is released for a retry, but the failed attempt still counts
   toward your daily assistant limit. A reservation whose process died is released once its
-  lease (the assistant timeout plus 60 seconds) expires. A completed reply is replayed even
-  when the model provider is unavailable.
+  lease (the assistant timeout plus 60 seconds) expires. If such an expired request later
+  finishes, it publishes nothing and returns `409 attempt_superseded`. A completed reply is
+  replayed even when the model provider is unavailable.
 
 Idempotency makes retries of *requests* safe. It does not make AWS execution exactly-once.
 

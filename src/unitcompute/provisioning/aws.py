@@ -363,8 +363,11 @@ class AwsEnvironment:
 
     def instance_volumes(
         self, instance_ids: list[str], creds: TemporaryCredentials
-    ) -> dict[str, list[str]]:
-        volumes: dict[str, list[str]] = {}
+    ) -> dict[str, list[tuple[str, bool]]]:
+        """(volume ID, is_root) per instance. A volume is the root disk only when its device
+        name equals the instance's RootDeviceName; other attached disks are never treated as
+        root evidence. A detached root (or a terminated instance) yields no root entry."""
+        volumes: dict[str, list[tuple[str, bool]]] = {}
         ec2 = self._client("ec2", creds)
         for instance_id in sorted(set(instance_ids)):
             try:
@@ -381,8 +384,9 @@ class AwsEnvironment:
                 ) from exc
             for reservation in reservations:
                 for instance in reservation["Instances"]:
+                    root_name = instance.get("RootDeviceName")
                     ids = [
-                        m["Ebs"]["VolumeId"]
+                        (m["Ebs"]["VolumeId"], bool(root_name) and m.get("DeviceName") == root_name)
                         for m in instance.get("BlockDeviceMappings", [])
                         if m.get("Ebs", {}).get("VolumeId")
                     ]

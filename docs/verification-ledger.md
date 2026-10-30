@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). Round-2 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). Round-3 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -130,7 +130,7 @@ The session-policy and IAM evidence is offline policy evaluation and recorded ST
 arguments only. Real IAM, STS session-tag and EC2/SSM acceptance remains part of the
 blocked live gate.
 
-## Round 2 fix commit (parent `910e9c0`)
+## Round 2 fix commit: `018c180bcd7d4978c13a2f5e62749ca22976ee75` (parent `910e9c0`)
 
 | Check | Result |
 |---|---|
@@ -140,4 +140,71 @@ blocked live gate.
 | Reviewer reproductions against `910e9c0` and the fix tree | see "Round 2 findings" above |
 | pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
 | Process-level offline run (real API and worker processes, schema 3) | `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; repeated chat `Idempotency-Key` returned the same session; identities recorded in the table and the `identities.jsonl` evidence file; second worker refused; worker stopped cleanly on SIGTERM |
+| CI on the exact pushed commit | passed: [run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490), 299 tests |
+
+## Candidate 3: `018c180bcd7d4978c13a2f5e62749ca22976ee75`
+
+| Check | Result |
+|---|---|
+| Sol Medium security review | **not clean**: 4 required findings |
+| Sol Medium reliability review | **not clean**: 4 required findings |
+
+The volume-tag / IAM mismatch appears in both reviews, so there are 7 unique findings (R3-1
+to R3-7 below).
+
+## Round 3 findings → fixes → tests
+
+Reviewer reproductions: security3 `test_security3_independent.py` (4 tests) and
+reliability3 `test_reliability_review3.py` (4 tests, including a run of the pinned AWS
+provider against a loopback EC2 stub). Both files were kept outside the repository:
+
+- On `018c180`, all 8 pass, so every defect reproduces.
+- On the fix tree, 7 of 8 fail for the intended reason. The security file imports the
+  removed `_acknowledge_root_disk`, so it was run with that one import made optional; its
+  other tests are unchanged.
+- `test_actual_provider_volume_tagging_does_not_satisfy_policies` still passes on the fix.
+  It asserts that both IAM policies deny an untagged volume launch, which is the
+  tag-on-create least privilege we deliberately keep. Its premise, that the plan leaves
+  volumes untagged, no longer holds: the pinned-provider reproduction now captures an
+  `{instance, volume}` TagSpecification, and `test_r3_1_pinned_provider_tags_root_volume_in_run_instances`
+  shows those request tags satisfy both policies.
+
+| ID | Finding | Fix | Regression tests (`tests/test_review_round3.py`) | Mutants |
+|---|---|---|---|---|
+| R3-1 (P1, both reviews) | `root_block_device.tags` are applied by a post-launch CreateTags, so the tag-on-create IAM conditions deny the launch | The template uses `volume_tags` (provider 6.71.0 sends them as RunInstances `TagSpecifications`, per the pinned provider docs, line 314). The policy now requires `volume_tags` equal to the deployment's root tags and rejects `root_block_device.tags`, in both the plan values and the configuration. The IAM policies are **unchanged**: untagged volume launches stay denied. The simulator and the real-Terraform fixture were regenerated, and `terraform test` asserts the new shape | `test_r3_1_*`: the pinned provider against a loopback EC2 stub captures `{instance, volume}` TagSpecifications with the deployment tags and no CreateTags; role and session policies allow that request and deny untagged or foreign-tagged launches; policy and template checks | `r3-1-policy-volume-tags`, `r3-1-policy-root-block-tags`, `r3-1-template-tag-on-create` |
+| R3-2 (P1 security, P1 reliability) | An operator free-text acknowledgement became verified deletion, and any attached disk counted as the root | Acknowledgement removed; the schema-3 `identity_acknowledgements` rows are ignored. Root evidence comes only from root-specific sources (root output, Terraform `root_block_device`, the deployment's root ID, `RootDeviceName` mapping, operator-recorded volume). Attached disks are recorded as `attached_device` but are never root evidence. `unitcompute-admin record-root-volume` only accepts a volume AWS reports as existing (and not contradicting a live instance's root); deletion must then verify it is gone | `test_r3_2_*`, plus the rewritten `test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone` | `r3-2-root-sources-only`, `r3-2-root-device-name`, `r3-2-recorded-volume-exists`, `r3-2-recorded-root-matches` |
+| R3-3 (P2) | Create/repair ignored an unresolved root identity | Planning (create, repair and deletion) fails with `identity_incomplete` while any known instance lacks root evidence; deletion verification keeps the same rule | `test_r3_3_*` (both routes: no approvable plan, quota held) | `r3-3-plan-needs-root-identity` |
+| R3-5 (P2) | A torn evidence-file tail swallowed the next durable record | Before appending, an unterminated last record is closed with a newline; short `os.write` results are retried until complete (no progress raises); then fsync | `test_r3_5_*` (torn tail, one-byte writes, zero-progress) | `r3-5-torn-tail`, `r3-5-short-write` |
+| R3-6 (P2) | An expired chat attempt could publish success after its retry completed | Completion is fenced: `UPDATE … WHERE id = ? AND status = 'reserved'` must succeed before any history is written, in the same transaction; otherwise `409 attempt_superseded` and nothing is published | `test_r3_6_*` (reviewer scenario: late attempt `failed` and superseded, retry `succeeded`, 2 messages, replay = retry) | `r3-6-completion-fence` |
+| R3-7 (P2) | Recognisable credentials reached the model and stored history | The message is redacted before the idempotency hash, the provider and storage; history is redacted again on load (covering pre-existing rows); redaction now also covers PEM private keys and more `name=value` secret names; the reply adds a notice. Pattern-based, not complete detection | `test_r3_7_*` (4 credential shapes, replay, legacy history, HTTP) | `r3-7-redact-input`, `r3-7-redact-history` |
+
+Changed test expectations (each is stricter):
+
+- `test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged` is now
+  `test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone`. The deletion
+  preview is refused up front (previously it was approved, then failed at verification).
+  An operator can only add an existing volume, which must then be removed and verified
+  gone before `deleted`; there is no acknowledgement.
+- The S3 binding test's stub plan now uses `volume_tags`, matching real Terraform output
+  for the new template.
+- The `moto_env` fixture moved to `conftest.py`.
+
+The mutation runner was also tightened. Previously any non-zero pytest exit counted as
+KILLED, so an unknown test ID would have looked like a kill. Now only exit code 1 counts;
+other codes are reported as BROKEN. All 73 referenced test IDs collect (only the renamed
+R2-3 ID needed updating).
+
+## Round 3 fix commit (parent `018c180`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check` | passed |
+| `pytest` with offline Terraform tests required | 320 passed |
+| `scripts/check_guards.py` | 74/74 mutants killed (61 earlier + 13 new). In the first full run, `r2-3-root-disk-completeness` survived: its test now stops at the new plan-time block before reaching the deletion-verification check. That check was kept as a second guard, and a direct test, `test_r3_3_deletion_verification_independently_requires_root_identity`, now kills the mutant |
+| Reviewer reproductions against `018c180` and the fix tree | see "Round 3 findings" above |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir, and a restart on the round-2 schema-3 data dir with existing identities (no migration needed). Both: `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; a synthetic `aws_secret_access_key=` chat message was not stored and the reply carried the redaction notice; second worker refused; worker stopped on SIGTERM |
 | CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+
+The live AWS lifecycle, IAM, EC2 and SSM gate remains blocked and is not proven by these
+offline results.

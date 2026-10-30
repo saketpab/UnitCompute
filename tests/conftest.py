@@ -145,3 +145,15 @@ def launch(h: Harness, user: str = "alice") -> dict[str, Any]:
     final: dict[str, Any] = h.client.get(f"/deployments/{detail['id']}", headers=auth(user)).json()
     assert final["status"] == "active", final
     return final
+
+
+@pytest.fixture
+def moto_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """moto-emulated EC2 client (offline; proves request handling, not AWS behaviour)."""
+    import boto3
+    from moto import mock_aws
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    with mock_aws():
+        yield boto3.client("ec2", region_name="us-east-1")

@@ -250,7 +250,7 @@ class TerraformProvisioner:
         creds = self._aws.credentials("plan", "uc-verify-ids")
         return self._aws.find_resources(resource_ids, creds)
 
-    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[str]]:
+    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[tuple[str, bool]]]:
         creds = self._aws.credentials("plan", "uc-verify-volumes")
         return self._aws.instance_volumes(instance_ids, creds)
 

@@ -314,7 +314,7 @@ def test_s3_terraform_plan_bound_to_account_network_backend_and_roles(tmp_path: 
                 tags = expected_tags(spec)
                 inst = change(plan, INST)["change"]["after"]
                 inst["tags"] = inst["tags_all"] = {**tags, "Name": "unitcompute-demo"}
-                inst["root_block_device"][0]["tags"] = {**tags, "Name": "unitcompute-demo-root"}
+                inst["volume_tags"] = {**tags, "Name": "unitcompute-demo-root"}
                 group = change(plan, SG)["change"]["after"]
                 group["tags"] = group["tags_all"] = {**tags, "Name": "unitcompute-demo"}
                 return RunResult(0, json.dumps(plan), "")

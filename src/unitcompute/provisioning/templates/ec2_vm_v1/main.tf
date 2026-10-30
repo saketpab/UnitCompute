@@ -57,8 +57,12 @@ resource "aws_instance" "vm" {
     volume_size           = var.disk_gib
     encrypted             = true
     delete_on_termination = true
-    tags                  = merge(local.tags, { Name = "unitcompute-${var.name}-root" })
   }
+
+  # volume_tags (not root_block_device.tags) are sent as RunInstances TagSpecifications,
+  # so the root volume is tagged at creation, as the execution IAM policies require.
+  # root_block_device.tags would be applied by a separate CreateTags call after launch.
+  volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })
 
   tags = merge(local.tags, { Name = "unitcompute-${var.name}" })
 }

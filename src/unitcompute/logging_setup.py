@@ -16,12 +16,17 @@ request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 _PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b"),
     re.compile(
-        r"(?i)(aws_secret_access_key|secret_access_key|session_token|password|api[_-]?key)"
+        r"(?i)(aws_secret_access_key|secret_access_key|aws_session_token|session_token|"
+        r"password|passwd|api[_-]?key|access[_-]?token|client[_-]?secret)"
         r"(\s*[=:]\s*|\"\s*:\s*\")([^\s\"',]+)"
     ),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+        re.DOTALL,
+    ),
 ]
 REDACTED = "[REDACTED]"
 

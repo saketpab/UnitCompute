@@ -37,6 +37,11 @@ rejected.
 - Limits: model calls and tool calls per message, a wall-clock timeout, message length,
   history length, total turns per session, messages per user per day and output tokens are
   all configurable (`UNITCOMPUTE_AGENT_*`).
+- Recognisable credentials in user messages are replaced with `[REDACTED]` before the
+  model sees them, before they are stored, and again when history is loaded. This covers
+  AWS key IDs, `secret_access_key=`/`password:`-style pairs, bearer tokens, JWTs, `sk-`
+  keys and PEM private keys. Detection is pattern-based and cannot catch every secret. The
+  reply tells the user something was removed.
 - The model never receives credentials, raw plans or state, plan hashes, or other users'
   data. Owners are identified only by their token subject, which is not sent to the model.
   LangSmith/LangChain tracing is forced off.

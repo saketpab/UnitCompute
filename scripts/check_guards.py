@@ -436,7 +436,8 @@ MUTATIONS = [
         "r2-3-root-disk-completeness",
         (("worker.py", "            if missing_disks:", "            if False:"),),
         (
-            "tests/test_review_round2.py::test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged",
+            "tests/test_review_round3.py::"
+            "test_r3_3_deletion_verification_independently_requires_root_identity",
         ),
     ),
     Mutation(
@@ -460,6 +461,114 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round2.py::test_r2_5_stale_observation_is_not_presented_as_ready",),
+    ),
+    Mutation(
+        "r3-1-policy-volume-tags",
+        (("provisioning/policy.py", 'after.get("volume_tags") == root_tags,', "True,"),),
+        ("tests/test_review_round3.py::test_r3_1_policy_requires_launch_time_volume_tags",),
+    ),
+    Mutation(
+        "r3-1-policy-root-block-tags",
+        (
+            (
+                "provisioning/policy.py",
+                '_first(after.get("root_block_device")).get("tags") in (None, {}),',
+                "True,",
+            ),
+        ),
+        ("tests/test_review_round3.py::test_r3_1_policy_requires_launch_time_volume_tags",),
+    ),
+    Mutation(
+        "r3-1-template-tag-on-create",
+        (
+            (
+                "provisioning/templates/ec2_vm_v1/main.tf",
+                '  volume_tags = merge(local.tags, { Name = "unitcompute-${var.name}-root" })\n',
+                "",
+            ),
+        ),
+        (
+            "tests/test_review_round3.py::test_r3_1_template_uses_volume_tags_not_root_block_tags",
+            "tests/test_review_round3.py::test_r3_1_pinned_provider_tags_root_volume_in_run_instances",
+        ),
+    ),
+    Mutation(
+        "r3-2-root-sources-only",
+        (
+            (
+                "identities.py",
+                'and r["parent_id"] and r["source"] in ROOT_SOURCES:',
+                'and r["parent_id"]:',
+            ),
+        ),
+        ("tests/test_review_round3.py::test_r3_2_attached_data_disk_is_not_root_evidence",),
+    ),
+    Mutation(
+        "r3-2-root-device-name",
+        (("provisioning/aws.py", 'bool(root_name) and m.get("DeviceName") == root_name', "True"),),
+        ("tests/test_review_round3.py::test_r3_2_live_root_device_is_positively_identified",),
+    ),
+    Mutation(
+        "r3-2-recorded-volume-exists",
+        (("admin.py", "    if not exists:", "    if False:"),),
+        (
+            "tests/test_review_round2.py::test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone",
+        ),
+    ),
+    Mutation(
+        "r3-2-recorded-root-matches",
+        (("admin.py", "if roots and args.volume_id not in roots:", "if False:"),),
+        ("tests/test_review_round3.py::test_r3_2_recorded_root_must_exist_and_match_the_instance",),
+    ),
+    Mutation(
+        "r3-3-plan-needs-root-identity",
+        (
+            (
+                "worker.py",
+                "        if missing:\n            # A known instance",
+                "        if False:\n            # A known instance",
+            ),
+        ),
+        (
+            "tests/test_review_round3.py::test_r3_3_unresolved_root_blocks_repair_and_deletion_previews",
+        ),
+    ),
+    Mutation(
+        "r3-5-torn-tail",
+        (("identities.py", 'if size and os.pread(fd, 1, size - 1) != b"\\n":', "if False:"),),
+        ("tests/test_review_round3.py::test_r3_5_torn_tail_does_not_swallow_next_record",),
+    ),
+    Mutation(
+        "r3-5-short-write",
+        (("identities.py", "view = view[written:]", "view = view[len(view):]"),),
+        ("tests/test_review_round3.py::test_r3_5_short_writes_are_completed",),
+    ),
+    Mutation(
+        "r3-6-completion-fence",
+        (("agent/service.py", "if owned != 1:", "if False:"),),
+        ("tests/test_review_round3.py::test_r3_6_expired_attempt_cannot_publish_after_retry",),
+    ),
+    Mutation(
+        "r3-7-redact-input",
+        (
+            (
+                "agent/service.py",
+                "sanitized = redact(request.message)",
+                "sanitized = request.message",
+            ),
+        ),
+        ("tests/test_review_round3.py::test_r3_7_credentials_removed_before_provider_and_history",),
+    ),
+    Mutation(
+        "r3-7-redact-history",
+        (
+            (
+                "agent/service.py",
+                'HumanMessage(content=redact(r["content"]))',
+                'HumanMessage(content=r["content"])',
+            ),
+        ),
+        ("tests/test_review_round3.py::test_r3_7_legacy_history_is_redacted_before_the_provider",),
     ),
     Mutation(
         "policy-imdsv2",
@@ -568,7 +677,11 @@ def run(mutation: Mutation, workspace: Path) -> str:
         timeout=600,
         check=False,
     )
-    return "KILLED" if result.returncode != 0 else "SURVIVED"
+    # pytest exits 1 when tests ran and failed. Any other non-zero code (collection error,
+    # unknown test ID, no tests collected) proves nothing about the guard.
+    if result.returncode == 1:
+        return "KILLED"
+    return "SURVIVED" if result.returncode == 0 else f"BROKEN({result.returncode})"
 
 
 def main() -> int:

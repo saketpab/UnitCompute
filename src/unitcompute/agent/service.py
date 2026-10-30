@@ -390,10 +390,12 @@ class AgentService:
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
+        # Redact again on the way out so history stored before redaction existed (or by an
+        # older version) never reaches the provider.
         return [
-            HumanMessage(content=r["content"])
+            HumanMessage(content=redact(r["content"]))
             if r["role"] == "user"
-            else AIMessage(content=r["content"])
+            else AIMessage(content=redact(r["content"]))
             for r in reversed(rows)
         ]
 
@@ -475,6 +477,12 @@ class AgentService:
             raise InvalidInput(
                 f"Messages are limited to {self._settings.agent_max_message_chars} characters."
             )
+        # Recognisable credentials are removed before anything else sees the message: the
+        # idempotency hash, the provider, and stored history. Detection is pattern-based and
+        # cannot catch every secret.
+        sanitized = redact(request.message)
+        credential_removed = sanitized != request.message
+        request = request.model_copy(update={"message": sanitized})
         payload_hash = canonical_hash(
             {"session_id": request.session_id, "message": request.message}
         )
@@ -498,7 +506,9 @@ class AgentService:
             return reserved
         session_id, attempt_id = reserved
         try:
-            reply = await self._run(principal, model, session_id, request, attempt_id, request_id)
+            reply = await self._run(
+                principal, model, session_id, request, attempt_id, request_id, credential_removed
+            )
         except BaseException:
             self._mark_failed(attempt_id)
             raise
@@ -512,6 +522,7 @@ class AgentService:
         request: AgentMessageRequest,
         attempt_id: int,
         request_id: str | None,
+        credential_removed: bool = False,
     ) -> AgentReply:
         history = self._history(session_id)
         ctx = _RunContext()
@@ -567,21 +578,39 @@ class AgentService:
             reply=reply,
             model=self.model_label,
             proposal=ctx.proposal,
-            clarifications=ctx.clarifications,
+            clarifications=[
+                *(
+                    [
+                        "A credential-like value was removed from your message. Never share "
+                        "credentials with the assistant."
+                    ]
+                    if credential_removed
+                    else []
+                ),
+                *ctx.clarifications,
+            ],
             tool_calls=ctx.tool_calls,
             approval_note=APPROVAL_NOTE,
         )
         with self._db.transaction() as conn:
             now = to_db_time(utcnow())
+            # Fence: publish only while this attempt still owns its reservation. If its lease
+            # expired and a retry took over the key, nothing from this run is published.
+            owned = conn.execute(
+                "UPDATE agent_attempts SET status = 'succeeded', response_json = ?, "
+                "finished_at = ? WHERE id = ? AND status = 'reserved'",
+                (response.model_dump_json(), now, attempt_id),
+            ).rowcount
+            if owned != 1:
+                raise Conflict(
+                    "This request's reservation expired and was superseded; its result was "
+                    "discarded. Retry to get the current result.",
+                    code="attempt_superseded",
+                )
             conn.executemany(
                 "INSERT INTO chat_messages (session_id, role, content, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 [(session_id, "user", request.message, now), (session_id, "assistant", reply, now)],
-            )
-            conn.execute(
-                "UPDATE agent_attempts SET status = 'succeeded', response_json = ?, "
-                "finished_at = ? WHERE id = ?",
-                (response.model_dump_json(), now, attempt_id),
             )
             record_audit(
                 conn,

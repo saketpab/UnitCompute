@@ -55,7 +55,6 @@ INSTANCE_CREATE_VALUES: dict[str, Any] = {
     "timeouts": None,
     "user_data": None,
     "user_data_replace_on_change": False,
-    "volume_tags": None,
 }
 INSTANCE_CREATE_FIELDS = set(INSTANCE_CREATE_VALUES) | {
     "ami",
@@ -69,6 +68,7 @@ INSTANCE_CREATE_FIELDS = set(INSTANCE_CREATE_VALUES) | {
     "subnet_id",
     "tags",
     "tags_all",
+    "volume_tags",
 }
 ROOT_CREATE_FIELDS = {"delete_on_termination", "encrypted", "tags", "volume_size", "volume_type"}
 SECURITY_GROUP_CREATE_FIELDS = {
@@ -96,17 +96,19 @@ CONFIGURED_ARGUMENTS = {
         "root_block_device",
         "subnet_id",
         "tags",
+        "volume_tags",
         "vpc_security_group_ids",
     },
     SECURITY_GROUP: {"description", "egress", "ingress", "name", "tags", "vpc_id"},
 }
 CONFIGURED_BLOCK_ARGUMENTS = {
+    # No "tags": root_block_device.tags are applied after launch by a separate CreateTags
+    # call, which the tag-on-create IAM policies deny. Volumes are tagged via volume_tags.
     "root_block_device": {
         "volume_type",
         "volume_size",
         "encrypted",
         "delete_on_termination",
-        "tags",
     },
     "metadata_options": {
         "http_endpoint",
@@ -194,6 +196,11 @@ def _check_instance_create_fields(
     extra_root = sorted(set(_first(after.get("root_block_device"))) - ROOT_CREATE_FIELDS)
     if extra_root:
         v.append(f"root volume sets unreviewed attributes: {', '.join(extra_root)}")
+    _check(
+        v,
+        _first(after.get("root_block_device")).get("tags") in (None, {}),
+        "root_block_device.tags are tagged after launch and denied by IAM; use volume_tags",
+    )
     v.extend(_check_group_attachment(after, after_unknown, group_id))
     return v
 
@@ -247,11 +254,11 @@ def _check_instance(
     _check(v, root.get("volume_size") == spec.disk_gib, "root volume size does not match request")
     _check(v, root.get("encrypted") is True, "root volume must be encrypted")
     _check(v, root.get("delete_on_termination") is True, "root volume must delete on termination")
+    root_tags = {**expected_tags(spec), "Name": f"unitcompute-{spec.name}-root"}
     _check(
         v,
-        isinstance(root.get("tags"), dict)
-        and root["tags"] == {**expected_tags(spec), "Name": f"unitcompute-{spec.name}-root"},
-        "root volume tags do not match this deployment",
+        after.get("volume_tags") == root_tags,
+        "volumes must be tagged for this deployment at launch (volume_tags)",
     )
     _check(v, after.get("region") in (None, spec.region), "instance region is not approved")
     _check(v, _tags_ok(after, spec, f"unitcompute-{spec.name}"), "instance tags do not match")

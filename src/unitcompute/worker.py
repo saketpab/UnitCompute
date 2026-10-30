@@ -30,7 +30,14 @@ from typing import Any
 from unitcompute.config import ProvisionerKind, Settings, load_settings
 from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
 from unitcompute.errors import ServiceUnavailable
-from unitcompute.identities import Identity, IdentityLedger, KnownIdentities, identity
+from unitcompute.identities import (
+    ATTACHED_DEVICE,
+    ROOT_DEVICE,
+    Identity,
+    IdentityLedger,
+    KnownIdentities,
+    identity,
+)
 from unitcompute.logging_setup import configure_logging, redact, secure_process_defaults
 from unitcompute.pricing import estimate_monthly_cost
 from unitcompute.provisioning.base import (
@@ -64,6 +71,15 @@ ACTOR = "system:worker"
 HEARTBEAT_SECONDS = 15
 WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
 _ID = re.compile(r"^(dep|plan)_[0-9a-f]{32}$")
+
+
+def _missing_root_message(instances: list[str]) -> str:
+    return (
+        "The root disk of " + ", ".join(instances) + " has never been identified (it cannot be "
+        "discovered once detached or terminated) and may still exist. An operator must find "
+        "it and record it with `unitcompute-admin record-root-volume`; it is then verified "
+        "like every other resource."
+    )
 
 
 class WorkerLockHeld(RuntimeError):
@@ -559,9 +575,9 @@ class Worker:
         self.record_identities(
             deployment_id,
             [
-                identity(volume, "instance_block_devices", instance_id)
+                identity(volume, ROOT_DEVICE if is_root else ATTACHED_DEVICE, instance_id)
                 for instance_id, volumes in mapped.items()
-                for volume in volumes
+                for volume, is_root in volumes
             ],
         )
 
@@ -588,6 +604,11 @@ class Worker:
         self._discover_volumes(
             deployment_id, [r.resource_id for r in live if r.resource_type == "instance"]
         )
+        missing = self.import_identities(deployment_id).instances_without_root_disk()
+        if missing:
+            # A known instance whose root disk was never identified may have left a billable
+            # disk behind; neither repair nor deletion may proceed until it is identified.
+            raise JobFailure("identity_incomplete", _missing_root_message(missing))
         merged = {r.resource_id: r for r in [*tagged, *live]}
         return list(merged.values())
 
@@ -767,12 +788,7 @@ class Worker:
             known = self.import_identities(deployment["id"])
             missing_disks = known.instances_without_root_disk()
             if missing_disks:
-                return JobFailure(
-                    "identity_incomplete",
-                    "The root disk of " + ", ".join(missing_disks) + " was never recorded and "
-                    "cannot be discovered after termination; an operator must confirm it is "
-                    "gone (unitcompute-admin acknowledge-root-disk).",
-                )
+                return JobFailure("identity_incomplete", _missing_root_message(missing_disks))
             found = self.provisioner.find_resources(known.all_ids)
         except ProvisioningError:
             log.warning("deletion verification failed", exc_info=True)

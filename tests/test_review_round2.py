@@ -13,13 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-import boto3
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
-from moto import mock_aws
 
 import iam_eval
 from conftest import (
@@ -79,7 +77,7 @@ class _AwsBacked(SimulatedProvisioner):
     def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
         return self.aws.find_resources(resource_ids, CREDS)
 
-    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[str]]:
+    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[tuple[str, bool]]]:
         return self.aws.instance_volumes(instance_ids, CREDS)
 
 
@@ -88,14 +86,6 @@ def _replan(h: Any, provisioner: SimulatedProvisioner, dep: str, route: str) -> 
     worker = Worker(h.settings, h.db, provisioner, clock=h.clock)
     assert worker.run_once()
     return worker, _detail(h, dep)
-
-
-@pytest.fixture
-def moto_env(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    with mock_aws():
-        yield boto3.client("ec2", region_name="us-east-1")
 
 
 # --------------------------------------------------- S2-1: JWKS key removal
@@ -761,9 +751,11 @@ def _client(settings: Any, db: Database, clock: FakeClock) -> Any:
     return client, SimpleNamespace(settings=settings, db=db, client=client, clock=clock)
 
 
-def test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged(
+def test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
+    """Round 3 tightened this: no operator waiver exists. The root volume must be identified
+    as evidence (AWS confirms it exists) and then verified gone like any other resource."""
     ec2 = moto_env
     vm = ec2.run_instances(
         ImageId="ami-12345678",
@@ -779,13 +771,10 @@ def test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged(
     clock = FakeClock()
     client, h = _client(settings, db, clock)
     with client:
+        # The unresolved root identity blocks the deletion preview itself.
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
-        approve_current(h, pending)
-        Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
-        final = _detail(h, dep)
-        assert final["status"] == "recovery_required"
-        assert final["latest_job"]["error"]["code"] == "identity_incomplete"
-        assert ec2.describe_volumes(VolumeIds=[vid])["Volumes"][0]["State"] == "available"
+        assert pending["status"] == "plan_failed"
+        assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
         assert (
             client.post(
                 "/deployments", json={"name": "next", "disk_gib": 8}, headers=auth()
@@ -793,46 +782,40 @@ def test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged(
             == 409
         )
 
-        from unitcompute.admin import main as admin
+        from argparse import Namespace
 
-        monkeypatch.setenv("UNITCOMPUTE_DATA_DIR", str(settings.data_dir))
-        monkeypatch.setenv("UNITCOMPUTE_PROVISIONER", "simulated")
-        assert (
-            admin(
-                [
-                    "acknowledge-root-disk",
-                    dep,
-                    "i-0123456789abcdef0",
-                    "--operator",
-                    "op",
-                    "--reason",
-                    "x",
-                ]
+        from unitcompute.admin import _record_root_volume
+
+        def record(instance: str, volume: str) -> int:
+            return _record_root_volume(
+                db,
+                Namespace(
+                    deployment_id=dep,
+                    instance_id=instance,
+                    volume_id=volume,
+                    operator="ops-oncall",
+                    reason="CloudTrail RunInstances",
+                ),
+                _AwsBacked(h),
+                IdentityLedger(settings.workdir_root),
             )
-            == 1
-        )  # unknown instance is refused
-        assert (
-            admin(
-                [
-                    "acknowledge-root-disk",
-                    dep,
-                    iid,
-                    "--operator",
-                    "ops-oncall",
-                    "--reason",
-                    "CloudTrail DeleteVolume confirmed",
-                ]
-            )
-            == 0
-        )
-        ec2.delete_volume(VolumeId=vid)  # the operator cleaned the disk up out of band
+
+        assert record("i-0123456789abcdef0", vid) == 1  # not this deployment's instance
+        assert record(iid, "vol-0123456789abcdef0") == 1  # AWS does not know it
+        assert record(iid, vid) == 0
+        # Recorded root volume exists outside Terraform state: preview rejected until an
+        # operator removes it; nothing is waived.
+        _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
+        assert pending["current_plan"]["status"] == "rejected"
+        assert vid in pending["current_plan"]["error"]["message"]
+        ec2.delete_volume(VolumeId=vid)
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
         approve_current(h, pending)
         Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
         assert _detail(h, dep)["status"] == "deleted"
         with db.read() as conn:
             actions = [r[0] for r in conn.execute("SELECT action FROM audit_events")]
-        assert "identity.root_disk_acknowledged" in actions
+        assert "identity.root_volume_recorded" in actions
 
 
 def test_r2_3_live_instance_disk_is_discovered_and_verified(

@@ -54,6 +54,14 @@ run "secure_defaults" {
     condition     = aws_instance.vm.tags["UnitComputeDeployment"] == var.deployment_id && aws_security_group.vm.tags["UnitComputeDeployment"] == var.deployment_id
     error_message = "resources must be tagged with the deployment"
   }
+  assert {
+    condition     = aws_instance.vm.volume_tags["UnitComputeDeployment"] == var.deployment_id && aws_instance.vm.volume_tags["ManagedBy"] == "unitcompute"
+    error_message = "volumes must be tagged at creation (volume_tags)"
+  }
+  assert {
+    condition     = aws_instance.vm.root_block_device[0].tags == null
+    error_message = "root_block_device.tags are applied after launch; use volume_tags"
+  }
 }
 
 run "rejects_large_disk" {

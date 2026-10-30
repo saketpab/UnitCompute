@@ -140,6 +140,9 @@ access to that prefix, and nothing in this repository applies them.
    expected actions, attribute values and ownership tags. It rejects extra resources, data
    sources, modules, provider arguments, replacements and untracked tagged resources
    (orphans).
+   Volumes must be tagged at launch through `volume_tags`, which the provider sends as
+   RunInstances `TagSpecifications`. `root_block_device.tags` are rejected: the provider
+   applies them with a later `CreateTags` call, which the tag-on-create IAM policies deny.
    It also rejects provisioners, unreviewed arguments or meta-arguments, and any
    instance-to-security-group attachment other than the deployment's own group. For newly
    created resources, attributes outside the reviewed set (for example `key_name`,
@@ -189,13 +192,24 @@ post-apply verification failed.
    `terraform import` them into that deployment's state or delete them by hand. Afterwards,
    request a new preview. Never let the application guess. A recorded VM that is still
    running therefore always blocks a repair preview from launching a second VM.
-5. `identity_incomplete` means an instance is known, but its root disk was never recorded
-   (for example, a deployment created before identities were tracked) and it can no longer
-   be discovered because the instance is terminated. An operator must confirm that the
-   disk is gone, or delete it, and then run
-   `unitcompute-admin acknowledge-root-disk <deployment> <instance> --operator <name>
-   --reason <evidence>`. This appends an acknowledgement and an audit event. After that,
-   request a new deletion preview.
+5. `identity_incomplete` means an instance is known, but its root disk was never
+   positively identified. Typical causes are a deployment created before identities were
+   tracked, a terminated instance, or a root volume that was detached. The root disk may
+   still exist and be billable, so every repair and deletion preview is refused until it
+   is identified. There is no waiver.
+
+   An operator finds the volume (for example from CloudTrail `RunInstances`/`DetachVolume`
+   events) and runs
+   `unitcompute-admin record-root-volume <deployment> <instance> <volume> --operator <name>
+   --reason <evidence>`. The command refuses a volume that AWS does not report as
+   existing, and refuses one that differs from the root device of a still-running instance.
+   It appends evidence and an audit event. That volume is then reconciled and must be
+   confirmed gone by lookup like any other resource: delete it, or import it into state,
+   then request a new preview.
+
+   If the volume no longer exists, it cannot be recorded, and the deployment stays in
+   recovery. Absence cannot be asserted. This needs a deliberate support decision outside
+   the application.
 
 ### Resource identity evidence
 
@@ -205,11 +219,27 @@ Sources are:
 
 - apply outputs, recorded before any verification;
 - Terraform prior state, tag inventory and disks discovered on live instances;
-- the IDs held on the deployment record, including those from earlier schema versions.
+- the IDs held on the deployment record, including those from earlier schema versions;
+- root volumes recorded by an operator.
 
-Planning reconciles every known ID against Terraform state. Deletion is complete only when
-every known instance, volume and security group is confirmed gone by direct lookup, and
-every known instance has an identified (or operator-acknowledged) root disk.
+A volume counts as an instance's root disk only from root-specific evidence:
+
+- the template's root volume output;
+- Terraform `root_block_device` state;
+- the root ID stored on the deployment;
+- the mapping on the instance's `RootDeviceName`;
+- an operator-recorded volume that AWS confirmed exists.
+
+Other attached disks are recorded, but they never satisfy the root requirement.
+
+Records are appended with retried short writes and an fsync. A record torn by a crash is
+terminated before the next append, so it cannot swallow later records.
+
+Planning, for both repair and deletion, reconciles every known ID against Terraform state
+and refuses to proceed while any known instance's root disk is unidentified. Deletion is
+complete only when every known instance, volume and security group is confirmed gone by
+direct lookup. The `identity_acknowledgements` table from schema 3 is retired: it is no
+longer written, and its rows grant nothing.
 
 A failed or expired plan never changes infrastructure, so you can always request a new
 preview.

@@ -23,6 +23,26 @@ _ID = re.compile(r"^(i|vol|sg)-[0-9a-f]{8,17}$")
 _TYPES = {"i": "instance", "vol": "volume", "sg": "security_group"}
 _DEPLOYMENT = re.compile(r"^dep_[0-9a-f]{32}$")
 
+# Sources that positively establish a volume as an instance's ROOT disk (when the row also
+# names the parent instance): the template output for the root block device, Terraform's
+# root_block_device state, the root ID kept on the deployment row, the instance's
+# RootDeviceName mapping, or an operator-recorded root volume whose existence AWS confirmed.
+# Disks merely attached to an instance (ATTACHED_DEVICE, and the pre-round-3
+# "instance_block_devices" source) are never root evidence.
+ROOT_DEVICE = "root_device"
+ATTACHED_DEVICE = "attached_device"
+OPERATOR_ROOT_VOLUME = "operator_root_volume"
+ROOT_SOURCES = frozenset(
+    {
+        "apply_output",
+        "terraform_state",
+        "deployment_record",
+        "migration",
+        ROOT_DEVICE,
+        OPERATOR_ROOT_VOLUME,
+    }
+)
+
 
 @dataclass(frozen=True)
 class Identity:
@@ -48,15 +68,17 @@ class KnownIdentities:
     instances: set[str]
     volumes: dict[str, str | None]  # volume -> parent instance (if known)
     groups: set[str]
-    acknowledged: set[str]  # instances whose unrecorded root disk an operator confirmed gone
+    root_volumes: dict[str, set[str]]  # instance -> volumes positively known as its root
 
     @property
     def all_ids(self) -> list[str]:
         return sorted(self.instances | set(self.volumes) | self.groups)
 
     def instances_without_root_disk(self) -> list[str]:
-        with_disk = {parent for parent in self.volumes.values() if parent}
-        return sorted(self.instances - with_disk - self.acknowledged)
+        """Instances whose root disk identity was never positively established.
+
+        There is no waiver: until root evidence exists, plans and deletion stay blocked."""
+        return sorted(i for i in self.instances if not self.root_volumes.get(i))
 
 
 class IdentityLedger:
@@ -80,9 +102,20 @@ class IdentityLedger:
             + "\n"
             for i in rows
         )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        data = payload.encode()
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(fd, payload.encode())
+            # A crash can leave a torn, unterminated last record. Start on a fresh line so the
+            # fragment stays its own (skipped) line instead of swallowing this record.
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = b"\n" + data
+            view = memoryview(data)
+            while view:  # os.write may write fewer bytes than requested
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("evidence write made no progress")
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -149,7 +182,7 @@ class IdentityLedger:
     @staticmethod
     def known(conn: sqlite3.Connection, deployment_id: str) -> KnownIdentities:
         rows = conn.execute(
-            "SELECT resource_type, resource_id, parent_id FROM deployment_resources "
+            "SELECT resource_type, resource_id, parent_id, source FROM deployment_resources "
             "WHERE deployment_id = ?",
             (deployment_id,),
         ).fetchall()
@@ -160,11 +193,8 @@ class IdentityLedger:
             if r["resource_type"] == "volume":
                 # A volume can appear once without and once with its parent; keep the parent.
                 volumes[r["resource_id"]] = r["parent_id"] or volumes.get(r["resource_id"])
-        acknowledged = {
-            r["instance_id"]
-            for r in conn.execute(
-                "SELECT instance_id FROM identity_acknowledgements WHERE deployment_id = ?",
-                (deployment_id,),
-            )
-        }
-        return KnownIdentities(instances, volumes, groups, acknowledged)
+        root_volumes: dict[str, set[str]] = {}
+        for r in rows:
+            if r["resource_type"] == "volume" and r["parent_id"] and r["source"] in ROOT_SOURCES:
+                root_volumes.setdefault(r["parent_id"], set()).add(r["resource_id"])
+        return KnownIdentities(instances, volumes, groups, root_volumes)

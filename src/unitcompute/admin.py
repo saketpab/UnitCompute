@@ -8,14 +8,16 @@ import re
 import sys
 
 from unitcompute.config import ConfigError, load_settings
-from unitcompute.db.database import Database, to_db_time, utcnow
-from unitcompute.identities import IdentityLedger
+from unitcompute.db.database import Database
+from unitcompute.identities import OPERATOR_ROOT_VOLUME, IdentityLedger, identity
 from unitcompute.logging_setup import secure_process_defaults
+from unitcompute.provisioning.base import Provisioner, ProvisioningError
 from unitcompute.provisioning.factory import build_provisioner
 from unitcompute.services.deployments import record_audit
 
 _DEPLOYMENT = re.compile(r"^dep_[0-9a-f]{32}$")
 _INSTANCE = re.compile(r"^i-[0-9a-f]{8,17}$")
+_VOLUME = re.compile(r"^vol-[0-9a-f]{8,17}$")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,14 +33,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also list AWS resources tagged for each deployment (read-only)",
     )
-    ack = sub.add_parser(
-        "acknowledge-root-disk",
-        help="record that a known instance's never-recorded root disk is confirmed gone",
+    record = sub.add_parser(
+        "record-root-volume",
+        help="record the identity of a known instance's root volume (AWS must confirm the "
+        "volume exists; deletion then verifies it is gone like any other resource)",
     )
-    ack.add_argument("deployment_id")
-    ack.add_argument("instance_id")
-    ack.add_argument("--operator", required=True, help="who verified it (recorded in audit)")
-    ack.add_argument("--reason", required=True, help="how it was verified, e.g. CloudTrail")
+    record.add_argument("deployment_id")
+    record.add_argument("instance_id")
+    record.add_argument("volume_id")
+    record.add_argument("--operator", required=True, help="who identified it (audited)")
+    record.add_argument("--reason", required=True, help="how it was identified, e.g. CloudTrail")
     args = parser.parse_args(argv)
     secure_process_defaults()
 
@@ -68,8 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     db.require_current_schema()
-    if args.command == "acknowledge-root-disk":
-        return _acknowledge_root_disk(db, args)
+    if args.command == "record-root-volume":
+        provisioner = build_provisioner(settings)
+        if provisioner is None:
+            print("provisioning is disabled; AWS cannot confirm the volume", file=sys.stderr)
+            return 2
+        return _record_root_volume(db, args, provisioner, IdentityLedger(settings.workdir_root))
     with db.read() as conn:
         rows = conn.execute(
             "SELECT d.id, d.status, d.status_reason, d.provisioner, d.updated_at, "
@@ -94,32 +102,74 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _acknowledge_root_disk(db: Database, args: argparse.Namespace) -> int:
-    if not (_DEPLOYMENT.fullmatch(args.deployment_id) and _INSTANCE.fullmatch(args.instance_id)):
-        print("invalid deployment or instance ID", file=sys.stderr)
+def _record_root_volume(
+    db: Database, args: argparse.Namespace, provisioner: Provisioner, ledger: IdentityLedger
+) -> int:
+    """Add recoverable root-disk evidence. Never a waiver: the volume must exist now, and a
+    later deletion only completes once AWS reports it gone."""
+    if not (
+        _DEPLOYMENT.fullmatch(args.deployment_id)
+        and _INSTANCE.fullmatch(args.instance_id)
+        and _VOLUME.fullmatch(args.volume_id)
+    ):
+        print("invalid deployment, instance or volume ID", file=sys.stderr)
         return 2
     if not args.operator.strip() or not args.reason.strip():
         print("operator and reason are required", file=sys.stderr)
         return 2
-    with db.transaction() as conn:
+    with db.read() as conn:
         known = IdentityLedger.known(conn, args.deployment_id)
-        if args.instance_id not in known.instances:
-            print("that instance is not recorded for this deployment", file=sys.stderr)
+    if args.instance_id not in known.instances:
+        print("that instance is not recorded for this deployment", file=sys.stderr)
+        return 1
+    try:
+        mapped = provisioner.instance_volumes([args.instance_id]).get(args.instance_id, [])
+        roots = [volume for volume, is_root in mapped if is_root]
+        if roots and args.volume_id not in roots:
+            print(
+                f"AWS reports a different root volume for {args.instance_id}: {', '.join(roots)}",
+                file=sys.stderr,
+            )
             return 1
-        now = to_db_time(utcnow())
-        conn.execute(
-            "INSERT INTO identity_acknowledgements (deployment_id, instance_id, operator, "
-            "reason, recorded_at) VALUES (?, ?, ?, ?, ?)",
-            (args.deployment_id, args.instance_id, args.operator[:200], args.reason[:500], now),
+        exists = any(
+            r.resource_id == args.volume_id for r in provisioner.find_resources([args.volume_id])
         )
+    except ProvisioningError as exc:
+        print(f"AWS lookup failed: {exc.safe_message}", file=sys.stderr)
+        return 1
+    if not exists:
+        print(
+            "AWS does not report that volume; only an existing volume can be recorded as "
+            "evidence (absence must be proven by verification, not asserted)",
+            file=sys.stderr,
+        )
+        return 1
+    ledger.append_evidence(
+        args.deployment_id,
+        [identity(args.volume_id, OPERATOR_ROOT_VOLUME, args.instance_id)],
+    )
+    with db.transaction() as conn:
+        ledger.import_evidence(conn, args.deployment_id)
         record_audit(
             conn,
             actor=f"operator:{args.operator[:100]}",
-            action="identity.root_disk_acknowledged",
+            action="identity.root_volume_recorded",
             deployment_id=args.deployment_id,
-            detail={"instance_id": args.instance_id},
+            detail={
+                "instance_id": args.instance_id,
+                "volume_id": args.volume_id,
+                "reason": args.reason[:200],
+            },
         )
-    print(json.dumps({"acknowledged": args.instance_id, "deployment_id": args.deployment_id}))
+    print(
+        json.dumps(
+            {
+                "recorded_root_volume": args.volume_id,
+                "instance_id": args.instance_id,
+                "deployment_id": args.deployment_id,
+            }
+        )
+    )
     return 0
 
 

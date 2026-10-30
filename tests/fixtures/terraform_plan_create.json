@@ -292,12 +292,6 @@
         "encrypted": {
          "constant_value": true
         },
-        "tags": {
-         "references": [
-          "local.tags",
-          "var.name"
-         ]
-        },
         "volume_size": {
          "references": [
           "var.disk_gib"
@@ -314,6 +308,12 @@
        ]
       },
       "tags": {
+       "references": [
+        "local.tags",
+        "var.name"
+       ]
+      },
+      "volume_tags": {
        "references": [
         "local.tags",
         "var.name"
@@ -489,7 +489,6 @@
       "private_dns_name_options": [],
       "root_block_device": [
        {
-        "tags": {},
         "tags_all": {}
        }
       ],
@@ -498,6 +497,7 @@
       "security_groups": [],
       "tags": {},
       "tags_all": {},
+      "volume_tags": {},
       "vpc_security_group_ids": []
      },
      "type": "aws_instance",
@@ -530,13 +530,7 @@
        {
         "delete_on_termination": true,
         "encrypted": true,
-        "tags": {
-         "ManagedBy": "unitcompute",
-         "Name": "unitcompute-demo-root",
-         "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
-         "UnitComputeOwner": "0123456789abcdef",
-         "UnitComputeTemplate": "ec2-vm/v1"
-        },
+        "tags": null,
         "volume_size": 8,
         "volume_type": "gp3"
        }
@@ -560,7 +554,13 @@
       "timeouts": null,
       "user_data": null,
       "user_data_replace_on_change": false,
-      "volume_tags": null
+      "volume_tags": {
+       "ManagedBy": "unitcompute",
+       "Name": "unitcompute-demo-root",
+       "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
+       "UnitComputeOwner": "0123456789abcdef",
+       "UnitComputeTemplate": "ec2-vm/v1"
+      }
      }
     },
     {
@@ -642,7 +642,9 @@
   },
   {
    "attribute": [
-    "id"
+    "root_block_device",
+    0,
+    "volume_id"
    ],
    "resource": "aws_instance.vm"
   },
@@ -654,9 +656,7 @@
   },
   {
    "attribute": [
-    "root_block_device",
-    0,
-    "volume_id"
+    "id"
    ],
    "resource": "aws_instance.vm"
   }
@@ -697,13 +697,7 @@
       {
        "delete_on_termination": true,
        "encrypted": true,
-       "tags": {
-        "ManagedBy": "unitcompute",
-        "Name": "unitcompute-demo-root",
-        "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
-        "UnitComputeOwner": "0123456789abcdef",
-        "UnitComputeTemplate": "ec2-vm/v1"
-       },
+       "tags": null,
        "volume_size": 8,
        "volume_type": "gp3"
       }
@@ -727,7 +721,13 @@
      "timeouts": null,
      "user_data": null,
      "user_data_replace_on_change": false,
-     "volume_tags": null
+     "volume_tags": {
+      "ManagedBy": "unitcompute",
+      "Name": "unitcompute-demo-root",
+      "UnitComputeDeployment": "dep_0123456789abcdef0123456789abcdef",
+      "UnitComputeOwner": "0123456789abcdef",
+      "UnitComputeTemplate": "ec2-vm/v1"
+     }
     },
     "after_identity": {
      "account_id": null,
@@ -755,7 +755,6 @@
      "private_dns_name_options": [],
      "root_block_device": [
       {
-       "tags": {},
        "tags_all": {}
       }
      ],
@@ -764,6 +763,7 @@
      "security_groups": [],
      "tags": {},
      "tags_all": {},
+     "volume_tags": {},
      "vpc_security_group_ids": []
     },
     "after_unknown": {
@@ -814,7 +814,6 @@
        "device_name": true,
        "iops": true,
        "kms_key_id": true,
-       "tags": {},
        "tags_all": true,
        "throughput": true,
        "volume_id": true
@@ -828,6 +827,7 @@
      "tags_all": {},
      "tenancy": true,
      "user_data_base64": true,
+     "volume_tags": {},
      "vpc_security_group_ids": true
     },
     "before": null,
