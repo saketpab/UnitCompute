@@ -156,8 +156,11 @@ access to that prefix, and nothing in this repository applies them.
    - the resource IDs in prior state;
    - the cost snapshot and a 15-minute expiry.
 4. Approval, and the worker again just before applying, re-check owner, plan type, expiry,
-   hash, versions, execution binding and job state. Apply runs exactly
-   `terraform apply -input=false tfplan` with apply-role credentials.
+   hash, versions, execution binding and job state. Expiry is judged against a clock read
+   after every wait that precedes the action: after the database write lock is acquired at
+   approval, and in the worker after its evidence and database preparation, inside the
+   transaction that records the start and once more immediately before dispatch. Apply
+   runs exactly `terraform apply -input=false tfplan` with apply-role credentials.
 5. A create is marked `active` only after the instance is found by its tags and by direct
    ID lookup. Its instance, security group and root volume IDs are recorded. Connection
    readiness (both EC2 status checks plus SSM `Online` for that exact instance) is then
@@ -170,8 +173,11 @@ access to that prefix, and nothing in this repository applies them.
 
 Terraform runs with a fixed argument list (`shell=False`), a minimal environment (no
 inherited variables, no shared AWS config files, no IMDS), a separate process group, and a
-timeout that kills the whole group. Logs are capped, redacted and stored with mode `0600`
-under the plan's work directory.
+timeout that kills the whole group. Its output is drained while it runs into bounded
+buffers (stdout up to 8 MiB, which is rejected beyond that, and the last 64 KiB of each
+stream for the log), so a noisy child cannot exhaust the worker's memory and is never killed
+for being noisy. Logs are capped, redacted and stored with mode `0600` under the plan's work
+directory.
 
 ## Recovery
 
@@ -209,6 +215,14 @@ post-apply verification failed.
 In both cases the deployment stays in recovery and keeps its quota. Resolving it is a
 deliberate support decision outside the application, made with the retained work
 directory, the identity evidence and the AWS inventory.
+
+An unproven deletion is never reported as a clean one. If a deployment recorded as
+`deleted` has an open `uncaptured` obligation (for example a schema-4 failed create followed
+by an empty successful deletion), migration 0007 turns it into `recovery_required`. If the
+owner already has a newer live deployment, the one-live-VM unique index keeps the old row
+`deleted`; its obligation stays open, `unitcompute-admin recovery-report` lists it, and
+`POST /deployments` refuses with `409 recovery_required` (`details.deployment_id` names it)
+whenever any of the owner's deployments has an open `uncaptured` obligation.
 
 ### Recovery obligations
 

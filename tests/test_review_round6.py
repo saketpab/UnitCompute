@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,7 @@ from unitcompute.db.database import Database
 from unitcompute.identities import EvidenceBusy, IdentityLedger, identity
 from unitcompute.logging_setup import redact
 from unitcompute.provisioning.base import ApplyResult, DeploymentSpec, ProvisioningError
+from unitcompute.provisioning.runner import TerraformRunner
 from unitcompute.provisioning.simulated import SimulatedProvisioner, raw_state, simulated_lineage
 from unitcompute.provisioning.state_evidence import (
     INSTANCE,
@@ -586,14 +588,21 @@ def test_r6_1_real_terraform_backend_and_fallback_failure_leaves_empty_state(
         parse_raw_state(stored, terraform_version="1.17.1")
 
 
-def test_r6_1_state_command_is_read_only() -> None:
-    from unitcompute.provisioning.runner import ALLOWED_STATE_ARGS, TerraformRunner
+def test_r6_1_state_command_is_read_only(tmp_path: Path) -> None:
+    from unitcompute.provisioning.runner import ALLOWED_STATE_ARGS
 
     assert ALLOWED_STATE_ARGS == ("state", "pull")
-    runner = TerraformRunner(Path("/nonexistent"))
+    ran = tmp_path / "ran"
+    binary = tmp_path / "recording-terraform"
+    binary.write_text(f"#!{sys.executable}\nimport pathlib\npathlib.Path({str(ran)!r}).touch()\n")
+    binary.chmod(0o700)
+    runner = TerraformRunner(binary)
     for args in (["state", "push", "x"], ["state", "rm", "x"], ["state", "mv"], ["state"]):
         with pytest.raises(ValueError, match="not allowed"):
-            runner.run(args, workdir=Path("/tmp"), env={}, timeout=1, log_name="x")
+            runner.run(args, workdir=tmp_path, env={}, timeout=5, log_name="x")
+    assert not ran.exists()  # the binary was never started
+    runner.run(["state", "pull"], workdir=tmp_path, env={}, timeout=5, log_name="x")
+    assert ran.exists()
 
 
 def test_r6_1_signal_exit_is_classified_not_reported_as_a_plain_failure(tmp_path: Path) -> None:
@@ -734,7 +743,7 @@ def test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance(
         replacement,
         [("1", "apply_failed", "recovery_required", _LAUNCH), ("2", "applied", "succeeded", [])],
     )
-    assert db.migrate() == [5, 6]
+    assert db.migrate() == [5, 6, 7]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -773,7 +782,7 @@ def test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance(
         replacement,
         [("1", "applied", "succeeded", _LAUNCH), ("2", "apply_failed", "recovery_required", [])],
     )
-    assert db.migrate() == [5, 6]
+    assert db.migrate() == [5, 6, 7]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:

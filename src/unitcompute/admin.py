@@ -61,7 +61,9 @@ def main(argv: list[str] | None = None) -> int:
             "j.id AS job_id, j.kind, j.status AS job_status, j.error_code "
             "FROM deployments d LEFT JOIN jobs j ON j.id = ("
             "  SELECT id FROM jobs WHERE deployment_id = d.id ORDER BY rowid DESC LIMIT 1) "
-            "WHERE d.status = 'recovery_required' ORDER BY d.updated_at"
+            "WHERE d.status = 'recovery_required' OR EXISTS (SELECT 1 FROM "
+            "recovery_obligations o WHERE o.deployment_id = d.id AND o.discharged_at IS NULL "
+            "AND o.evidence = 'uncaptured') ORDER BY d.updated_at"
         ).fetchall()
     provisioner = build_provisioner(settings) if args.inventory else None
     for row in rows:

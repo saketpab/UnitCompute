@@ -287,7 +287,7 @@ def test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index(
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {}  # shadowed under schema 3
-    assert db.migrate() == [4, 5, 6]
+    assert db.migrate() == [4, 5, 6, 7]
     with db.transaction() as conn:
         ledger.import_evidence(conn, dep)
         assert ledger.known(conn, dep).launch_roots == {iid: {vid}}

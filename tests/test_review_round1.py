@@ -286,7 +286,7 @@ def test_s3_worker_rechecks_execution_config(harness: Harness, field: str) -> No
     assert job is not None
     deployment, plan = worker._load(job)
     with pytest.raises(JobFailure) as exc:
-        worker._precheck_apply(job, deployment, plan, harness.clock())
+        worker._precheck_apply(job, deployment, plan)
     assert exc.value.code == "plan_stale"
 
 

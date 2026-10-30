@@ -3,14 +3,19 @@
     uv run python scripts/check_guards.py [--only NAME ...]
 
 Each mutation edits a copy of ``src/`` and runs the named tests against it. A mutation
-that still passes ("SURVIVED") means the guard is not actually tested. Exit status is
-non-zero if any mutation survives or no longer applies.
+that still passes ("SURVIVED") means the guard is not actually tested. A failing run only
+counts as KILLED when it fails for the intended reason: if the output shows an error that a
+broken mutant would cause (invalid SQL, a syntax or name error, a type error) the mutant is
+reported as "BROKEN-MUTANT" unless the mutation lists that error in ``allow``, and a mutation
+may require a pattern in the output with ``expect``. Exit status is non-zero if any
+mutation survives, is broken or no longer applies.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +31,15 @@ class Mutation:
     name: str
     edits: tuple[tuple[str, str, str], ...]  # (path under src/unitcompute, old, new)
     tests: tuple[str, ...]
+    expect: str = ""  # regex that must appear in the failing output (the intended reason)
+    allow: tuple[str, ...] = ()  # error names that this mutation legitimately produces
+
+
+# Errors a mutant produces when the edit itself is invalid rather than the guard missing.
+BROKEN_MUTANT_ERRORS = re.compile(
+    r"\b(OperationalError(?!: database is locked)|SyntaxError|IndentationError|NameError|UnboundLocalError|"
+    r"ImportError|ModuleNotFoundError|AttributeError|TypeError)\b"
+)
 
 
 SVC = "services/deployments.py"
@@ -99,11 +113,6 @@ MUTATIONS = [
         "worker-hash",
         ((WORKER, 'if sha256_file(plan_path) != plan["plan_hash"]:', "if False:"),),
         ("tests/test_approval.py::test_worker_rejects_plan_file_modified_after_approval",),
-    ),
-    Mutation(
-        "worker-expiry",
-        ((WORKER, 'if from_db_time(plan["expires_at"]) <= now:', "if False:"),),
-        ("tests/test_approval.py::test_worker_rejects_plan_that_expired_in_queue",),
     ),
     Mutation(
         "worker-approver",
@@ -180,12 +189,12 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                "                        \"UPDATE agent_attempts SET status = 'failed', "
-                'idempotency_key = NULL, "',
-                '                        "DELETE FROM agent_attempts WHERE 1 = 1 OR "',
+                "                        \"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"\n                        \"finished_at = ? WHERE id = ? AND status = 'reserved'\",\n                        (to_db_time(utcnow()), attempt_id),\n",
+                "                        \"DELETE FROM agent_attempts WHERE id = ? AND status = 'reserved'\",\n                        (attempt_id,),\n",
             ),
         ),
         ("tests/test_review_round1.py::test_r3_failed_attempts_stay_counted",),
+        expect="rate_limited",
     ),
     Mutation(
         "r6-chat-idempotency",
@@ -653,6 +662,8 @@ MUTATIONS = [
         (
             "tests/test_review_round5.py::test_r5_3_malformed_evidence_does_not_stop_worker_recovery",
         ),
+        expect="NoneType' object has no attribute 'get'",
+        allow=("AttributeError",),
     ),
     Mutation(
         "r5-corrupt-obligation",
@@ -1316,6 +1327,155 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "worker-expiry",
+        (
+            (
+                "worker.py",
+                'if from_db_time(plan["expires_at"]) <= self.clock():',
+                "if False:",
+            ),
+        ),
+        (
+            "tests/test_approval.py::test_worker_rejects_plan_that_expired_in_queue",
+            "tests/test_review_round7.py::test_r7_2_worker_rejects_a_plan_that_expired_during_the_evidence_import",
+        ),
+    ),
+    Mutation(
+        "r7-expiry-in-transaction",
+        (
+            (
+                "worker.py",
+                "                self._require_unexpired(plan)\n                conn.execute(",
+                "                conn.execute(",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_2_worker_rejects_a_plan_that_expired_while_waiting_for_the_write_lock",
+        ),
+    ),
+    Mutation(
+        "r7-expiry-before-dispatch",
+        (
+            (
+                "worker.py",
+                "            self._require_unexpired(plan)  # and once more immediately before dispatch\n",
+                "",
+            ),
+        ),
+        ("tests/test_review_round7.py::test_r7_2_worker_rechecks_immediately_before_dispatch",),
+    ),
+    Mutation(
+        "r7-approve-time-after-lock",
+        (
+            (
+                "services/deployments.py",
+                "        with self._db.transaction() as conn:\n            # Sampled only after the write lock is held",
+                "        stale_dt = self._clock()\n        with self._db.transaction() as conn:\n            # Sampled only after the write lock is held",
+            ),
+            (
+                "services/deployments.py",
+                "            now_dt = self._clock()\n            now = to_db_time(now_dt)\n            replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)\n            if replay:\n                return replay\n            deployment = self._owned_deployment(conn, principal, deployment_id)",
+                "            now_dt = stale_dt\n            now = to_db_time(now_dt)\n            replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)\n            if replay:\n                return replay\n            deployment = self._owned_deployment(conn, principal, deployment_id)",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_2_approval_time_is_sampled_after_the_transaction_wait",
+            "tests/test_review_round7.py::test_r7_2_approval_with_a_real_sqlite_lock_wait",
+        ),
+    ),
+    Mutation(
+        "r7-quota-unproven-obligation",
+        (
+            (
+                "services/deployments.py",
+                "            if unproven is not None:",
+                "            if False:",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_1_runtime_open_uncaptured_obligation_blocks_reservation",
+            "tests/test_review_round7.py::test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_visible",
+        ),
+    ),
+    Mutation(
+        "r7-migration-surfaces-deleted",
+        (
+            (
+                "db/migrations/0007_deleted_with_open_obligation.sql",
+                "UPDATE deployments SET status = 'recovery_required'",
+                "UPDATE deployments SET status = 'deleted'",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_1_deleted_deployment_with_unproven_obligation_becomes_recovery_required",
+        ),
+    ),
+    Mutation(
+        "r7-migration-respects-live-slot",
+        (
+            (
+                "db/migrations/0007_deleted_with_open_obligation.sql",
+                "AND live.status <> 'deleted'",
+                "AND live.status = 'nonexistent'",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_visible",
+        ),
+        expect="UNIQUE constraint failed",
+    ),
+    Mutation(
+        "r7-admin-lists-deleted",
+        (
+            (
+                "admin.py",
+                "WHERE d.status = 'recovery_required' OR EXISTS",
+                "WHERE d.status = 'recovery_required' AND EXISTS",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_1_owner_with_a_newer_deployment_keeps_both_rows_and_the_obligation_visible",
+        ),
+    ),
+    Mutation(
+        "r7-runner-stdout-bounded",
+        (
+            (
+                "provisioning/runner.py",
+                "head_limit=MAX_STDOUT_BYTES + 1",
+                "head_limit=1 << 40",
+            ),
+        ),
+        ("tests/test_review_round7.py::test_r7_3_oversized_stdout_is_bounded_and_still_rejected",),
+        expect="peak",
+    ),
+    Mutation(
+        "r7-runner-tail-bounded",
+        (
+            (
+                "provisioning/runner.py",
+                "            del self._tail[:-MAX_LOG_BYTES]\n",
+                "            pass\n",
+            ),
+        ),
+        ("tests/test_review_round7.py::test_r7_3_noisy_stderr_is_bounded",),
+        expect="peak",
+    ),
+    Mutation(
+        "r7-runner-pipes-held-open",
+        (
+            (
+                "provisioning/runner.py",
+                "                if reader.is_alive():\n                    raise subprocess.TimeoutExpired(command, timeout)\n",
+                "                if False:\n                    raise subprocess.TimeoutExpired(command, timeout)\n",
+            ),
+        ),
+        (
+            "tests/test_review_round7.py::test_r7_3_a_lingering_grandchild_holding_the_pipes_is_a_timeout",
+        ),
+        expect="DID NOT RAISE",
+    ),
+    Mutation(
         "policy-imdsv2",
         ((POLICY, 'metadata.get("http_tokens") == "required"', "True"),),
         ("tests/test_policy.py::test_policy_rejects_mutation[imdsv1]",),
@@ -1402,7 +1562,7 @@ MUTATIONS = [
 ]
 
 
-def run(mutation: Mutation, workspace: Path) -> str:
+def run(mutation: Mutation, workspace: Path, verbose: bool = False) -> str:
     src = workspace / "src"
     shutil.rmtree(src, ignore_errors=True)
     shutil.copytree(ROOT / "src", src)
@@ -1424,14 +1584,29 @@ def run(mutation: Mutation, workspace: Path) -> str:
     )
     # pytest exits 1 when tests ran and failed. Any other non-zero code (collection error,
     # unknown test ID, no tests collected) proves nothing about the guard.
-    if result.returncode == 1:
-        return "KILLED"
-    return "SURVIVED" if result.returncode == 0 else f"BROKEN({result.returncode})"
+    if result.returncode == 0:
+        return "SURVIVED"
+    if result.returncode != 1:
+        return f"BROKEN({result.returncode})"
+    output = result.stdout + result.stderr
+    errors = {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(output)} - set(mutation.allow)
+    if errors:
+        if verbose:
+            for line in output.splitlines():
+                if BROKEN_MUTANT_ERRORS.search(line) and not line.lstrip().startswith("def "):
+                    print(f"      | {line.strip()[:200]}")
+        return "BROKEN-MUTANT(" + ",".join(sorted(errors)) + ")"
+    if mutation.expect and not re.search(mutation.expect, output):
+        return "WRONG-REASON"
+    return "KILLED"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", nargs="*")
+    parser.add_argument(
+        "--verbose", action="store_true", help="print the error lines of broken mutants"
+    )
     args = parser.parse_args()
     selected = [m for m in MUTATIONS if not args.only or m.name in args.only]
     failures = 0
@@ -1448,7 +1623,7 @@ def main() -> int:
             print(f"mutants would not be imported (got {probe.stdout.strip()})")
             return 2
         for mutation in selected:
-            outcome = run(mutation, Path(tmp))
+            outcome = run(mutation, Path(tmp), args.verbose)
             failures += outcome != "KILLED"
             print(f"{outcome:15} {mutation.name}")
     print(f"{len(selected) - failures}/{len(selected)} guards proven by a failing test")

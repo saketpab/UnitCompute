@@ -700,7 +700,7 @@ def _schema_v1_deployment(
             "?, ?)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3, 4, 5, 6]
+    assert db.migrate() == [2, 3, 4, 5, 6, 7]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
@@ -733,7 +733,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3, 4, 5, 6]
+    assert db.migrate() == [3, 4, 5, 6, 7]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}

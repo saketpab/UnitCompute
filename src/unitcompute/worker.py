@@ -22,7 +22,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -684,9 +684,7 @@ class Worker:
         merged = {r.resource_id: r for r in [*tagged, *live]}
         return list(merged.values())
 
-    def _precheck_apply(
-        self, job: sqlite3.Row, deployment: sqlite3.Row, plan: sqlite3.Row, now: datetime
-    ) -> Path:
+    def _precheck_apply(self, job: sqlite3.Row, deployment: sqlite3.Row, plan: sqlite3.Row) -> Path:
         if (
             plan["status"] != "approved"
             or deployment["current_plan_id"] != plan["id"]
@@ -698,12 +696,6 @@ class Worker:
         expected_status = "applying" if plan["kind"] == "create" else "deleting"
         if deployment["status"] != expected_status:
             raise JobFailure("invalid_state", "The deployment is not awaiting this apply.")
-        if from_db_time(plan["expires_at"]) <= now:
-            raise JobFailure(
-                "plan_expired",
-                "The approved plan expired before it could run; "
-                "request a fresh preview and approve it.",
-            )
         expected = expected_versions(self.provisioner.kind)
         runtime = self.provisioner.runtime_versions()
         actual = {
@@ -738,37 +730,48 @@ class Worker:
         self._require_no_uncaptured(deployment["id"])
         return plan_path
 
+    def _require_unexpired(self, plan: sqlite3.Row) -> None:
+        if from_db_time(plan["expires_at"]) <= self.clock():
+            raise JobFailure(
+                "plan_expired",
+                "The approved plan expired before it could run; "
+                "request a fresh preview and approve it.",
+            )
+
     def process_apply(self, job: sqlite3.Row) -> None:
         deployment, plan = self._load(job)
         spec = self._spec(deployment)
         try:
-            plan_path = self._precheck_apply(job, deployment, plan, self.clock())
+            plan_path = self._precheck_apply(job, deployment, plan)
+            with self._tx() as conn:
+                # The precheck can block (evidence lock, database retries); judge expiry again
+                # now that the write lock is held, before recording that an apply starts.
+                self._require_unexpired(plan)
+                conn.execute(
+                    "UPDATE deployments SET apply_attempted = 1, "
+                    "ami_id = COALESCE(?, ami_id), updated_at = ? WHERE id = ?",
+                    (
+                        plan["ami_id"] if plan["kind"] == "create" else None,
+                        to_db_time(self.clock()),
+                        deployment["id"],
+                    ),
+                )
+                record_audit(
+                    conn,
+                    actor=ACTOR,
+                    action="apply.started",
+                    deployment_id=deployment["id"],
+                    plan_id=plan["id"],
+                    job_id=job["id"],
+                    detail={"kind": plan["kind"], "plan_hash": plan["plan_hash"]},
+                )
+            self._require_unexpired(plan)  # and once more immediately before dispatch
         except (JobFailure, ProvisioningError) as exc:
             code = exc.code
             message = exc.message if isinstance(exc, JobFailure) else exc.safe_message
             with self._tx() as conn:
                 self._finish_plan_failure(conn, job, code, message)
             return
-
-        with self._tx() as conn:
-            conn.execute(
-                "UPDATE deployments SET apply_attempted = 1, "
-                "ami_id = COALESCE(?, ami_id), updated_at = ? WHERE id = ?",
-                (
-                    plan["ami_id"] if plan["kind"] == "create" else None,
-                    to_db_time(self.clock()),
-                    deployment["id"],
-                ),
-            )
-            record_audit(
-                conn,
-                actor=ACTOR,
-                action="apply.started",
-                deployment_id=deployment["id"],
-                plan_id=plan["id"],
-                job_id=job["id"],
-                detail={"kind": plan["kind"], "plan_hash": plan["plan_hash"]},
-            )
 
         try:
             outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)

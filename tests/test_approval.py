@@ -146,7 +146,7 @@ def test_worker_rejects_plan_that_expired_in_queue(harness: Harness) -> None:
     harness.clock.advance(minutes=2)
     harness.drain()
     after = harness.client.get(f"/deployments/{detail['id']}", headers=auth()).json()
-    assert after["latest_job"]["error"]["code"] == "plan_expired"
+    assert (after["latest_job"]["error"] or {}).get("code") == "plan_expired"
     assert harness.provisioner.owned_resources(detail["id"]) == []
 
 
@@ -160,7 +160,7 @@ def test_worker_rejects_approval_by_someone_else(harness: Harness) -> None:
         )
     harness.drain()
     after = harness.client.get(f"/deployments/{detail['id']}", headers=auth()).json()
-    assert after["latest_job"]["error"]["code"] == "plan_not_approved"
+    assert (after["latest_job"]["error"] or {}).get("code") == "plan_not_approved"
     assert harness.provisioner.owned_resources(detail["id"]) == []
 
 

@@ -101,7 +101,7 @@ All errors share one shape:
 | 401 | Missing, invalid or expired token (`WWW-Authenticate: Bearer`) |
 | 403 | Valid token, but not a member of the team group |
 | 404 | Not found **or not yours**; the two cases are indistinguishable by design |
-| 409 | Conflict: `quota_exceeded`, `job_in_progress`, `invalid_state`, `idempotency_key_reused`, `idempotency_in_progress`, plan errors above, `session_turn_limit` |
+| 409 | Conflict: `quota_exceeded`, `recovery_required` (an earlier deployment of yours has an unverified deletion; needs support), `job_in_progress`, `invalid_state`, `idempotency_key_reused`, `idempotency_in_progress`, plan errors above, `session_turn_limit` |
 | 413 | Body larger than `UNITCOMPUTE_MAX_REQUEST_BYTES` (default 16 KiB) |
 | 422 | Invalid input, including unknown fields. Input values are not echoed back. |
 | 429 | `rate_limited`: assistant daily cap per user (`UNITCOMPUTE_AGENT_MAX_MESSAGES_PER_DAY`). Every model attempt counts, including failed, timed-out and cancelled ones. |

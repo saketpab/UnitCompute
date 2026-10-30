@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). Round-6 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5 on `33602aa`: **not clean**. Round 6 on `b5341db`: **not clean**. Round 7 on `5756293`: **not clean**. Round 8: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). `33602aa`: passed ([run 41022275602](https://github.com/saketpab/UnitCompute/actions/runs/41022275602)). `b5341db`: passed ([run 41052612031](https://github.com/saketpab/UnitCompute/actions/runs/41052612031)). `5756293`: passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)). Round-7 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -473,7 +473,7 @@ Changed test expectations (each stricter or equivalent):
   rejected for a different reason, an audit test that scanned the checkout instead of the
   imported package, and two redundant validation layers); each was fixed, not excused.
 
-## Round 6 fix commit (parent `b5341db`)
+## Round 6 fix commit: `57562930a04b6a718db5c05f9266ddf204e019d2` (parent `b5341db`)
 
 | Check | Result |
 |---|---|
@@ -493,3 +493,68 @@ even if its recorded root was in fact the launch root. Redaction is pattern-base
 behaviour of root mappings, replaced roots, `terraform state pull` against S3 and Terraform
 being killed mid-apply remains part of the blocked live gate. Offline Terraform, simulator
 and moto evidence do not prove AWS behaviour.
+
+## Candidate 7: `57562930a04b6a718db5c05f9266ddf204e019d2`
+
+| Check | Result |
+|---|---|
+| Safe CI on the exact commit | passed ([run 41097901151](https://github.com/saketpab/UnitCompute/actions/runs/41097901151)) |
+| Sol Medium security review | **not clean** |
+| Sol Medium reliability review | **not clean** |
+
+Four unique findings; both reviewers independently confirmed the frozen HEAD, the CI run
+and 449 passing tests. Implementation: native Claude Sonnet 5.5 (high), at the user's request.
+
+## Round 7 findings → fixes → tests
+
+Reviewer reproductions (`test_independent_reliability.py`, `test_independent.py`,
+`runner-memory-repro.py`) were run unchanged in isolated copies. On `5756293` all six tests
+fail (each asserts the safe outcome) and the memory script reports a 201 MB traced peak. On
+the fix tree the five expiry tests pass and the script's peak is 0.4 MB. The migration
+reproduction asserts `db.migrate() == [5, 6]` and then expects a second reservation to be
+accepted; on the fix tree the migration list is `[5, 6, 7]` and the reservation is refused,
+which is the intended behaviour (the deployment is `recovery_required`).
+
+| ID | Finding | Fix | Regression tests (`tests/test_review_round7.py`) | Mutants |
+|---|---|---|---|---|
+| R7-1 (P1) | Migration 0006 reopened an `uncaptured` obligation on a `deleted` deployment but left it `deleted`; `create_deployment` ignored obligations, so a second VM could be reserved | Migration 0007 turns such a deployment into `recovery_required` (one row per owner, the newest, because the one-live-VM unique index forbids more). An owner who already has a newer live deployment keeps the old row `deleted`: the migration does not fail, the obligation stays open and `recovery-report` lists it. `POST /deployments` refuses with `409 recovery_required` whenever any of the owner's deployments has an open `uncaptured` obligation | `test_r7_1_*` (reviewer's schema-4 history; owner with a newer deployment, including after it is deleted; two deleted rows; unaffected owners; runtime guard independent of the migration) | `r7-migration-surfaces-deleted`, `r7-migration-respects-live-slot`, `r7-quota-unproven-obligation`, `r7-admin-lists-deleted` |
+| R7-2 (P2) | Approval sampled the clock before acquiring SQLite; the worker checked expiry before its blocking evidence import and never again | Approval samples after the write lock is held. The worker has one expiry helper called inside the `apply.started` transaction (after the precheck's waits, before anything is recorded) and once more immediately before dispatch; the early duplicate check was removed | `test_r7_2_*` (injected-clock waits at the import, before the write lock and during the commit; **real** 1.5 s `flock` and real 1.5 s SQLite lock with a monotonic clock starting 0.5 s before expiry; the in-window boundary still applies) | `worker-expiry`, `r7-expiry-in-transaction`, `r7-expiry-before-dispatch`, `r7-approve-time-after-lock` |
+| R7-3 (P2) | `communicate()` buffered both streams completely: 64 MiB of stderr cost about 201 MB | Two reader threads drain both pipes as they are written into bounded buffers (stdout head up to the 8 MiB limit, a 64 KiB tail per stream for the log). A noisy child is never killed. Timeout, group kill, signal exit codes, and the oversize-stdout rejection are unchanged; a descendant holding the pipes open after the child exits is a timeout | `test_r7_3_*` (traced peak < 4 MiB for 64 MiB stderr; oversized stdout bounded and rejected; intact JSON; both streams full; timeout with a grandchild; lingering grandchild; `-9` exit code) | `r7-runner-stdout-bounded`, `r7-runner-tail-bounded`, `r7-runner-pipes-held-open` |
+| R7-4 (P2) | The mutant `r3-failed-attempts-counted` rewrote the statement into invalid SQL; the runner counted the resulting failure as a kill | Corrected to a valid deletion of the attempt row (statement and parameters), which fails the rate-limit assertion. The runner now checks the *reason* (below) | `test_r7_4_*` (the old broken mutant is reported `BROKEN-MUTANT(OperationalError)`; the valid one is `KILLED`; a wrong `expect` is `WRONG-REASON`; every edit in the inventory still compiles) | `r3-failed-attempts-counted` (now with `expect="rate_limited"`) |
+
+**Mutant-runner audit.** `scripts/check_guards.py` now treats a failing run as a kill only if
+the output contains no error that an invalid mutant would cause (invalid SQL, syntax, name,
+type and attribute errors; `database is locked` is exempt because several guards exist to
+handle it), and a mutation may require a pattern (`expect`) and list errors it legitimately
+produces (`allow`). Running the whole inventory under the new rule found nine more
+mutants whose failure was not the intended one: `worker-approver` and `worker-expiry` (the test
+indexed `None` after the guard was removed; both tests now assert cleanly),
+`r6-state-command-read-only` (it failed inside `Popen`; the test now uses a recording binary),
+`r5-corruption-isolation` (it fails with the original defect, an `AttributeError` on a JSON
+`null` record, so it now declares that), and five lock-contention guards (`database is locked` is
+their subject). `worker-expiry` also survived once the early duplicate check was removed and was
+retargeted to the single helper. A first pass at the new mutants found `r7-expiry-before-dispatch`
+survived because the test's clock advanced one transaction too early; the test now advances time
+precisely after the in-transaction check. All 132 earlier mutants are retained; 11 are new.
+
+Changed test expectations: migration lists include schema 7; `_precheck_apply` no longer takes a
+clock argument (one caller in the round-1 tests); `test_worker_rejects_approval_by_someone_else`
+and `test_worker_rejects_plan_that_expired_in_queue` assert `(error or {}).get("code")` so a
+removed guard fails cleanly.
+
+## Round 7 fix commit (parent `5756293`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check`, `uv sync --locked` | passed |
+| `pytest` with offline Terraform tests required | 472 passed |
+| `scripts/check_guards.py --verbose` | 142/142 mutants killed for the intended reason in one full run. All referenced test IDs collect and every mutation applies exactly once |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–7), and an **upgrade** of a schema-6 data dir seeded with a deleted deployment holding an open `uncaptured` obligation (`applied: [7]`): it became `recovery_required`, its owner's new reservation was refused, `recovery-report` listed it, another owner's lifecycle exited 0. In all runs `/readyz` was 503 without a worker and 200 with one, a second worker was refused and the worker stopped on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+
+Residual limits: unchanged from round 6. In addition, the final pre-dispatch expiry check
+cannot cover time that passes between that check and `terraform apply` starting; a plan that
+expires in that interval still applies, which the 15-minute window tolerates. For an owner
+with a newer live deployment, the old unproven deletion is visible to operators and blocks new
+reservations but is not shown as a status of the old row.

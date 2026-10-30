@@ -352,6 +352,21 @@ class DeploymentService:
                     code="quota_exceeded",
                     details={"deployment_id": live["id"]},
                 )
+            unproven = conn.execute(
+                "SELECT o.deployment_id FROM recovery_obligations o "
+                "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = ? "
+                "AND o.discharged_at IS NULL AND o.evidence = 'uncaptured' ORDER BY o.id LIMIT 1",
+                (principal.subject,),
+            ).fetchone()
+            if unproven is not None:
+                # An earlier apply's effects were never established, even if that deployment
+                # is recorded as deleted: its AWS resources may exist and be billable.
+                raise Conflict(
+                    "An earlier deployment may still hold AWS resources that could not be "
+                    "verified; it needs a support decision before you can create another.",
+                    code="recovery_required",
+                    details={"deployment_id": unproven["deployment_id"]},
+                )
             deployment_id = new_id("dep")
             now = to_db_time(self._clock())
             try:
@@ -467,9 +482,11 @@ class DeploymentService:
         provisioner = self._require_provisioning()
         scope = f"POST /deployments/{deployment_id}/approve"
         payload_hash = canonical_hash({"scope": scope, "body": approval.model_dump()})
-        now_dt = self._clock()
-        now = to_db_time(now_dt)
         with self._db.transaction() as conn:
+            # Sampled only after the write lock is held: acquiring it can wait for seconds, and
+            # approval must be judged at the moment it is recorded, not when it was requested.
+            now_dt = self._clock()
+            now = to_db_time(now_dt)
             replay = self._idempotent_replay(conn, principal, scope, idempotency_key, payload_hash)
             if replay:
                 return replay

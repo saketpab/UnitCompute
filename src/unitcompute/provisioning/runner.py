@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
 import subprocess
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from unitcompute.durable import ensure_directory
 from unitcompute.logging_setup import redact
@@ -25,6 +29,37 @@ MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 64 * 1024
 KILL_GRACE_SECONDS = 30
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+class _Capture:
+    """Bounded capture of one stream: the first ``head_limit`` bytes, the last
+    ``MAX_LOG_BYTES`` bytes, and the total length."""
+
+    def __init__(self, head_limit: int) -> None:
+        self.head_limit = head_limit
+        self.head = bytearray()
+        self._tail = bytearray()
+        self.total = 0
+
+    def add(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        room = self.head_limit - len(self.head)
+        if room > 0:
+            self.head += chunk[:room]
+        self._tail += chunk
+        if len(self._tail) > 2 * MAX_LOG_BYTES:
+            del self._tail[:-MAX_LOG_BYTES]
+
+    def tail_bytes(self) -> bytes:
+        return bytes(self._tail[-MAX_LOG_BYTES:])
+
+
+def _drain(stream: IO[bytes], capture: _Capture) -> None:
+    try:
+        while chunk := stream.read1(65536):  # type: ignore[attr-defined]
+            capture.add(chunk)
+    except (OSError, ValueError):
+        pass  # the pipe was closed under us (timeout path)
 
 
 @dataclass(frozen=True)
@@ -97,35 +132,62 @@ class TerraformRunner:
             raise ProvisioningError(
                 "terraform_unavailable", "The Terraform binary could not be started."
             ) from exc
+        # Both pipes are drained as they are written, into bounded buffers (stdout up to the
+        # output limit, plus a tail of each stream for the log), so a runaway child cannot
+        # exhaust this process's memory. The child is never killed for being noisy: stopping
+        # an apply mid-flight is worse than discarding its excess output.
+        stdout_pipe, stderr_pipe = process.stdout, process.stderr
+        if stdout_pipe is None or stderr_pipe is None:
+            raise RuntimeError("Terraform pipes were not created")
+        out = _Capture(head_limit=MAX_STDOUT_BYTES + 1)
+        err = _Capture(head_limit=0)
+        readers = [
+            threading.Thread(target=_drain, args=(stdout_pipe, out), daemon=True),
+            threading.Thread(target=_drain, args=(stderr_pipe, err), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
         try:
-            stdout_b, stderr_b = process.communicate(timeout=timeout)
+            process.wait(timeout=timeout)
+            for reader in readers:  # EOF only once nothing else holds the pipes
+                reader.join(timeout=max(0.0, deadline - time.monotonic()))
+                if reader.is_alive():
+                    raise subprocess.TimeoutExpired(command, timeout)
         except subprocess.TimeoutExpired:
             self._terminate(process)
+            for reader in readers:
+                reader.join(timeout=5)
             self._write_log(workdir, log_name, b"", b"terminated after timeout", secrets)
             raise ProvisioningTimeout(
                 "terraform_timeout", f"terraform {args[0]} exceeded its {int(timeout)}s limit."
             ) from None
-        self._write_log(workdir, log_name, stdout_b, stderr_b, secrets)
-        if len(stdout_b) > MAX_STDOUT_BYTES:
+        self._write_log(workdir, log_name, out.tail_bytes(), err.tail_bytes(), secrets)
+        if out.total > MAX_STDOUT_BYTES:
             raise ProvisioningError("terraform_output_too_large", "Terraform output was too large.")
         return RunResult(
             returncode=process.returncode,
-            stdout=stdout_b.decode("utf-8", "replace"),
-            stderr=redact(stderr_b.decode("utf-8", "replace")[-MAX_LOG_BYTES:], secrets),
+            stdout=bytes(out.head).decode("utf-8", "replace"),
+            stderr=redact(err.tail_bytes().decode("utf-8", "replace"), secrets),
         )
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:
-        for sig, wait in ((signal.SIGINT, KILL_GRACE_SECONDS), (signal.SIGKILL, 10)):
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                return
-            try:
-                process.communicate(timeout=wait)
-                return
-            except subprocess.TimeoutExpired:
-                continue
+        try:
+            for sig, wait in ((signal.SIGINT, KILL_GRACE_SECONDS), (signal.SIGKILL, 10)):
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    return
+                try:
+                    process.wait(timeout=wait)
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            # Anything left in the process group would keep the pipes open.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
 
     @staticmethod
     def _write_log(
