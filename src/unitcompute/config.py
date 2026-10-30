@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     auth_algorithms: Annotated[tuple[str, ...], NoDecode] = ("RS256",)
     auth_required_group: str | None = None
     auth_groups_claim: str = "groups"
+    auth_jwks_cache_seconds: int = Field(default=300, ge=30, le=3600)
 
     cors_origins: Annotated[tuple[str, ...], NoDecode] = ()
     max_request_bytes: int = Field(default=16 * 1024, ge=1024, le=1024 * 1024)

@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from unitcompute.config import Settings
-from unitcompute.provisioning.aws import AwsEnvironment, TemporaryCredentials
+from unitcompute.provisioning.aws import (
+    AwsEnvironment,
+    TemporaryCredentials,
+    packed_session_policy,
+)
 from unitcompute.provisioning.base import (
     TEMPLATE_VERSION,
     ApplyResult,
@@ -144,7 +148,9 @@ class TerraformProvisioner:
         self, spec: DeploymentSpec, kind: PlanKind, workdir: Path, frozen_ami_id: str | None
     ) -> PlanResult:
         versions = self.runtime_versions()
-        creds = self._aws.credentials("plan", f"uc-plan-{spec.deployment_id[4:20]}")
+        creds = self._aws.credentials(
+            "plan", f"uc-plan-{spec.deployment_id[4:20]}", spec.deployment_id
+        )
         account_id = self._aws.account_id(creds)
         ami_id = frozen_ami_id or self._aws.resolve_ami(creds)
         prepare_workdir(workdir, build_tfvars(spec, self.network_targets(), ami_id))
@@ -205,7 +211,9 @@ class TerraformProvisioner:
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult:
         if plan_path != workdir / PLAN_FILE:
             raise ProvisioningError("plan_path_invalid", "Plan file is not in its work directory.")
-        creds = self._aws.credentials("apply", f"uc-apply-{spec.deployment_id[4:20]}")
+        creds = self._aws.credentials(
+            "apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id
+        )
         timeout = self._settings.apply_timeout_seconds
         self._run(
             ["apply", "-input=false", "-no-color", "-lock-timeout=60s", PLAN_FILE],
@@ -242,12 +250,19 @@ class TerraformProvisioner:
         creds = self._aws.credentials("plan", "uc-verify-ids")
         return self._aws.find_resources(resource_ids, creds)
 
+    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[str]]:
+        creds = self._aws.credentials("plan", "uc-verify-volumes")
+        return self._aws.instance_volumes(instance_ids, creds)
+
     def connection_readiness(self, instance_id: str) -> Readiness:
         creds = self._aws.credentials("plan", "uc-readiness")
         return self._aws.connection_readiness(instance_id, creds)
 
     def self_check(self) -> dict[str, Any]:
         versions = self.runtime_versions()
+        probe = "dep_" + "0" * 32  # deployment IDs have a fixed length
+        for role in ("plan", "apply"):
+            packed_session_policy(self._settings, role, probe)
         plan_identity = self._aws.verify_role_identity("plan")
         apply_identity = self._aws.verify_role_identity("apply")
         if plan_identity["role"] == apply_identity["role"]:

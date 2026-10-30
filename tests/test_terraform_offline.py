@@ -216,6 +216,8 @@ def test_iam_examples_isolate_bootstrap_state() -> None:
             for r in ([st["Resource"]] if isinstance(st["Resource"], str) else st["Resource"])
             if r.startswith("arn:aws:s3:::")
         ]
-        state = f"{bucket}/deployments/*/terraform.tfstate"
+        state = (
+            f"{bucket}/deployments/${{aws:PrincipalTag/UnitComputeDeployment}}/terraform.tfstate"
+        )
         assert allowed
         assert all(r in (bucket, state, f"{state}.tflock") for r in allowed)

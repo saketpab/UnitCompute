@@ -7,6 +7,7 @@ long-lived keys are created or stored by the application.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -63,6 +64,122 @@ class TemporaryCredentials:
 SessionFactory = Callable[..., Any]
 
 
+MAX_SESSION_POLICY_CHARS = 2048
+_DEPLOYMENT_ID = re.compile(r"^dep_[0-9a-f]{32}$")
+
+
+def session_policy(
+    settings: Settings, role: Literal["plan", "apply"], deployment_id: str | None
+) -> dict[str, Any]:
+    """Inline STS session policy; effective permissions are role policy AND this policy."""
+    region, account = settings.aws_region, settings.aws_account_id
+    read = {
+        "Effect": "Allow",
+        "Action": ["ec2:Describe*", "ssm:DescribeInstanceInformation"],
+        "Resource": "*",
+    }
+    if deployment_id is None:
+        if role == "apply":
+            return {
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Deny", "Action": "*", "Resource": "*"}],
+            }
+        ami = {
+            "Effect": "Allow",
+            "Action": "ssm:GetParameter",
+            "Resource": f"arn:aws:ssm:{region}::parameter{AL2023_AMI_PARAMETER}",
+        }
+        return {"Version": "2012-10-17", "Statement": [read, ami]}
+    if not _DEPLOYMENT_ID.fullmatch(deployment_id):
+        raise ProvisioningError("invalid_identifier", "Invalid deployment identifier.")
+    bucket = f"arn:aws:s3:::{settings.state_bucket}"
+    state = f"{bucket}/deployments/{deployment_id}/terraform.tfstate"
+    tag = {f"aws:RequestTag/{TAG_DEPLOYMENT}": deployment_id}
+    owned = {f"ec2:ResourceTag/{TAG_DEPLOYMENT}": deployment_id}
+    ec2 = f"arn:aws:ec2:{region}:{account}"
+    statements: list[dict[str, Any]] = [
+        read,
+        {
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": bucket,
+            "Condition": {"StringLike": {"s3:prefix": f"deployments/{deployment_id}/*"}},
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"] if role == "plan" else ["s3:GetObject", "s3:PutObject"],
+            "Resource": state,
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+            "Resource": f"{state}.tflock",
+        },
+    ]
+    if role == "plan":
+        statements.append(
+            {
+                "Effect": "Allow",
+                "Action": "ssm:GetParameter",
+                "Resource": f"arn:aws:ssm:{region}::parameter{AL2023_AMI_PARAMETER}",
+            }
+        )
+        return {"Version": "2012-10-17", "Statement": statements}
+    statements += [
+        {
+            # New VM, root volume and security group must carry this deployment's tag.
+            "Effect": "Allow",
+            "Action": ["ec2:RunInstances", "ec2:CreateTags", "ec2:CreateSecurityGroup"],
+            "Resource": [f"{ec2}:instance/*", f"{ec2}:volume/*", f"{ec2}:security-group/*"],
+            "Condition": {"StringEquals": tag},
+        },
+        {
+            "Effect": "Allow",
+            "Action": "ec2:RunInstances",
+            "Resource": [
+                f"arn:aws:ec2:{region}::image/*",
+                f"{ec2}:subnet/{settings.subnet_id}",
+                f"{ec2}:network-interface/*",
+            ],
+        },
+        {
+            "Effect": "Allow",
+            "Action": "ec2:CreateSecurityGroup",
+            "Resource": f"{ec2}:vpc/{settings.vpc_id}",
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:RunInstances",
+                "ec2:TerminateInstances",
+                "ec2:DeleteSecurityGroup",
+                "ec2:AuthorizeSecurityGroupEgress",
+                "ec2:RevokeSecurityGroupEgress",
+                "ec2:RevokeSecurityGroupIngress",
+                "ec2:ModifyInstanceCreditSpecification",
+                "ec2:ModifyInstanceMetadataOptions",
+            ],
+            "Resource": [f"{ec2}:instance/*", f"{ec2}:security-group/*"],
+            "Condition": {"StringEquals": owned},
+        },
+        {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+    ]
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
+def packed_session_policy(
+    settings: Settings, role: Literal["plan", "apply"], deployment_id: str | None
+) -> str:
+    policy = json.dumps(session_policy(settings, role, deployment_id), separators=(",", ":"))
+    if len(policy) > MAX_SESSION_POLICY_CHARS:
+        # Never fall back to an unscoped session.
+        raise ProvisioningError(
+            "session_policy_too_large",
+            "The scoped session policy exceeds the STS size limit for this configuration.",
+        )
+    return policy
+
+
 class AwsEnvironment:
     def __init__(self, settings: Settings, session_factory: SessionFactory | None = None) -> None:
         self._settings = settings
@@ -80,17 +197,32 @@ class AwsEnvironment:
         return session.client(service, config=_BOTO_CONFIG)
 
     def credentials(
-        self, role: Literal["plan", "apply"], session_name: str
+        self,
+        role: Literal["plan", "apply"],
+        session_name: str,
+        deployment_id: str | None = None,
     ) -> TemporaryCredentials:
+        """Assume an execution role, always narrowed by an inline session policy.
+
+        With a deployment ID the session can only touch that deployment's state objects and
+        resources tagged with its ID. Without one, the plan role is read-only (no state
+        access) and the apply role can do nothing beyond proving its identity."""
         arn = self._settings.plan_role_arn if role == "plan" else self._settings.apply_role_arn
         if not arn:
             raise ProvisioningError(
                 "aws_not_configured", "The AWS execution role is not configured."
             )
+        policy = packed_session_policy(self._settings, role, deployment_id)
+        kwargs: dict[str, Any] = {
+            "RoleArn": arn,
+            "RoleSessionName": session_name[:64],
+            "DurationSeconds": 3600,
+            "Policy": policy,
+        }
+        if deployment_id is not None:
+            kwargs["Tags"] = [{"Key": TAG_DEPLOYMENT, "Value": deployment_id}]
         try:
-            response = self._client("sts").assume_role(
-                RoleArn=arn, RoleSessionName=session_name[:64], DurationSeconds=3600
-            )
+            response = self._client("sts").assume_role(**kwargs)
         except (ClientError, BotoCoreError) as exc:
             raise ProvisioningError(
                 "aws_credentials_unavailable", "Could not obtain AWS execution credentials."
@@ -228,6 +360,35 @@ class AwsEnvironment:
                     "aws_unavailable", f"Could not verify whether {resource_id} still exists."
                 ) from exc
         return found
+
+    def instance_volumes(
+        self, instance_ids: list[str], creds: TemporaryCredentials
+    ) -> dict[str, list[str]]:
+        volumes: dict[str, list[str]] = {}
+        ec2 = self._client("ec2", creds)
+        for instance_id in sorted(set(instance_ids)):
+            try:
+                reservations = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"]
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code", "") in _NOT_FOUND:
+                    continue
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not read the disks of {instance_id}."
+                ) from exc
+            except BotoCoreError as exc:
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not read the disks of {instance_id}."
+                ) from exc
+            for reservation in reservations:
+                for instance in reservation["Instances"]:
+                    ids = [
+                        m["Ebs"]["VolumeId"]
+                        for m in instance.get("BlockDeviceMappings", [])
+                        if m.get("Ebs", {}).get("VolumeId")
+                    ]
+                    if ids:
+                        volumes[instance_id] = ids
+        return volumes
 
     def connection_readiness(self, instance_id: str, creds: TemporaryCredentials) -> Readiness:
         """EC2 status checks plus SSM registration of this exact EC2 instance."""

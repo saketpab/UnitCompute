@@ -56,8 +56,15 @@ class JwtAuthenticator:
         self._group = settings.auth_required_group
         self._groups_claim = settings.auth_groups_claim
         if key_resolver is None:
+            # cache_keys=False: PyJWT's per-key cache never expires, so a key removed from the
+            # issuer's JWKS would stay trusted until restart. The JWKS document cache below
+            # is bounded, so removed keys stop working within auth_jwks_cache_seconds.
             client = jwt.PyJWKClient(
-                settings.auth_jwks_url, cache_keys=True, lifespan=300, timeout=5
+                settings.auth_jwks_url,
+                cache_keys=False,
+                cache_jwk_set=True,
+                lifespan=settings.auth_jwks_cache_seconds,
+                timeout=5,
             )
 
             def key_resolver(token: str) -> Any:

@@ -191,15 +191,16 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                "\"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"",
-                '"DELETE FROM agent_attempts WHERE 1 = 1 OR "',
+                "                        \"UPDATE agent_attempts SET status = 'failed', "
+                'idempotency_key = NULL, "',
+                '                        "DELETE FROM agent_attempts WHERE 1 = 1 OR "',
             ),
         ),
         ("tests/test_review_round1.py::test_r3_failed_attempts_stay_counted",),
     ),
     Mutation(
         "r6-chat-idempotency",
-        (("agent/service.py", "            if prior is not None:", "            if False:"),),
+        (("agent/service.py", 'if prior["status"] == "succeeded":', "if False:"),),
         (
             "tests/test_review_round1.py::test_r6_chat_idempotency_replays_without_second_model_call",
         ),
@@ -252,8 +253,14 @@ MUTATIONS = [
     ),
     Mutation(
         "r1-delete-by-id",
-        ((WORKER, "found = self.provisioner.find_resources(sorted(known))", "found = []"),),
-        ("tests/test_review_round1.py::test_r1_untagged_vm_with_lost_state_blocks_deletion",),
+        (
+            (
+                WORKER,
+                "            found = self.provisioner.find_resources(known.all_ids)",
+                "            found = []",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r1_retained_untagged_root_volume_blocks_deletion",),
     ),
     Mutation(
         "r2-stranded-recovery",
@@ -309,6 +316,150 @@ MUTATIONS = [
             "tests/test_review_round1.py::"
             "test_r5_connection_readiness_reads_ec2_checks_and_exact_ssm_identity",
         ),
+    ),
+    Mutation(
+        "s2-1-no-per-key-cache",
+        (("auth.py", "cache_keys=False,", "cache_keys=True,"),),
+        ("tests/test_review_round2.py::test_s2_1_removed_signing_key_stops_working",),
+    ),
+    Mutation(
+        "s2-2-session-policy",
+        (("provisioning/aws.py", '            "Policy": policy,\n', ""),),
+        ("tests/test_review_round2.py::test_s2_2_assume_role_passes_scoped_policy_and_tag",),
+    ),
+    Mutation(
+        "s2-2-session-tag",
+        (
+            (
+                "provisioning/aws.py",
+                'kwargs["Tags"] = [{"Key": TAG_DEPLOYMENT, "Value": deployment_id}]',
+                "pass",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_s2_2_assume_role_passes_scoped_policy_and_tag",),
+    ),
+    Mutation(
+        "s2-2-session-scope",
+        (
+            (
+                "provisioning/aws.py",
+                'owned = {f"ec2:ResourceTag/{TAG_DEPLOYMENT}": deployment_id}',
+                'owned = {"ec2:ResourceTag/ManagedBy": "unitcompute"}',
+            ),
+        ),
+        ("tests/test_review_round2.py::test_s2_2_session_policy_alone_enforces_scope",),
+    ),
+    Mutation(
+        "s2-2-provisioner-scope",
+        (
+            (
+                "provisioning/terraform.py",
+                '"apply", f"uc-apply-{spec.deployment_id[4:20]}", spec.deployment_id',
+                '"apply", f"uc-apply-{spec.deployment_id[4:20]}"',
+            ),
+        ),
+        ("tests/test_review_round2.py::test_s2_2_terraform_provisioner_scopes_plan_and_apply",),
+    ),
+    Mutation(
+        "s2-2-size-guard",
+        (("provisioning/aws.py", "if len(policy) > MAX_SESSION_POLICY_CHARS:", "if False:"),),
+        ("tests/test_review_round2.py::test_s2_2_oversized_session_policy_is_refused",),
+    ),
+    Mutation(
+        "s2-3-replay-before-provider",
+        (
+            (
+                "agent/service.py",
+                "        if idempotency_key is not None:\n            # Completed replays",
+                "        if False:\n            # Completed replays",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_s2_3_completed_replay_does_not_need_provider",),
+    ),
+    Mutation(
+        "r2-4-reservation-lease",
+        (("agent/service.py", "if expires > utcnow():", "if True:"),),
+        ("tests/test_review_round2.py::test_r2_4_stranded_reservation_expires_after_its_lease",),
+    ),
+    Mutation(
+        "r2-4-mark-failed-retry",
+        (
+            (
+                "agent/service.py",
+                "for delay in (*MARK_FAILED_RETRY_DELAYS, None):",
+                "for delay in (None,):",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_4_failure_marking_retries_through_contention",),
+    ),
+    Mutation(
+        "r2-1-reconcile-known-ids",
+        (
+            (
+                "worker.py",
+                "merged = {r.resource_id: r for r in [*tagged, *live]}",
+                "merged = {r.resource_id: r for r in tagged}",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_1_known_live_vm_blocks_second_vm",),
+    ),
+    Mutation(
+        "r2-1-append-only",
+        (
+            (
+                "db/migrations/0003_resource_identity_ledger.sql",
+                "CREATE TRIGGER deployment_resources_no_delete BEFORE DELETE ON "
+                "deployment_resources BEGIN SELECT RAISE(ABORT, "
+                "'deployment_resources is append-only'); END;\n",
+                "",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_1_identity_rows_are_append_only",),
+    ),
+    Mutation(
+        "r2-2-persist-outputs",
+        (("worker.py", 'identity(instance_output, "apply_output"),', "None,"),),
+        ("tests/test_review_round2.py::test_r2_2_apply_outputs_persist_when_inventory_fails",),
+    ),
+    Mutation(
+        "r2-2-import-on-recovery",
+        (
+            (
+                "worker.py",
+                '                self.identities.import_evidence(conn, job["deployment_id"])\n',
+                "",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_2_evidence_file_survives_database_contention",),
+    ),
+    Mutation(
+        "r2-3-root-disk-completeness",
+        (("worker.py", "            if missing_disks:", "            if False:"),),
+        (
+            "tests/test_review_round2.py::test_r2_3_unknown_root_disk_blocks_deletion_until_acknowledged",
+        ),
+    ),
+    Mutation(
+        "r2-5-refresh-all-states",
+        (
+            (
+                "worker.py",
+                "\"SELECT id, instance_id FROM deployments WHERE status <> 'deleted' \"",
+                "\"SELECT id, instance_id FROM deployments WHERE status = 'active' \"",
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_5_readiness_keeps_refreshing_during_previews",),
+    ),
+    Mutation(
+        "r2-5-stale-not-ready",
+        (
+            (
+                "services/deployments.py",
+                'connection_ready = bool(row["connection_ready"]) and not stale',
+                'connection_ready = bool(row["connection_ready"])',
+            ),
+        ),
+        ("tests/test_review_round2.py::test_r2_5_stale_observation_is_not_presented_as_ready",),
     ),
     Mutation(
         "policy-imdsv2",

@@ -167,9 +167,13 @@ class FakeAws:
 
     def __init__(self) -> None:
         self.roles: list[str] = []
+        self.scopes: list[str | None] = []
 
-    def credentials(self, role: str, session_name: str) -> TemporaryCredentials:
+    def credentials(
+        self, role: str, session_name: str, deployment_id: str | None = None
+    ) -> TemporaryCredentials:
         self.roles.append(role)
+        self.scopes.append(deployment_id)
         return self.creds
 
     def account_id(self, creds: TemporaryCredentials) -> str:
@@ -186,6 +190,9 @@ class FakeAws:
 
     def find_resources(self, ids: list[str], creds: TemporaryCredentials) -> list[Any]:
         return []
+
+    def instance_volumes(self, ids: list[str], creds: TemporaryCredentials) -> dict[str, Any]:
+        return {}
 
 
 SPEC = DeploymentSpec(

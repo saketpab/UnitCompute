@@ -13,7 +13,6 @@ import shutil
 import sqlite3
 import threading
 import time
-from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +24,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from moto import mock_aws
 from pydantic import ValidationError
 
+import iam_eval
 from conftest import Harness, approve_current, auth, create_and_plan, launch, make_settings
 from test_config_and_auth import AWS_TERRAFORM, JWT_SETTINGS, TERRAFORM_SETTINGS
 from test_policy import AMI, INST, SG, SPEC, TARGETS, as_destroy, change, load, run
@@ -462,18 +462,12 @@ def test_s4_real_plan_with_local_exec_and_foreign_group_rejected(tmp_path: Path)
 # ------------------------------------------------------------------- S5: IAM
 
 
+PLACEHOLDERS = {"state_bucket": "${state_bucket}"}
+ALICE_SESSION = {"aws:PrincipalTag/UnitComputeDeployment": "dep_alice"}
+
+
 def _allowed(policy: dict[str, Any], action: str, resource: str) -> bool:
-    effects = []
-    for statement in policy["Statement"]:
-        actions = statement.get("Action") or []
-        actions = actions if isinstance(actions, list) else [actions]
-        resources = statement["Resource"]
-        resources = resources if isinstance(resources, list) else [resources]
-        if any(fnmatchcase(action, a) for a in actions) and any(
-            fnmatchcase(resource, r) for r in resources
-        ):
-            effects.append(statement["Effect"])
-    return "Allow" in effects and "Deny" not in effects
+    return iam_eval.allowed([policy], action, resource, ALICE_SESSION, PLACEHOLDERS)
 
 
 STATE = "arn:aws:s3:::${state_bucket}/deployments/dep_alice/terraform.tfstate"
@@ -541,12 +535,16 @@ def test_r1_untagged_vm_with_lost_state_blocks_deletion(
     harness.provisioner._state_path(d["id"]).unlink()  # state lost, tag never present
     provisioner = _AwsBacked(harness.settings.data_dir)
     provisioner.aws = AwsEnvironment(harness.settings)
-    final = _delete_with(harness, provisioner, d)
+    harness.client.post(f"/deployments/{d['id']}/deletion-plan", headers=auth())
+    Worker(harness.settings, harness.db, provisioner, clock=harness.clock).run_once()
+    final = harness.client.get(f"/deployments/{d['id']}", headers=auth()).json()
     state = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
     assert state["State"]["Name"] == "running"
-    assert final["status"] == "recovery_required"
-    assert final["latest_job"]["error"]["code"] == "resources_remaining"
-    assert iid in final["latest_job"]["error"]["message"]
+    # Round 2: the live, recorded VM is not in Terraform state, so the deletion preview
+    # itself is rejected for operator reconciliation instead of reaching "deleted".
+    assert final["status"] == "plan_failed"
+    assert final["current_plan"]["status"] == "rejected"
+    assert iid in final["current_plan"]["error"]["message"]
     assert (
         harness.client.post(
             "/deployments", json={"name": "next", "disk_gib": 8}, headers=auth()
@@ -599,13 +597,36 @@ def test_r1_retained_untagged_root_volume_blocks_deletion(
 
 def test_r1_unverifiable_deletion_keeps_recovery_and_quota(harness: Harness) -> None:
     class Unverifiable(SimulatedProvisioner):
+        applied = False
+
+        def apply(self, *args: Any) -> Any:
+            self.applied = True
+            return super().apply(*args)
+
         def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
-            raise ProvisioningError("aws_unavailable", "Could not verify.")
+            if self.applied:
+                raise ProvisioningError("aws_unavailable", "Could not verify.")
+            return super().find_resources(resource_ids)
 
     d = launch(harness)
     final = _delete_with(harness, Unverifiable(harness.settings.data_dir), d)
     assert final["status"] == "recovery_required"
     assert final["latest_job"]["error"]["code"] == "verification_failed"
+
+
+def test_r1_lookup_failure_blocks_preview(harness: Harness) -> None:
+    class Blind(SimulatedProvisioner):
+        def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
+            raise ProvisioningError("aws_unavailable", "Could not verify.")
+
+    d = launch(harness)
+    harness.client.post(f"/deployments/{d['id']}/deletion-plan", headers=auth())
+    Worker(
+        harness.settings, harness.db, Blind(harness.settings.data_dir), clock=harness.clock
+    ).run_once()
+    after = harness.client.get(f"/deployments/{d['id']}", headers=auth()).json()
+    assert after["status"] == "plan_failed"
+    assert after["current_plan"]["error"]["code"] == "aws_unavailable"
 
 
 def test_r1_identities_recorded_at_creation(harness: Harness) -> None:

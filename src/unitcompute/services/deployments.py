@@ -679,12 +679,19 @@ class DeploymentService:
         resources = None
         access = None
         if row["instance_id"] and row["status"] not in {"deleted"}:
+            checked = _dt(row["readiness_checked_at"])
+            # An observation older than two refresh intervals is not presented as current.
+            stale = checked is None or (self._clock() - checked).total_seconds() > (
+                2 * self._settings.readiness_refresh_seconds
+            )
+            connection_ready = bool(row["connection_ready"]) and not stale
             resources = {
                 "instance_id": row["instance_id"],
                 "security_group_id": row["security_group_id"],
                 "root_volume_id": row["root_volume_id"],
                 "connection": {
-                    "ready": bool(row["connection_ready"]),
+                    "ready": connection_ready,
+                    "stale": stale,
                     "ec2_status_checks": row["ec2_status"],
                     "ssm_ping_status": row["ssm_ping_status"],
                     "checked_at": row["readiness_checked_at"],
@@ -694,7 +701,7 @@ class DeploymentService:
             command = (
                 f"aws ssm start-session --target {row['instance_id']} --region {row['region']}"
             )
-            ready = bool(row["connection_ready"])
+            ready = connection_ready
             requirements = (
                 ["Simulated deployment: there is no real VM to connect to."]
                 if simulated
@@ -707,8 +714,10 @@ class DeploymentService:
             )
             if not ready:
                 requirements.append(
-                    "Not ready yet: sessions fail until EC2 status checks pass and SSM reports "
-                    "the instance Online (see resources.connection)."
+                    "Readiness is stale; waiting for a fresh check (see resources.connection)."
+                    if stale and row["connection_ready"]
+                    else "Not ready yet: sessions fail until EC2 status checks pass and SSM "
+                    "reports the instance Online (see resources.connection)."
                 )
             access = AccessInstructions(
                 ready=ready, command=None if simulated else command, requirements=requirements

@@ -347,6 +347,21 @@ def _prior_group_id(plan: dict[str, Any]) -> str | None:
     return None
 
 
+def prior_resource_identities(plan: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """(resource_id, parent_instance_id) for everything in Terraform's prior state."""
+    found: list[tuple[str, str | None]] = []
+    root = plan.get("prior_state", {}).get("values", {}).get("root_module", {})
+    for resource in root.get("resources", []) or []:
+        values = resource.get("values") or {}
+        instance = values.get("id") if resource.get("address") == INSTANCE else None
+        if isinstance(values.get("id"), str):
+            found.append((values["id"], None))
+        for device in values.get("root_block_device") or []:
+            if isinstance(device, dict) and isinstance(device.get("volume_id"), str):
+                found.append((device["volume_id"], instance if isinstance(instance, str) else None))
+    return found
+
+
 def prior_resource_ids(plan: dict[str, Any]) -> set[str]:
     """IDs Terraform state knows for this deployment (instance, root volume, group)."""
     return _prior_resource_ids(plan)
@@ -466,7 +481,8 @@ def evaluate_plan(
     orphans = sorted(r.resource_id for r in inventory if r.resource_id not in known)
     if orphans:
         v.append(
-            "AWS has resources tagged for this deployment that are not in Terraform state "
+            "AWS has resources recorded or tagged for this deployment that are not in "
+            "Terraform state "
             f"({', '.join(orphans)}); operator reconciliation is required"
         )
     if plan.get("resource_drift"):

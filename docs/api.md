@@ -48,16 +48,22 @@ Other statuses:
 
 Your VM slot stays reserved until a deletion is verified, including while a deployment is in
 `plan_failed` or `recovery_required`. A deletion is verified only when every resource ever
-recorded for the deployment (instance, root volume and security group IDs, plus the IDs in
-Terraform state) is confirmed gone by direct lookup, and nothing tagged for it remains. If
-that cannot be established, the deployment stays `recovery_required`.
+recorded for the deployment is confirmed gone by direct lookup, and nothing tagged for it
+remains. Recorded resources include instance, root volume and security group IDs, the IDs in
+Terraform state, and disks discovered on live instances. If that cannot be established, the
+deployment stays `recovery_required` (`verification_failed` or `identity_incomplete`). A
+preview is rejected if a recorded or tagged resource exists that Terraform state does not
+track.
 
 ### Connection readiness
 
 `active` means the infrastructure was applied and the VM was verified to exist. It does not
 mean you can connect yet. `resources.connection` shows the latest EC2 status checks
 (`ec2_status_checks`), SSM registration of this exact instance (`ssm_ping_status`) and when
-they were checked. `access.ready` is `true` only when both checks pass. The worker
+they were checked. `access.ready` is `true` only when both checks pass and the observation
+is fresh. An observation older than twice `UNITCOMPUTE_READINESS_REFRESH_SECONDS` is
+reported as `stale` and not ready. Readiness keeps being refreshed while previews are
+pending. The worker
 observes readiness for a bounded time after launch and then refreshes it periodically.
 
 ### Plans and approval
@@ -113,7 +119,9 @@ Mutating routes accept an optional `Idempotency-Key` header: 8–128 characters 
 - For `POST /agent/messages`, a repeat while the first request is still running returns
   `409 idempotency_in_progress`, and the model is never called twice for one key. If the first
   attempt failed, the key is released for a retry, but the failed attempt still counts
-  toward your daily assistant limit.
+  toward your daily assistant limit. A reservation whose process died is released once its
+  lease (the assistant timeout plus 60 seconds) expires. A completed reply is replayed even
+  when the model provider is unavailable.
 
 Idempotency makes retries of *requests* safe. It does not make AWS execution exactly-once.
 

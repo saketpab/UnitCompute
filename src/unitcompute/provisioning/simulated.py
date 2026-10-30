@@ -320,6 +320,15 @@ class SimulatedProvisioner:
                     found.append(resource)
         return found
 
+    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[str]]:
+        wanted = set(instance_ids)
+        volumes: dict[str, list[str]] = {}
+        for path in sorted(self._state_dir.glob("dep_*.json")):
+            instance = self._load(path.stem).get("aws_instance.vm")
+            if instance and instance["id"] in wanted:
+                volumes[instance["id"]] = [instance["root_block_device"][0]["volume_id"]]
+        return volumes
+
     def connection_readiness(self, instance_id: str) -> Readiness:
         return Readiness(ec2_status="ok", ssm_status="Online (simulated)")
 

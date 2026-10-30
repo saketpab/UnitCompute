@@ -131,6 +131,13 @@ class Provisioner(Protocol):
         ProvisioningError when existence cannot be established."""
         ...
 
+    def instance_volumes(self, instance_ids: list[str]) -> dict[str, list[str]]:
+        """EBS volume IDs currently mapped to each instance (absent once terminated).
+
+        Instances that are unknown or report no mappings are omitted. Raises
+        ProvisioningError when the lookup itself fails."""
+        ...
+
     def connection_readiness(self, instance_id: str) -> Readiness: ...
 
     def self_check(self) -> dict[str, Any]:

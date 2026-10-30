@@ -41,7 +41,7 @@
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "deployments/*"
+            "deployments/${aws:PrincipalTag/UnitComputeDeployment}/*"
           ]
         }
       }
@@ -50,7 +50,7 @@
       "Sid": "DeploymentStateRead",
       "Effect": "Allow",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/${aws:PrincipalTag/UnitComputeDeployment}/terraform.tfstate"
     },
     {
       "Sid": "DeploymentStateLockFiles",
@@ -60,7 +60,7 @@
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate.tflock"
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/${aws:PrincipalTag/UnitComputeDeployment}/terraform.tfstate.tflock"
     },
     {
       "Sid": "NeverTouchBootstrapState",

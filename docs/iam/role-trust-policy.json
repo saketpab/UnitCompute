@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyTheUnitComputeHostMayAssume",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "${host_role_arn}"
+      },
+      "Action": "sts:AssumeRole"
+    },
+    {
+      "Sid": "SessionsMustBeTaggedWithOneDeployment",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "${host_role_arn}"
+      },
+      "Action": "sts:TagSession",
+      "Condition": {
+        "StringLike": {
+          "aws:RequestTag/UnitComputeDeployment": "dep_*"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "UnitComputeDeployment"
+          ]
+        }
+      }
+    }
+  ]
+}

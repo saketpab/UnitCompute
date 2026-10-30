@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean** (both reviews). Round 2: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). Round-1 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). Round-2 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -67,7 +67,7 @@ Moto does not implement `ssm:DescribeInstanceInformation`, and the real
 proven against stubbed clients only. Real EC2/SSM/IAM acceptance remains part of the
 blocked live gate.
 
-## Round 1 fix commit (parent `715e5e3`)
+## Round 1 fix commit: `910e9c00634edc591878b88f43b2901c1332a591` (parent `715e5e3`)
 
 | Check | Result |
 |---|---|
@@ -78,4 +78,66 @@ blocked live gate.
 | pip-audit (hash-pinned) | no known vulnerabilities |
 | gitleaks (working tree) | no leaks |
 | Process-level offline run (real API and worker processes) | `/readyz` 503 without a worker and 200 with a healthy worker; client walkthrough exit 0; repeated chat `Idempotency-Key` returned the same session over HTTP; second worker refused by the lock; Terraform with dev auth refused at configuration |
-| CI on the exact pushed commit | recorded in the handoff for this commit |
+| CI on the exact pushed commit | passed: [run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402), 267 tests |
+
+## Candidate 2: `910e9c00634edc591878b88f43b2901c1332a591`
+
+| Check | Result |
+|---|---|
+| Sol Medium security review | **not clean**: 3 required findings (S2-1 to S2-3) |
+| Sol Medium reliability review | **not clean**: 6 required findings (R2-1 to R2-6) |
+
+S2-3 and R2-6 are the same defect (a completed chat replay needed the provider), so there
+are 8 unique findings.
+
+## Round 2 findings → fixes → tests
+
+Reviewer reproductions: security2 `test_security2_independent.py` (3 defect tests and 1
+control); reliability2 `test_reliability_review2.py` (6 defect tests). Both files were kept
+outside the repository and run unchanged:
+
+- On `910e9c0`, all 10 pass (the defects reproduce and the control holds).
+- On the fix tree, all 9 defect tests fail and the control still passes.
+- Three of those fail at an earlier or incidental assertion: the migration test now
+  applies `[2, 3]`, the inventory-error test stops at approve, and the readiness test stops
+  at the first `ready` check. For those three, minimally adapted copies print the actual
+  end state on the fix tree:
+  - the migrated deployment ends `recovery_required` rather than `deleted`;
+  - the ID returned by apply is persisted, and the deletion preview is rejected because the
+    live VM is not in Terraform state;
+  - readiness is refreshed (`stopped`/`ConnectionLost`) and reports not ready.
+
+| ID | Finding | Fix | Regression tests (`tests/test_review_round2.py`) | Mutants |
+|---|---|---|---|---|
+| S2-1 (P2) | Removed JWKS keys stayed trusted (PyJWT per-key cache never expires) | `auth.py`: `cache_keys=False`; the JWKS document cache is bounded by `auth_jwks_cache_seconds` (default 300) | `test_s2_1_*` (key removal rejects new tokens; lifespan is configurable) | `s2-1-no-per-key-cache` |
+| S2-2 (P2) | Execution sessions could act on other deployments | `aws.py`: every `AssumeRole` passes an inline session policy plus a `UnitComputeDeployment` session tag. State is limited to that deployment's key, mutations to resources tagged with its ID, and creation to that tag. Unscoped plan sessions are read-only without state; unscoped apply sessions are deny-all. Policies over 2,048 characters are refused (also checked by the worker self-check). The IAM examples bind the same scope through `${aws:PrincipalTag/UnitComputeDeployment}`; a trust-policy example is added | `test_s2_2_*`: recorded STS arguments, plus an offline evaluator (`tests/iam_eval.py`) over the role policy alone, the session policy alone, and both combined | `s2-2-session-policy`, `s2-2-session-tag`, `s2-2-session-scope`, `s2-2-provisioner-scope`, `s2-2-size-guard` |
+| S2-3 / R2-6 (P2) | Completed chat replays required the provider | `agent/service.py`: completed replays and key conflicts are resolved from the database before the model factory is called | `test_s2_3_*` (service and HTTP; factory unavailable or unconfigured; factory never called) | `s2-3-replay-before-provider` |
+| R2-1 (P1) | Repair could launch a second VM despite a recorded live instance | Append-only `deployment_resources` table (migration 0003, triggers forbid UPDATE/DELETE). Planning imports all evidence (including the deployment row), looks up every known ID, and treats live known resources missing from Terraform state as orphans, so the plan is rejected | `test_r2_1_*` (moto: no second VM, history kept, append-only enforced) | `r2-1-reconcile-known-ids`, `r2-1-append-only` |
+| R2-2 (P1) | IDs returned by apply were lost when the follow-up lookup failed | Apply outputs are appended to the fsynced per-deployment evidence file, then the table, before any inventory or verification. Stranded-job recovery, planning and verification import the file first | `test_r2_2_*` (inventory failure then no false deletion; DB contention then evidence imported on recovery) | `r2-2-persist-outputs`, `r2-2-import-on-recovery` |
+| R2-3 (P1) | Migrated deployments could be marked deleted while an untagged root disk remained | Migration 0003 backfills identities from schema-2 columns and plan prior-state IDs. Disks of live known instances are discovered and recorded. Deletion requires every known instance to have an identified root disk, otherwise `identity_incomplete`: recovery is kept, and the quota stays reserved until an operator records `unitcompute-admin acknowledge-root-disk` (append-only, audited) | `test_r2_3_*` (a real schema 1→2→3 upgrade with moto; acknowledgement path; discovery while live) | `r2-3-root-disk-completeness` |
+| R2-4 (P2) | Cancellation plus contention stranded a chat key as in progress forever | Reservations carry a lease (`agent_timeout + 60s`, also derived from `created_at`). An expired reservation is closed as failed (still counted) and the key is reused. Failure marking retries through contention | `test_r2_4_*` | `r2-4-reservation-lease`, `r2-4-mark-failed-retry` |
+| R2-5 (P2) | A pending preview froze readiness | Readiness is observed and refreshed in every non-deleted status. An observation older than twice the refresh interval is `stale` and not ready | `test_r2_5_*` | `r2-5-refresh-all-states`, `r2-5-stale-not-ready` |
+
+Behaviour changed deliberately in existing tests:
+
+- `test_r1_untagged_vm_with_lost_state_blocks_deletion` now expects the deletion preview
+  itself to be rejected (stricter than the earlier `recovery_required` after apply).
+- `test_r1_unverifiable_deletion_keeps_recovery_and_quota` fails lookups only after apply.
+  A new test, `test_r1_lookup_failure_blocks_preview`, covers lookups failing during planning.
+- The IAM tests use the evaluator because the resources now contain principal-tag variables.
+
+The session-policy and IAM evidence is offline policy evaluation and recorded STS
+arguments only. Real IAM, STS session-tag and EC2/SSM acceptance remains part of the
+blocked live gate.
+
+## Round 2 fix commit (parent `910e9c0`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check` | passed |
+| `pytest` with offline Terraform tests required | 299 passed |
+| `scripts/check_guards.py` | 61/61 mutants killed (45 earlier + 16 new). Three earlier mutants were retargeted because their code moved: `r3-failed-attempts-counted`, `r6-chat-idempotency` and `r1-delete-by-id` |
+| Reviewer reproductions against `910e9c0` and the fix tree | see "Round 2 findings" above |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline run (real API and worker processes, schema 3) | `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; repeated chat `Idempotency-Key` returned the same session; identities recorded in the table and the `identities.jsonl` evidence file; second worker refused; worker stopped cleanly on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |

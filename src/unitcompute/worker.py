@@ -30,6 +30,7 @@ from typing import Any
 from unitcompute.config import ProvisionerKind, Settings, load_settings
 from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
 from unitcompute.errors import ServiceUnavailable
+from unitcompute.identities import Identity, IdentityLedger, KnownIdentities, identity
 from unitcompute.logging_setup import configure_logging, redact, secure_process_defaults
 from unitcompute.pricing import estimate_monthly_cost
 from unitcompute.provisioning.base import (
@@ -43,7 +44,11 @@ from unitcompute.provisioning.base import (
     sha256_file,
 )
 from unitcompute.provisioning.factory import build_provisioner
-from unitcompute.provisioning.policy import evaluate_plan, prior_resource_ids
+from unitcompute.provisioning.policy import (
+    evaluate_plan,
+    prior_resource_identities,
+    prior_resource_ids,
+)
 from unitcompute.services.deployments import (
     Clock,
     binding_problem,
@@ -117,6 +122,7 @@ class Worker:
         self._checked_at: float | None = None
         self._registered = False
         self.write_retry_delays: tuple[float, ...] = WRITE_RETRY_DELAYS
+        self.identities = IdentityLedger(settings.workdir_root)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -198,6 +204,7 @@ class Worker:
             ).fetchall()
             for job in rows:
                 recovered.append(job["id"])
+                self.identities.import_evidence(conn, job["deployment_id"])
                 if job["kind"] == "plan":
                     self._finish_plan_failure(
                         conn,
@@ -433,7 +440,7 @@ class Worker:
             }
             if actual != expected_versions(self.provisioner.kind):
                 raise JobFailure("plan_stale", "Tool or template versions changed; retry.")
-            inventory = self.provisioner.owned_resources(spec.deployment_id)
+            inventory = self._reconciled_inventory(spec.deployment_id, result.plan_json)
             policy = evaluate_plan(
                 result.plan_json,
                 kind=kind,
@@ -533,6 +540,57 @@ class Worker:
                 detail={"kind": kind, "plan_hash": result.plan_hash},
             )
 
+    # ------------------------------------------------------------ identities
+
+    def record_identities(self, deployment_id: str, identities: list[Identity | None]) -> None:
+        """Durably append identity evidence (file first, then the append-only table)."""
+        if self.identities.append_evidence(deployment_id, identities):
+            self.import_identities(deployment_id)
+
+    def import_identities(self, deployment_id: str) -> KnownIdentities:
+        with self._tx() as conn:
+            self.identities.import_evidence(conn, deployment_id)
+            return self.identities.known(conn, deployment_id)
+
+    def _discover_volumes(self, deployment_id: str, instance_ids: list[str]) -> None:
+        if not instance_ids:
+            return
+        mapped = self.provisioner.instance_volumes(instance_ids)
+        self.record_identities(
+            deployment_id,
+            [
+                identity(volume, "instance_block_devices", instance_id)
+                for instance_id, volumes in mapped.items()
+                for volume in volumes
+            ],
+        )
+
+    def _reconciled_inventory(
+        self, deployment_id: str, plan_json: dict[str, Any]
+    ) -> list[OwnedResource]:
+        """Everything that exists for this deployment: tagged, or known from any evidence.
+
+        Anything here that Terraform state does not contain is an orphan and blocks the plan,
+        so a lost state or removed tag can never lead to a second VM."""
+        self.record_identities(
+            deployment_id,
+            [
+                identity(rid, "terraform_state", parent)
+                for rid, parent in prior_resource_identities(plan_json)
+            ],
+        )
+        tagged = self.provisioner.owned_resources(deployment_id)
+        self.record_identities(
+            deployment_id, [identity(r.resource_id, "tag_inventory") for r in tagged]
+        )
+        known = self.import_identities(deployment_id)
+        live = self.provisioner.find_resources(known.all_ids)
+        self._discover_volumes(
+            deployment_id, [r.resource_id for r in live if r.resource_type == "instance"]
+        )
+        merged = {r.resource_id: r for r in [*tagged, *live]}
+        return list(merged.values())
+
     def _precheck_apply(
         self, job: sqlite3.Row, deployment: sqlite3.Row, plan: sqlite3.Row, now: datetime
     ) -> Path:
@@ -608,7 +666,23 @@ class Worker:
 
         try:
             outcome = self.provisioner.apply(spec, plan_path.parent, plan_path)
+            # Persist returned identities before anything else can fail.
+            instance_output = outcome.outputs.get("instance_id")
+            self.record_identities(
+                spec.deployment_id,
+                [
+                    identity(instance_output, "apply_output"),
+                    identity(outcome.outputs.get("security_group_id"), "apply_output"),
+                    identity(
+                        outcome.outputs.get("root_volume_id"), "apply_output", instance_output
+                    ),
+                ],
+            )
             inventory = self.provisioner.owned_resources(spec.deployment_id)
+            self.record_identities(
+                spec.deployment_id,
+                [identity(r.resource_id, "tag_inventory") for r in inventory],
+            )
         except ProvisioningError as exc:
             self._recovery_required(job, exc.code, exc.safe_message)
             return
@@ -657,13 +731,8 @@ class Worker:
             return
 
         remaining = self._remaining_after_delete(deployment, plan, inventory)
-        if remaining is None:
-            self._recovery_required(
-                job,
-                "verification_failed",
-                "Delete ran but it could not be verified that the VM, disk and security group "
-                "are gone.",
-            )
+        if isinstance(remaining, JobFailure):
+            self._recovery_required(job, remaining.code, remaining.message)
             return
         if remaining:
             self._recovery_required(
@@ -683,22 +752,35 @@ class Worker:
 
     def _remaining_after_delete(
         self, deployment: sqlite3.Row, plan: sqlite3.Row, inventory: list[OwnedResource]
-    ) -> list[str] | None:
-        """Every identity we ever knew must be gone, checked by ID, not just by tag.
+    ) -> list[str] | JobFailure:
+        """Every identity ever recorded must be confirmed gone by direct lookup.
 
-        Returns None if existence could not be established (keep recovery and quota)."""
-        known = {
-            deployment["instance_id"],
-            deployment["security_group_id"],
-            deployment["root_volume_id"],
-            *json.loads(plan["prior_resource_ids_json"] or "[]"),
-        }
-        known.discard(None)
+        Returns a JobFailure when absence cannot be established: a lookup failed, or a known
+        instance's root disk was never identified (its mapping disappears on termination).
+        The deployment then keeps its recovery status and quota slot."""
         try:
-            found = self.provisioner.find_resources(sorted(known))
+            known = self.import_identities(deployment["id"])
+            live = self.provisioner.find_resources(known.all_ids)
+            self._discover_volumes(
+                deployment["id"], [r.resource_id for r in live if r.resource_type == "instance"]
+            )
+            known = self.import_identities(deployment["id"])
+            missing_disks = known.instances_without_root_disk()
+            if missing_disks:
+                return JobFailure(
+                    "identity_incomplete",
+                    "The root disk of " + ", ".join(missing_disks) + " was never recorded and "
+                    "cannot be discovered after termination; an operator must confirm it is "
+                    "gone (unitcompute-admin acknowledge-root-disk).",
+                )
+            found = self.provisioner.find_resources(known.all_ids)
         except ProvisioningError:
             log.warning("deletion verification failed", exc_info=True)
-            return None
+            return JobFailure(
+                "verification_failed",
+                "Delete ran but it could not be verified that the VM, disk and security group "
+                "are gone.",
+            )
         remaining = {f"{r.resource_type}:{r.resource_id}" for r in [*inventory, *found]}
         return sorted(remaining)
 
@@ -773,7 +855,7 @@ class Worker:
                 conn.execute(
                     "UPDATE deployments SET ec2_status = ?, ssm_ping_status = ?, "
                     "connection_ready = ?, readiness_checked_at = ? "
-                    "WHERE id = ? AND instance_id = ? AND status = 'active'",
+                    "WHERE id = ? AND instance_id = ? AND status <> 'deleted'",
                     (
                         readiness.ec2_status,
                         readiness.ssm_status,
@@ -793,7 +875,9 @@ class Worker:
         )
         with self.db.read() as conn:
             rows = conn.execute(
-                "SELECT id, instance_id FROM deployments WHERE status = 'active' "
+                # A launched VM may exist in every status except deleted, so a pending preview
+                # never freezes a stale readiness answer.
+                "SELECT id, instance_id FROM deployments WHERE status <> 'deleted' "
                 "AND instance_id IS NOT NULL AND (readiness_checked_at IS NULL "
                 "OR readiness_checked_at <= ?) ORDER BY readiness_checked_at LIMIT ?",
                 (cutoff, limit),

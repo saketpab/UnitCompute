@@ -35,7 +35,8 @@
         "StringEquals": {
           "aws:RequestTag/ManagedBy": "unitcompute",
           "ec2:InstanceType": "t3.micro",
-          "ec2:MetadataHttpTokens": "required"
+          "ec2:MetadataHttpTokens": "required",
+          "aws:RequestTag/UnitComputeDeployment": "${aws:PrincipalTag/UnitComputeDeployment}"
         }
       }
     },
@@ -50,7 +51,8 @@
         },
         "StringEquals": {
           "ec2:VolumeType": "gp3",
-          "aws:RequestTag/ManagedBy": "unitcompute"
+          "aws:RequestTag/ManagedBy": "unitcompute",
+          "aws:RequestTag/UnitComputeDeployment": "${aws:PrincipalTag/UnitComputeDeployment}"
         },
         "NumericLessThanEquals": {
           "ec2:VolumeSize": "30"
@@ -85,7 +87,8 @@
       ],
       "Condition": {
         "StringEqualsIfExists": {
-          "aws:RequestTag/ManagedBy": "unitcompute"
+          "aws:RequestTag/ManagedBy": "unitcompute",
+          "aws:RequestTag/UnitComputeDeployment": "${aws:PrincipalTag/UnitComputeDeployment}"
         }
       }
     },
@@ -103,7 +106,8 @@
           "ec2:CreateAction": [
             "RunInstances",
             "CreateSecurityGroup"
-          ]
+          ],
+          "aws:RequestTag/UnitComputeDeployment": "${aws:PrincipalTag/UnitComputeDeployment}"
         }
       }
     },
@@ -125,7 +129,8 @@
       ],
       "Condition": {
         "StringEquals": {
-          "ec2:ResourceTag/ManagedBy": "unitcompute"
+          "ec2:ResourceTag/ManagedBy": "unitcompute",
+          "ec2:ResourceTag/UnitComputeDeployment": "${aws:PrincipalTag/UnitComputeDeployment}"
         }
       }
     },
@@ -148,7 +153,7 @@
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "deployments/*"
+            "deployments/${aws:PrincipalTag/UnitComputeDeployment}/*"
           ]
         }
       }
@@ -160,7 +165,7 @@
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/${aws:PrincipalTag/UnitComputeDeployment}/terraform.tfstate"
     },
     {
       "Sid": "DeploymentStateLockFiles",
@@ -170,7 +175,7 @@
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate.tflock"
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/${aws:PrincipalTag/UnitComputeDeployment}/terraform.tfstate.tflock"
     },
     {
       "Sid": "NeverTouchBootstrapState",

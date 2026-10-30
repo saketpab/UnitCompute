@@ -137,7 +137,7 @@ def test_api_refuses_unmigrated_database(tmp_path: Path) -> None:
 
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
     db = Database(make_settings(tmp_path).database_path)
-    assert db.migrate() == [1, 2]
+    assert db.migrate() == [1, 2, 3]
     assert db.migrate() == []
     assert db.schema_version() == LATEST_SCHEMA_VERSION
 

@@ -31,7 +31,9 @@ rejected.
 - Each request is admitted atomically before the provider is called: the daily per-user
   attempt count and the session's turn count are reserved in one database transaction, so
   concurrent requests cannot exceed them. Failed, timed-out and cancelled attempts stay
-  counted. An `Idempotency-Key` replays a completed reply without calling the model again.
+  counted. An `Idempotency-Key` replays a completed reply without constructing or calling
+  the model, so replays work even while the provider is unavailable. A reservation left
+  behind by a crashed or cancelled request expires after its lease and stays counted.
 - Limits: model calls and tool calls per message, a wall-clock timeout, message length,
   history length, total turns per session, messages per user per day and output tokens are
   all configurable (`UNITCOMPUTE_AGENT_*`).

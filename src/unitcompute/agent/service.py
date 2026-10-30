@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -29,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from unitcompute.auth import Principal
 from unitcompute.config import AGENT_PROVIDERS, INSTANCE_TYPE, Settings
-from unitcompute.db.database import Database, to_db_time, utcnow
+from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
 from unitcompute.errors import (
     AppError,
     Conflict,
@@ -59,6 +60,8 @@ from unitcompute.services.deployments import (
 log = logging.getLogger(__name__)
 
 MAX_REPLY_CHARS = 4000
+LEASE_GRACE_SECONDS = 60
+MARK_FAILED_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 MAX_TOOL_OUTPUT_CHARS = 4000
 APPROVAL_NOTE = (
     "The assistant cannot create, approve, apply or delete resources. Submit the proposal "
@@ -324,23 +327,11 @@ class AgentService:
         whatever happens to the call."""
         now = to_db_time(utcnow())
         if idempotency_key is not None:
-            prior = conn.execute(
-                "SELECT status, payload_hash, response_json FROM agent_attempts "
-                "WHERE owner_id = ? AND idempotency_key = ?",
-                (principal.subject, idempotency_key),
-            ).fetchone()
-            if prior is not None:
-                if not hmac.compare_digest(prior["payload_hash"], payload_hash):
-                    raise Conflict(
-                        "This Idempotency-Key was already used with a different request.",
-                        code="idempotency_key_reused",
-                    )
-                if prior["status"] == "succeeded":
-                    return AgentReply.model_validate_json(prior["response_json"])
-                raise Conflict(
-                    "A request with this Idempotency-Key is still in progress.",
-                    code="idempotency_in_progress",
-                )
+            replay = self._prior_attempt(
+                conn, principal, idempotency_key, payload_hash, close_expired=True
+            )
+            if replay is not None:
+                return replay
         since = to_db_time(utcnow() - timedelta(days=1))
         attempts = conn.execute(
             "SELECT COUNT(*) FROM agent_attempts WHERE owner_id = ? AND created_at > ?",
@@ -377,8 +368,15 @@ class AgentService:
         )
         cursor = conn.execute(
             "INSERT INTO agent_attempts (owner_id, session_id, status, idempotency_key, "
-            "payload_hash, created_at) VALUES (?, ?, 'reserved', ?, ?, ?)",
-            (principal.subject, session_id, idempotency_key, payload_hash, now),
+            "payload_hash, created_at, lease_expires_at) VALUES (?, ?, 'reserved', ?, ?, ?, ?)",
+            (
+                principal.subject,
+                session_id,
+                idempotency_key,
+                payload_hash,
+                now,
+                to_db_time(utcnow() + self._lease()),
+            ),
         )
         return session_id, int(cursor.lastrowid or 0)
 
@@ -399,17 +397,72 @@ class AgentService:
             for r in reversed(rows)
         ]
 
+    def _lease(self) -> timedelta:
+        """How long a reservation may be in flight before it is presumed dead."""
+        return timedelta(seconds=self._settings.agent_timeout_seconds + LEASE_GRACE_SECONDS)
+
+    def _prior_attempt(
+        self,
+        conn: sqlite3.Connection,
+        principal: Principal,
+        idempotency_key: str,
+        payload_hash: str,
+        *,
+        close_expired: bool,
+    ) -> AgentReply | None:
+        """Replay a completed attempt or reject a conflicting/in-flight one.
+
+        A reservation whose lease expired (its process died or could not record the outcome)
+        is closed as failed so the key can be reused; it stays counted."""
+        prior = conn.execute(
+            "SELECT id, status, payload_hash, response_json, created_at, lease_expires_at "
+            "FROM agent_attempts WHERE owner_id = ? AND idempotency_key = ?",
+            (principal.subject, idempotency_key),
+        ).fetchone()
+        if prior is None:
+            return None
+        if not hmac.compare_digest(prior["payload_hash"], payload_hash):
+            raise Conflict(
+                "This Idempotency-Key was already used with a different request.",
+                code="idempotency_key_reused",
+            )
+        if prior["status"] == "succeeded":
+            return AgentReply.model_validate_json(prior["response_json"])
+        # Expired when either the recorded lease or creation + the current lease has passed.
+        expires = from_db_time(prior["created_at"]) + self._lease()
+        if prior["lease_expires_at"]:
+            expires = min(expires, from_db_time(prior["lease_expires_at"]))
+        if expires > utcnow():
+            raise Conflict(
+                "A request with this Idempotency-Key is still in progress.",
+                code="idempotency_in_progress",
+            )
+        if not close_expired:
+            return None  # the reservation transaction closes it
+        conn.execute(
+            "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
+            "finished_at = ? WHERE id = ? AND status = 'reserved'",
+            (to_db_time(utcnow()), prior["id"]),
+        )
+        return None
+
     def _mark_failed(self, attempt_id: int) -> None:
-        # The attempt stays counted; only the idempotency key is released for a retry.
-        try:
-            with self._db.transaction() as conn:
-                conn.execute(
-                    "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
-                    "finished_at = ? WHERE id = ?",
-                    (to_db_time(utcnow()), attempt_id),
-                )
-        except Exception:
-            log.warning("could not record failed assistant attempt", exc_info=True)
+        # The attempt stays counted; only the idempotency key is released for a retry. If the
+        # write keeps failing, the reservation lease expires and the key is released then.
+        for delay in (*MARK_FAILED_RETRY_DELAYS, None):
+            try:
+                with self._db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
+                        "finished_at = ? WHERE id = ? AND status = 'reserved'",
+                        (to_db_time(utcnow()), attempt_id),
+                    )
+                return
+            except Exception:
+                if delay is None:
+                    log.warning("could not record failed assistant attempt", exc_info=True)
+                    return
+                time.sleep(delay)
 
     async def handle(
         self,
@@ -422,15 +475,23 @@ class AgentService:
             raise InvalidInput(
                 f"Messages are limited to {self._settings.agent_max_message_chars} characters."
             )
+        payload_hash = canonical_hash(
+            {"session_id": request.session_id, "message": request.message}
+        )
+        if idempotency_key is not None:
+            # Completed replays and key conflicts never depend on the provider being up.
+            with self._db.read() as conn:
+                replay = self._prior_attempt(
+                    conn, principal, idempotency_key, payload_hash, close_expired=False
+                )
+            if replay is not None:
+                return replay
         if self._model_factory is None:
             raise ServiceUnavailable(
                 "The assistant is not configured; the REST workflow remains available.",
                 code="agent_unavailable",
             )
         model = self._model_factory()
-        payload_hash = canonical_hash(
-            {"session_id": request.session_id, "message": request.message}
-        )
         with self._db.transaction() as conn:
             reserved = self._reserve(conn, principal, request, idempotency_key, payload_hash)
         if isinstance(reserved, AgentReply):
