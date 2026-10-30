@@ -340,7 +340,8 @@ def test_r3_2_attached_data_disk_is_not_root_evidence(
         with db.read() as conn:
             known = IdentityLedger.known(conn, dep)
         assert known.volumes == {data: iid}  # recorded as evidence ...
-        assert known.root_volumes == {}  # ... but never as the root disk
+        assert known.launch_roots == {}  # ... but never as the root disk
+        assert known.observed_roots == {}
         assert known.instances_without_root_disk() == [iid]
         ec2.terminate_instances(InstanceIds=[iid])
         ec2.delete_volume(VolumeId=data)
@@ -355,11 +356,11 @@ def test_r3_2_attached_data_disk_is_not_root_evidence(
         )
 
 
-def test_r3_2_live_root_device_is_positively_identified(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    moto_env: Any,
+def test_r3_2_root_device_observation_is_distinct_from_launch_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
+    """Round 4: the volume at RootDeviceName is recorded as an observation (and attached
+    disks as attachments), but neither completes identity without launch evidence."""
     ec2 = moto_env
     vm = ec2.run_instances(
         ImageId="ami-12345678",
@@ -375,62 +376,42 @@ def test_r3_2_live_root_device_is_positively_identified(
     settings, db, dep = _schema_v1_deployment(tmp_path, monkeypatch, iid)
     client, h = _client(settings, db, FakeClock())
     with client:
-        _replan(h, _AwsBacked(h), dep, "deletion-plan")
+        _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
+        assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
         with db.read() as conn:
             known = IdentityLedger.known(conn, dep)
-            sources = dict(
+            sources = set(
                 conn.execute(
                     "SELECT resource_id, source FROM deployment_resources WHERE deployment_id = ?",
                     (dep,),
                 ).fetchall()
             )
-    assert known.root_volumes == {iid: {root}}
-    assert sources[root] == "root_device"
-    assert sources[data] == "attached_device"
+    assert known.observed_roots == {iid: {root}}
+    assert known.launch_roots == {}
+    assert known.instances_without_root_disk() == [iid]
+    assert (root, "root_device") in {tuple(r) for r in sources}
+    assert (data, "attached_device") in {tuple(r) for r in sources}
 
 
-def test_r3_2_recorded_root_must_exist_and_match_the_instance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    moto_env: Any,
-) -> None:
-    from argparse import Namespace
+def test_r3_2_operator_root_claims_no_longer_exist() -> None:
+    """Round 4 removed `record-root-volume`: an operator assertion, even about an existing
+    volume, cannot establish which volume was an instance's launch root."""
+    from unitcompute import admin
 
-    from unitcompute.admin import _record_root_volume
-
-    ec2 = moto_env
-    vm = ec2.run_instances(
-        ImageId="ami-12345678",
-        MinCount=1,
-        MaxCount=1,
-        BlockDeviceMappings=[{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 8}}],
-    )["Instances"][0]
-    iid, root = vm["InstanceId"], vm["BlockDeviceMappings"][0]["Ebs"]["VolumeId"]
-    other = ec2.create_volume(AvailabilityZone=vm["Placement"]["AvailabilityZone"], Size=8)[
-        "VolumeId"
-    ]
-    settings, db, dep = _schema_v1_deployment(tmp_path, monkeypatch, iid)
-    _, h = _client(settings, db, FakeClock())
-
-    def record(volume: str, operator: str = "ops") -> int:
-        return _record_root_volume(
-            db,
-            Namespace(
-                deployment_id=dep,
-                instance_id=iid,
-                volume_id=volume,
-                operator=operator,
-                reason="ticket 42",
-            ),
-            _AwsBacked(h),
-            IdentityLedger(settings.workdir_root),
+    assert not hasattr(admin, "_record_root_volume")
+    with pytest.raises(SystemExit):
+        admin.main(
+            [
+                "record-root-volume",
+                "dep_" + "a" * 32,
+                "i-0123456789abcdef0",
+                "vol-0123456789abcdef0",
+                "--operator",
+                "x",
+                "--reason",
+                "y",
+            ]
         )
-
-    assert record(other) == 1  # AWS reports a different root for the live instance
-    assert record(root, operator="  ") == 2
-    assert record(root) == 0
-    with db.read() as conn:
-        assert IdentityLedger.known(conn, dep).root_volumes == {iid: {root}}
 
 
 # --------------------------------------------- R3-5: torn records and short writes

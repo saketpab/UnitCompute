@@ -8,6 +8,8 @@ evidence, and it is imported again before any plan, verification or recovery dec
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -23,24 +25,19 @@ _ID = re.compile(r"^(i|vol|sg)-[0-9a-f]{8,17}$")
 _TYPES = {"i": "instance", "vol": "volume", "sg": "security_group"}
 _DEPLOYMENT = re.compile(r"^dep_[0-9a-f]{32}$")
 
-# Sources that positively establish a volume as an instance's ROOT disk (when the row also
-# names the parent instance): the template output for the root block device, Terraform's
-# root_block_device state, the root ID kept on the deployment row, the instance's
-# RootDeviceName mapping, or an operator-recorded root volume whose existence AWS confirmed.
-# Disks merely attached to an instance (ATTACHED_DEVICE, and the pre-round-3
-# "instance_block_devices" source) are never root evidence.
+# Launch-root evidence: what UnitCompute itself recorded from Terraform for the root block
+# device of an instance it launched (apply outputs, Terraform root_block_device state, the
+# root ID kept on the deployment row, and the migrated copies of those). Only this completes
+# an instance's identity.
+#
+# Everything else is an observation of the present and never completes identity: the
+# volume currently mapped at the root device name (which may be a replacement root, while
+# the original survives detached), other attached disks, tag inventory. Observations are
+# still recorded, so every observed resource must be verified gone before deletion.
 ROOT_DEVICE = "root_device"
 ATTACHED_DEVICE = "attached_device"
-OPERATOR_ROOT_VOLUME = "operator_root_volume"
-ROOT_SOURCES = frozenset(
-    {
-        "apply_output",
-        "terraform_state",
-        "deployment_record",
-        "migration",
-        ROOT_DEVICE,
-        OPERATOR_ROOT_VOLUME,
-    }
+LAUNCH_ROOT_SOURCES = frozenset(
+    {"apply_output", "terraform_state", "deployment_record", "migration"}
 )
 
 
@@ -68,17 +65,19 @@ class KnownIdentities:
     instances: set[str]
     volumes: dict[str, str | None]  # volume -> parent instance (if known)
     groups: set[str]
-    root_volumes: dict[str, set[str]]  # instance -> volumes positively known as its root
+    launch_roots: dict[str, set[str]]  # instance -> root volumes recorded at/after its launch
+    observed_roots: dict[str, set[str]]  # instance -> volumes seen at its root device name
 
     @property
     def all_ids(self) -> list[str]:
         return sorted(self.instances | set(self.volumes) | self.groups)
 
     def instances_without_root_disk(self) -> list[str]:
-        """Instances whose root disk identity was never positively established.
-
-        There is no waiver: until root evidence exists, plans and deletion stay blocked."""
-        return sorted(i for i in self.instances if not self.root_volumes.get(i))
+        """Instances without launch-root evidence. A current or replacement root, an attached
+        disk or any existing volume cannot stand in for the launch root; there is no
+        waiver. Plans and deletion stay blocked until launch evidence is recovered (for
+        example by restoring the deployment's Terraform state)."""
+        return sorted(i for i in self.instances if not self.launch_roots.get(i))
 
 
 class IdentityLedger:
@@ -90,21 +89,38 @@ class IdentityLedger:
             raise ValueError("invalid deployment id")
         return self._root / deployment_id / EVIDENCE_FILE
 
+    def _ensure_directory(self, directory: Path) -> None:
+        """Create missing directories and fsync each new entry's parent (fsync(2): syncing
+        a file does not make its directory entry durable)."""
+        missing = []
+        current = directory
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for path in reversed(missing):
+            with contextlib.suppress(FileExistsError):
+                path.mkdir(mode=0o700)
+            _fsync_directory(path.parent)
+
     def append_evidence(self, deployment_id: str, identities: Iterable[Identity | None]) -> int:
         rows = [i for i in identities if i is not None]
         if not rows:
             return 0
         path = self._path(deployment_id)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._ensure_directory(path.parent)
         now = to_db_time(utcnow())
         payload = "".join(
             json.dumps({"id": i.resource_id, "parent": i.parent_id, "source": i.source, "at": now})
             + "\n"
             for i in rows
         )
-        data = payload.encode()
+        created = not path.exists()
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # Exclusive lock across threads and processes (worker, API, operator CLI): the
+            # torn-tail check and the possibly-short write loop must not interleave.
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            data = payload.encode()
             # A crash can leave a torn, unterminated last record. Start on a fresh line so the
             # fragment stays its own (skipped) line instead of swallowing this record.
             size = os.fstat(fd).st_size
@@ -118,8 +134,28 @@ class IdentityLedger:
                 view = view[written:]
             os.fsync(fd)
         finally:
-            os.close(fd)
+            os.close(fd)  # also releases the lock
+        if created:
+            _fsync_directory(path.parent)
         return len(rows)
+
+    @staticmethod
+    def missing(
+        conn: sqlite3.Connection, deployment_id: str, identities: Iterable[Identity | None]
+    ) -> list[Identity]:
+        """Identities not (yet) present in the table, exactly as recorded (ID, parent, source)."""
+        absent = []
+        for item in identities:
+            if item is None:
+                continue
+            row = conn.execute(
+                "SELECT 1 FROM deployment_resources WHERE deployment_id = ? AND resource_id = ? "
+                "AND IFNULL(parent_id, '') = ? AND source = ?",
+                (deployment_id, item.resource_id, item.parent_id or "", item.source),
+            ).fetchone()
+            if row is None:
+                absent.append(item)
+        return absent
 
     def import_evidence(self, conn: sqlite3.Connection, deployment_id: str) -> int:
         imported = self._import_deployment_record(conn, deployment_id)
@@ -193,8 +229,21 @@ class IdentityLedger:
             if r["resource_type"] == "volume":
                 # A volume can appear once without and once with its parent; keep the parent.
                 volumes[r["resource_id"]] = r["parent_id"] or volumes.get(r["resource_id"])
-        root_volumes: dict[str, set[str]] = {}
+        launch_roots: dict[str, set[str]] = {}
+        observed_roots: dict[str, set[str]] = {}
         for r in rows:
-            if r["resource_type"] == "volume" and r["parent_id"] and r["source"] in ROOT_SOURCES:
-                root_volumes.setdefault(r["parent_id"], set()).add(r["resource_id"])
-        return KnownIdentities(instances, volumes, groups, root_volumes)
+            if r["resource_type"] != "volume" or not r["parent_id"]:
+                continue
+            if r["source"] in LAUNCH_ROOT_SOURCES:
+                launch_roots.setdefault(r["parent_id"], set()).add(r["resource_id"])
+            elif r["source"] == ROOT_DEVICE:
+                observed_roots.setdefault(r["parent_id"], set()).add(r["resource_id"])
+        return KnownIdentities(instances, volumes, groups, launch_roots, observed_roots)
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

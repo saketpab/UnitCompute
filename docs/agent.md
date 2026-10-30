@@ -38,10 +38,17 @@ rejected.
   history length, total turns per session, messages per user per day and output tokens are
   all configurable (`UNITCOMPUTE_AGENT_*`).
 - Recognisable credentials in user messages are replaced with `[REDACTED]` before the
-  model sees them, before they are stored, and again when history is loaded. This covers
-  AWS key IDs, `secret_access_key=`/`password:`-style pairs, bearer tokens, JWTs, `sk-`
-  keys and PEM private keys. Detection is pattern-based and cannot catch every secret. The
-  reply tells the user something was removed.
+  model sees them, before they are stored, in replies and stored replay responses, and
+  again when history is loaded. This covers:
+  - AWS key IDs;
+  - assignments to known credential names (`secret_access_key`, `password`, `api_key`,
+    `client_secret`, session/access/auth tokens, `private_key`), whether unquoted,
+    `'single'`- or `"double"`-quoted (whole quoted value), `export NAME="…"` or JSON
+    `"name": "…"`;
+  - bearer tokens, JWTs, `sk-` keys and PEM private keys.
+
+  Detection is pattern-based and bounded: prose such as "my password is …" is not
+  recognised. The reply tells the user something was removed.
 - The model never receives credentials, raw plans or state, plan hashes, or other users'
   data. Owners are identified only by their token subject, which is not sent to the model.
   LangSmith/LangChain tracing is forced off.

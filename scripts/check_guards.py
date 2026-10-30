@@ -497,8 +497,8 @@ MUTATIONS = [
         (
             (
                 "identities.py",
-                'and r["parent_id"] and r["source"] in ROOT_SOURCES:',
-                'and r["parent_id"]:',
+                'if r["source"] in LAUNCH_ROOT_SOURCES:',
+                "if True:",
             ),
         ),
         ("tests/test_review_round3.py::test_r3_2_attached_data_disk_is_not_root_evidence",),
@@ -506,19 +506,10 @@ MUTATIONS = [
     Mutation(
         "r3-2-root-device-name",
         (("provisioning/aws.py", 'bool(root_name) and m.get("DeviceName") == root_name', "True"),),
-        ("tests/test_review_round3.py::test_r3_2_live_root_device_is_positively_identified",),
-    ),
-    Mutation(
-        "r3-2-recorded-volume-exists",
-        (("admin.py", "    if not exists:", "    if False:"),),
         (
-            "tests/test_review_round2.py::test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone",
+            "tests/test_review_round3.py::"
+            "test_r3_2_root_device_observation_is_distinct_from_launch_root",
         ),
-    ),
-    Mutation(
-        "r3-2-recorded-root-matches",
-        (("admin.py", "if roots and args.volume_id not in roots:", "if False:"),),
-        ("tests/test_review_round3.py::test_r3_2_recorded_root_must_exist_and_match_the_instance",),
     ),
     Mutation(
         "r3-3-plan-needs-root-identity",
@@ -569,6 +560,100 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_review_round3.py::test_r3_7_legacy_history_is_redacted_before_the_provider",),
+    ),
+    Mutation(
+        "r4-observation-not-launch-root",
+        (
+            (
+                "identities.py",
+                '{"apply_output", "terraform_state", "deployment_record", "migration"}',
+                '{"apply_output", "terraform_state", "deployment_record", "migration", '
+                '"root_device"}',
+            ),
+        ),
+        (
+            "tests/test_review_round4.py::test_r4_2_replacement_root_does_not_complete_historical_identity",
+        ),
+    ),
+    Mutation(
+        "r4-relookup-after-discovery",
+        (
+            (
+                "worker.py",
+                "        live = self.provisioner.find_resources(known.all_ids)\n        merged =",
+                "        merged =",
+            ),
+        ),
+        (
+            "tests/test_review_round4.py::test_r4_2_launch_evidence_plus_replacement_requires_both_gone",
+        ),
+    ),
+    Mutation(
+        "r4-source-distinct-index",
+        (
+            (
+                "db/migrations/0004_source_distinct_identity.sql",
+                "IFNULL(parent_id, ''), source);",
+                "IFNULL(parent_id, ''));",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_4_later_sources_are_kept_for_the_same_volume",),
+    ),
+    Mutation(
+        "r4-evidence-presence-check",
+        (("worker.py", "        if absent:", "        if False:"),),
+        ("tests/test_review_round4.py::test_r4_4_recording_fails_loudly_if_evidence_is_absent",),
+    ),
+    Mutation(
+        "r4-append-lock",
+        (("identities.py", "            fcntl.flock(fd, fcntl.LOCK_EX)\n", ""),),
+        ("tests/test_review_round4.py::test_r4_5_concurrent_short_appends_keep_every_record",),
+    ),
+    Mutation(
+        "r4-new-file-dir-fsync",
+        (
+            (
+                "identities.py",
+                "        if created:\n            _fsync_directory(path.parent)",
+                "        if False:\n            _fsync_directory(path.parent)",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
+    ),
+    Mutation(
+        "r4-new-ancestor-fsync",
+        (
+            (
+                "identities.py",
+                "                path.mkdir(mode=0o700)\n            _fsync_directory(path.parent)",
+                "                path.mkdir(mode=0o700)",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_6_new_evidence_file_and_directories_are_fsynced",),
+    ),
+    Mutation(
+        "r4-retain-unresolved-apply",
+        (
+            (
+                "worker.py",
+                "\"OR (plans.status = 'apply_failed' AND EXISTS (\"",
+                "\"OR (plans.status = 'apply_failed' AND NOT EXISTS (\"",
+            ),
+        ),
+        (
+            "tests/test_review_round4.py::test_r4_7_failed_apply_workdir_kept_until_a_later_apply_succeeds",
+        ),
+    ),
+    Mutation(
+        "r4-quoted-assignment",
+        (
+            (
+                "logging_setup.py",
+                "(\\\"[^\\\"\\n]*\\\"|'[^'\\n]*'|[^\\s\\\"',;]+)",
+                "([^\\s\\\"',;]+)",
+            ),
+        ),
+        ("tests/test_review_round4.py::test_r4_3_redaction_preserves_quotes_and_bounds",),
     ),
     Mutation(
         "policy-imdsv2",

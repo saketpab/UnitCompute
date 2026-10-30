@@ -13,13 +13,19 @@ from typing import Any
 
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
+# Pattern-based, so bounded: it covers the listed credential names in name=value,
+# name: value, export NAME="value", 'single-quoted' and JSON "name": "value" forms (the
+# whole quoted value, spaces included), plus the token shapes below. It cannot recognise
+# every secret.
+_CREDENTIAL_FIELD_NAMES = (
+    r"(?:aws_secret_access_key|secret_access_key|aws_session_token|session_token|password|"
+    r"passwd|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key)"
+)
+_ASSIGNMENT = re.compile(
+    rf"(?i)(\b{_CREDENTIAL_FIELD_NAMES}[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)"
+)
 _PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA|AROA|AIDA)[A-Z0-9]{16}\b"),
-    re.compile(
-        r"(?i)(aws_secret_access_key|secret_access_key|aws_session_token|session_token|"
-        r"password|passwd|api[_-]?key|access[_-]?token|client[_-]?secret)"
-        r"(\s*[=:]\s*|\"\s*:\s*\")([^\s\"',]+)"
-    ),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -31,15 +37,19 @@ _PATTERNS = [
 REDACTED = "[REDACTED]"
 
 
+def _redact_assignment(match: re.Match[str]) -> str:
+    value = match.group(2)
+    quote = value[0] if value[0] in "\"'" else ""
+    return f"{match.group(1)}{quote}{REDACTED}{quote}"
+
+
 def redact(text: str, secrets: Iterable[str] = ()) -> str:
     for secret in secrets:
         if secret and len(secret) >= 8:
             text = text.replace(secret, REDACTED)
+    text = _ASSIGNMENT.sub(_redact_assignment, text)
     for pattern in _PATTERNS:
-        if pattern.groups >= 3:
-            text = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
-        else:
-            text = pattern.sub(REDACTED, text)
+        text = pattern.sub(REDACTED, text)
     return text
 
 

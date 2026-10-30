@@ -14,8 +14,8 @@ GPT-6.1-Sol, medium effort, in fresh contexts run by the orchestrator.
 |---|---|
 | Live AWS sandbox lifecycle (plan → approve → launch → EC2/SSM ready → destroy → verify) | **Blocked**: no sandbox credentials or spending authorization |
 | Paid runtime LLM test | **Not run**: no authorization |
-| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4: pending |
-| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). Round-3 fix commit: see below |
+| Two clean independent Sol Medium review rounds on the final commit | Round 1 on `715e5e3`: **not clean**. Round 2 on `910e9c0`: **not clean**. Round 3 on `018c180`: **not clean**. Round 4 on `8cf2e5d`: **not clean**. Round 5: pending |
+| Safe CI on the exact pushed commit | `715e5e3`: passed ([run 40959338191](https://github.com/saketpab/UnitCompute/actions/runs/40959338191)). `910e9c0`: passed ([run 40988581402](https://github.com/saketpab/UnitCompute/actions/runs/40988581402)). `018c180`: passed ([run 40992170490](https://github.com/saketpab/UnitCompute/actions/runs/40992170490)). `8cf2e5d`: passed ([run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496)). Round-4 fix commit: see below |
 | Draft PR | Not opened (gates outstanding) |
 
 ## Candidate 1: `715e5e380b543c38971a802e83a780fec691f173`
@@ -194,7 +194,7 @@ KILLED, so an unknown test ID would have looked like a kill. Now only exit code 
 other codes are reported as BROKEN. All 73 referenced test IDs collect (only the renamed
 R2-3 ID needed updating).
 
-## Round 3 fix commit (parent `018c180`)
+## Round 3 fix commit: `8cf2e5d2176264bcfe8105aa5f4ed4b67936b3fd` (parent `018c180`)
 
 | Check | Result |
 |---|---|
@@ -204,7 +204,89 @@ R2-3 ID needed updating).
 | Reviewer reproductions against `018c180` and the fix tree | see "Round 3 findings" above |
 | pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
 | Process-level offline runs (real API and worker processes) | Fresh data dir, and a restart on the round-2 schema-3 data dir with existing identities (no migration needed). Both: `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; a synthetic `aws_secret_access_key=` chat message was not stored and the reply carried the redaction notice; second worker refused; worker stopped on SIGTERM |
-| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+| CI on the exact pushed commit | passed: [run 41016426496](https://github.com/saketpab/UnitCompute/actions/runs/41016426496), 320 tests |
 
 The live AWS lifecycle, IAM, EC2 and SSM gate remains blocked and is not proven by these
 offline results.
+
+## Candidate 4: `8cf2e5d2176264bcfe8105aa5f4ed4b67936b3fd`
+
+| Check | Result |
+|---|---|
+| Sol Medium security review | **not clean**: 4 required findings |
+| Sol Medium reliability review | **not clean**: 6 required findings |
+
+Both reviews reported the operator non-root/unrelated-volume false deletion, the
+quoted-secret leak and the source-uniqueness suppression, so there are 7 unique findings
+(R4-1 to R4-7 below).
+
+## Round 4 findings → fixes → tests
+
+Reviewer reproductions: security4 `test_security4_independent.py` (7 cases, one of them a
+JSON redaction control) and reliability4 `test_reliability_review4.py` (6 tests). Both files
+were kept outside the repository:
+
+- On `8cf2e5d`, all 13 pass: every defect reproduces, and the JSON control holds.
+- On the fix tree (with only the import of the removed `_record_root_volume` made optional),
+  all 12 defect cases fail and the control still passes.
+- Several of those fail incidentally, because the operator command no longer exists or
+  `root_volumes` was renamed. So `tests/test_review_round4.py` replays every scenario end to
+  end through the API, worker and moto-backed AWS lookups and asserts the safe outcome:
+  no `deleted`, and quota held.
+
+Design change (one coherent rule, not special cases): an instance's identity is complete
+only with **launch-root evidence**, meaning what UnitCompute recorded from Terraform:
+
+- apply outputs;
+- Terraform `root_block_device` state;
+- the deployment row's root ID;
+- migrated copies of those.
+
+Current root-device mappings (including replacement roots), attached disks and tag inventory
+are **observations**. They are recorded and must be verified gone, but they never complete
+identity. The operator `record-root-volume` path was **removed**, because no operator input
+can verify a historical root association. The recovery route is restoring launch evidence:
+Terraform state from the versioned bucket, or the retained `errored.tfstate`.
+
+| ID | Finding | Fix | Regression tests (`tests/test_review_round4.py`) | Mutants |
+|---|---|---|---|---|
+| R4-1 (P1, both reviews) | An operator-recorded unrelated or non-root volume completed identity, causing false deletion and quota release | `record-root-volume` removed; completeness needs launch-root evidence only | `test_r4_1_unrelated_volume_cannot_complete_identity` (even a deployment-tagged volume), `test_r4_1_known_non_root_disk_cannot_complete_identity`, `test_r3_2_operator_root_claims_no_longer_exist` | `r4-observation-not-launch-root` |
+| R4-2 (P1, security) | A replacement at the root device name completed historical identity | Root-device mappings are recorded as `root_device` observations (`KnownIdentities.observed_roots`), separate from `launch_roots`. Planning also looks resources up again after discovery, so a newly observed replacement outside state rejects the same plan (a gap found while writing these tests) | `test_r4_2_replacement_root_does_not_complete_historical_identity`, `test_r4_2_launch_evidence_plus_replacement_requires_both_gone` | `r4-observation-not-launch-root`, `r4-relookup-after-discovery` |
+| R4-3 (P2, both reviews) | Quoted credential assignments leaked to the model, history, output and replay | One assignment pattern for listed credential names with unquoted, `'single'`, `"double"` (whole value), `export NAME="…"` and JSON forms, keeping the quotes. Applied at input, history load and reply (so stored replay responses too). Bounded: prose isn't recognised | `test_r4_3_*` (7 forms, model echo, history, stored response, provider-free replay, legacy history, bounds) | `r4-quoted-assignment` |
+| R4-4 (P2, both reviews) | The unique index ignored a new source for the same resource/parent, so later valid evidence was dropped silently | Migration 0004 rebuilds the unique index to include `source` (append-only triggers unchanged). Evidence files re-import rows the old index suppressed. `record_identities` raises unless the exact rows are present | `test_r4_4_later_sources_are_kept_for_the_same_volume`, `test_r4_4_upgrade_reimports_evidence_suppressed_by_old_index` (real schema 3→4 upgrade), `test_r4_4_recording_fails_loudly_if_evidence_is_absent` | `r4-source-distinct-index`, `r4-evidence-presence-check` |
+| R4-5 (P2) | Concurrent short appends lost acknowledged evidence | An exclusive `flock` on the evidence file covers the torn-tail check, the short-write loop and the fsync, across threads and processes | `test_r4_5_concurrent_short_appends_keep_every_record` (reviewer interleaving), `test_r4_5_appends_from_separate_processes_are_serialized` (4 processes × 200 appends) | `r4-append-lock` |
+| R4-6 (P2) | New evidence file and directory entries weren't made durable | The parent of every newly created directory is fsynced, and the file's directory after the file is created (per fsync(2)) | `test_r4_6_new_evidence_file_and_directories_are_fsynced` (traced fsync targets) | `r4-new-file-dir-fsync`, `r4-new-ancestor-fsync` |
+| R4-7 (P2) | An unapproved repair preview allowed pruning a failed apply's work directory (which may hold `errored.tfstate`) | Retention is keyed on apply history: an `apply_failed` plan's directory is kept until a later apply for that deployment succeeds, whatever previews come in between | `test_r4_7_failed_apply_workdir_kept_until_a_later_apply_succeeds` (repair preview and deletion preview, then resolved and pruned) | `r4-retain-unresolved-apply` |
+
+Changed test expectations (each is stricter):
+
+- `test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone` is now
+  `test_r2_3_unknown_root_disk_blocks_until_launch_evidence_recovered`. Recovery needs
+  restored Terraform state, not an operator record. The disk must still be verified gone,
+  and the first deletion ends `recovery_required` because the disk exists.
+- `test_r2_3_live_instance_disk_is_discovered_and_verified` is now
+  `test_r2_3_live_root_observation_is_recorded_but_not_launch_evidence`. A live root
+  observation no longer completes identity.
+- `test_r3_2_live_root_device_is_positively_identified` is now
+  `test_r3_2_root_device_observation_is_distinct_from_launch_root`, for the same reason.
+- `test_r3_2_recorded_root_must_exist_and_match_the_instance` is replaced by
+  `test_r3_2_operator_root_claims_no_longer_exist`.
+- Migration lists now include schema 4.
+- Mutants `r3-2-recorded-volume-exists` and `r3-2-recorded-root-matches` were removed with
+  the command they guarded. `r3-2-root-sources-only` was retargeted to the
+  launch-root-source check.
+
+## Round 4 fix commit (parent `8cf2e5d`)
+
+| Check | Result |
+|---|---|
+| ruff format and lint, `mypy --strict`, `uv lock --check` | passed |
+| `pytest` with offline Terraform tests required | 340 passed |
+| `scripts/check_guards.py` | 81/81 mutants killed in one full run (74 earlier, minus 2 removed with the operator command, plus 9 new). All referenced test IDs collect and every mutation applies exactly once |
+| Reviewer reproductions against `8cf2e5d` and the fix tree | see "Round 4 findings" above |
+| pip-audit (hash-pinned), gitleaks (working tree) | passed, nothing found |
+| Process-level offline runs (real API and worker processes) | Fresh data dir (migrations 1–4), and an **upgrade** of the round-3 data dir from schema 3 to 4 (`applied: [4]`). Both: `/readyz` 503 without a worker and 200 with one; client walkthrough exit 0; a quoted `export AWS_SECRET_ACCESS_KEY="…"` chat message was not stored and the reply carried the removal notice; source-distinct evidence rows present; second worker refused; worker stopped on SIGTERM |
+| CI on the exact pushed commit | reported in the handoff (the ledger cannot contain its own commit's SHA) |
+
+Residual limits: redaction is pattern-based. Whether real AWS reports root mappings,
+retains replaced roots and accepts the IAM policies is part of the blocked live gate.

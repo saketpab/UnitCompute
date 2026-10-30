@@ -699,7 +699,7 @@ def _schema_v1_deployment(
             "?, ?)",
             (dep, iid, now, now),
         )
-    assert db.migrate() == [2, 3]
+    assert db.migrate() == [2, 3, 4]
     if volume:
         with db.transaction() as conn:
             conn.execute("UPDATE deployments SET root_volume_id = ? WHERE id = ?", (volume, dep))
@@ -732,7 +732,7 @@ def test_r2_3_migration_backfills_known_identities(
             "'simulated', 'h', 'us-east-1', 'k', 'v', ?, ?)",
             (dep, now, json.dumps(["i-0bbbbbbbbbbbbbbb2", "vol-0bbbbbbbbbbbbbbb2"])),
         )
-    assert db.migrate() == [3]
+    assert db.migrate() == [3, 4]
     with db.read() as conn:
         known = IdentityLedger.known(conn, dep)
     assert known.instances == {"i-0aaaaaaaaaaaaaaa1", "i-0bbbbbbbbbbbbbbb2"}
@@ -751,11 +751,23 @@ def _client(settings: Any, db: Database, clock: FakeClock) -> Any:
     return client, SimpleNamespace(settings=settings, db=db, client=client, clock=clock)
 
 
-def test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone(
+def _restore_terraform_state(h: Any, dep: str, instance_id: str, volume_id: str) -> None:
+    """Model an operator restoring the deployment's Terraform state from the versioned state
+    bucket (or the retained errored.tfstate): the recoverable launch-root evidence."""
+    with h.db.read() as conn:
+        row = conn.execute("SELECT * FROM deployments WHERE id = ?", (dep,)).fetchone()
+    provisioner = SimulatedProvisioner(h.settings.data_dir)
+    state = provisioner._desired(Worker._spec(row), "ami-0123456789abcdef0")
+    state["aws_instance.vm"]["id"] = instance_id
+    state["aws_instance.vm"]["root_block_device"][0]["volume_id"] = volume_id
+    provisioner._state_path(dep).write_text(json.dumps(state))
+
+
+def test_r2_3_unknown_root_disk_blocks_until_launch_evidence_recovered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
-    """Round 3 tightened this: no operator waiver exists. The root volume must be identified
-    as evidence (AWS confirms it exists) and then verified gone like any other resource."""
+    """Rounds 3-4 tightened this: no operator claim can complete identity. Only recovered
+    launch evidence (restored Terraform state) does, and the disk must then be verified gone."""
     ec2 = moto_env
     vm = ec2.run_instances(
         ImageId="ami-12345678",
@@ -771,7 +783,6 @@ def test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone(
     clock = FakeClock()
     client, h = _client(settings, db, clock)
     with client:
-        # The unresolved root identity blocks the deletion preview itself.
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
         assert pending["status"] == "plan_failed"
         assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
@@ -782,45 +793,29 @@ def test_r2_3_unknown_root_disk_blocks_until_recorded_and_verified_gone(
             == 409
         )
 
-        from argparse import Namespace
-
-        from unitcompute.admin import _record_root_volume
-
-        def record(instance: str, volume: str) -> int:
-            return _record_root_volume(
-                db,
-                Namespace(
-                    deployment_id=dep,
-                    instance_id=instance,
-                    volume_id=volume,
-                    operator="ops-oncall",
-                    reason="CloudTrail RunInstances",
-                ),
-                _AwsBacked(h),
-                IdentityLedger(settings.workdir_root),
-            )
-
-        assert record("i-0123456789abcdef0", vid) == 1  # not this deployment's instance
-        assert record(iid, "vol-0123456789abcdef0") == 1  # AWS does not know it
-        assert record(iid, vid) == 0
-        # Recorded root volume exists outside Terraform state: preview rejected until an
-        # operator removes it; nothing is waived.
+        _restore_terraform_state(h, dep, iid, vid)
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
-        assert pending["current_plan"]["status"] == "rejected"
-        assert vid in pending["current_plan"]["error"]["message"]
+        assert pending["status"] == "awaiting_deletion_approval", pending
+        with db.read() as conn:
+            assert IdentityLedger.known(conn, dep).launch_roots == {iid: {vid}}
+        approve_current(h, pending)
+        Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
+        # Terraform's state is gone but AWS still has the disk: not deleted.
+        stuck = _detail(h, dep)
+        assert stuck["status"] == "recovery_required"
+        assert vid in stuck["latest_job"]["error"]["message"]
         ec2.delete_volume(VolumeId=vid)
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
         approve_current(h, pending)
         Worker(settings, db, _AwsBacked(h), clock=clock).run_once()
         assert _detail(h, dep)["status"] == "deleted"
-        with db.read() as conn:
-            actions = [r[0] for r in conn.execute("SELECT action FROM audit_events")]
-        assert "identity.root_volume_recorded" in actions
 
 
-def test_r2_3_live_instance_disk_is_discovered_and_verified(
+def test_r2_3_live_root_observation_is_recorded_but_not_launch_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, moto_env: Any
 ) -> None:
+    """Round 4 tightened this: the current root mapping is recorded as a resource to verify,
+    but it cannot stand in for the (unknown) launch root."""
     ec2 = moto_env
     vm = ec2.run_instances(
         ImageId="ami-12345678",
@@ -832,17 +827,16 @@ def test_r2_3_live_instance_disk_is_discovered_and_verified(
     )["Instances"][0]
     iid, vid = vm["InstanceId"], vm["BlockDeviceMappings"][0]["Ebs"]["VolumeId"]
     settings, db, dep = _schema_v1_deployment(tmp_path, monkeypatch, iid)
-    clock = FakeClock()
-    client, h = _client(settings, db, clock)
+    client, h = _client(settings, db, FakeClock())
     with client:
-        # Planning sees the live, recorded VM outside Terraform state and refuses; while
-        # doing so it discovers and records the root disk identity.
         _, pending = _replan(h, _AwsBacked(h), dep, "deletion-plan")
         assert pending["status"] == "plan_failed"
+        assert pending["current_plan"]["error"]["code"] == "identity_incomplete"
         with db.read() as conn:
             known = IdentityLedger.known(conn, dep)
         assert known.volumes.get(vid) == iid
-        assert known.instances_without_root_disk() == []
+        assert known.observed_roots == {iid: {vid}}
+        assert known.instances_without_root_disk() == [iid]
 
 
 # ------------------------------------------- R2-5: readiness during previews

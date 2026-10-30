@@ -560,8 +560,17 @@ class Worker:
 
     def record_identities(self, deployment_id: str, identities: list[Identity | None]) -> None:
         """Durably append identity evidence (file first, then the append-only table)."""
-        if self.identities.append_evidence(deployment_id, identities):
-            self.import_identities(deployment_id)
+        if not self.identities.append_evidence(deployment_id, identities):
+            return
+        with self._tx() as conn:
+            self.identities.import_evidence(conn, deployment_id)
+            absent = self.identities.missing(conn, deployment_id, identities)
+        if absent:
+            # Never report evidence as recorded unless the exact rows are present.
+            raise RuntimeError(
+                "identity evidence not present after import: "
+                + ", ".join(f"{i.resource_id}/{i.source}" for i in absent)
+            )
 
     def import_identities(self, deployment_id: str) -> KnownIdentities:
         with self._tx() as conn:
@@ -604,11 +613,15 @@ class Worker:
         self._discover_volumes(
             deployment_id, [r.resource_id for r in live if r.resource_type == "instance"]
         )
-        missing = self.import_identities(deployment_id).instances_without_root_disk()
+        known = self.import_identities(deployment_id)
+        missing = known.instances_without_root_disk()
         if missing:
             # A known instance whose root disk was never identified may have left a billable
             # disk behind; neither repair nor deletion may proceed until it is identified.
             raise JobFailure("identity_incomplete", _missing_root_message(missing))
+        # Look up again: disks discovered just now (e.g. a replacement root) must also be
+        # reconciled against Terraform state in this same plan.
+        live = self.provisioner.find_resources(known.all_ids)
         merged = {r.resource_id: r for r in [*tagged, *live]}
         return list(merged.values())
 
@@ -922,11 +935,18 @@ class Worker:
             self.refresh_readiness()
         cutoff = to_db_time(now_dt - timedelta(days=self.settings.workdir_retention_days))
         with self.db.read() as conn:
+            # A failed or uncertain apply's work directory can hold the only recovery state
+            # (Terraform writes errored.tfstate there if the backend write fails). Keep it
+            # until a later apply for the deployment has succeeded, whatever previews were
+            # requested in between.
             rows = conn.execute(
-                "SELECT plans.id, plans.deployment_id FROM plans JOIN deployments "
-                "ON deployments.id = plans.deployment_id WHERE plans.created_at < ? AND ("
+                "SELECT plans.id, plans.deployment_id FROM plans WHERE plans.created_at < ? AND ("
                 "plans.status IN ('superseded', 'expired', 'rejected', 'failed', 'applied') "
-                "OR (plans.status = 'apply_failed' AND deployments.status <> 'recovery_required'))",
+                "OR (plans.status = 'apply_failed' AND EXISTS ("
+                "  SELECT 1 FROM jobs later WHERE later.deployment_id = plans.deployment_id "
+                "  AND later.kind = 'apply' AND later.status = 'succeeded' AND later.rowid > ("
+                "    SELECT MAX(attempt.rowid) FROM jobs attempt WHERE attempt.plan_id = plans.id"
+                "  ))))",
                 (cutoff,),
             ).fetchall()
         for row in rows:
