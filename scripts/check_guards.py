@@ -147,11 +147,168 @@ MUTATIONS = [
         (
             (
                 "agent/service.py",
-                "if recent >= self._settings.agent_max_messages_per_day:",
+                "if attempts >= self._settings.agent_max_messages_per_day:",
                 "if False:",
             ),
         ),
         ("tests/test_agent.py::test_daily_message_cap_per_owner",),
+    ),
+    Mutation(
+        "s1-terraform-needs-jwt",
+        (
+            (
+                "config.py",
+                "if self.provisioner is ProvisionerKind.TERRAFORM and (",
+                "if False and (",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_s1_real_provisioning_requires_verified_team_auth",),
+    ),
+    Mutation(
+        "r3-daily-reservation",
+        (
+            (
+                "agent/service.py",
+                "if attempts >= self._settings.agent_max_messages_per_day:",
+                "if False:",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r3_concurrent_requests_cannot_exceed_daily_cap",),
+    ),
+    Mutation(
+        "r3-session-turn-reservation",
+        (
+            (
+                "agent/service.py",
+                '"UPDATE chat_sessions SET turns = turns + 1, updated_at = ? WHERE id = ?",',
+                '"UPDATE chat_sessions SET updated_at = ? WHERE id = ?",',
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r3_concurrent_requests_cannot_exceed_session_turns",),
+    ),
+    Mutation(
+        "r3-failed-attempts-counted",
+        (
+            (
+                "agent/service.py",
+                "\"UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, \"",
+                '"DELETE FROM agent_attempts WHERE 1 = 1 OR "',
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r3_failed_attempts_stay_counted",),
+    ),
+    Mutation(
+        "r6-chat-idempotency",
+        (("agent/service.py", "            if prior is not None:", "            if False:"),),
+        (
+            "tests/test_review_round1.py::test_r6_chat_idempotency_replays_without_second_model_call",
+        ),
+    ),
+    Mutation(
+        "s3-approval-binding",
+        (
+            (
+                SVC,
+                "                binding = binding_problem(self._settings, plan)\n"
+                "                if binding:",
+                "                binding = binding_problem(self._settings, plan)\n"
+                "                if False:",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_s3_changed_execution_config_invalidates_approval",),
+    ),
+    Mutation(
+        "s3-worker-binding",
+        (
+            (
+                WORKER,
+                "        binding = binding_problem(self.settings, plan)\n        if binding:",
+                "        binding = binding_problem(self.settings, plan)\n        if False:",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_s3_worker_rechecks_execution_config",),
+    ),
+    Mutation(
+        "s4-provisioners",
+        ((POLICY, 'if resource.get("provisioners"):', "if False:"),),
+        ("tests/test_review_round1.py::test_s4_provisioners_rejected",),
+    ),
+    Mutation(
+        "s4-group-attachment",
+        ((POLICY, "if group_id is not None and groups == [group_id]:", "if True:"),),
+        ("tests/test_review_round1.py::test_s4_existing_instance_must_use_its_own_group",),
+    ),
+    Mutation(
+        "s4-root-attributes",
+        (
+            (
+                POLICY,
+                'extra_root = sorted(set(_first(after.get("root_block_device"))) - '
+                "ROOT_CREATE_FIELDS)",
+                "extra_root: list[str] = []",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_s4_unreviewed_instance_attributes_rejected",),
+    ),
+    Mutation(
+        "r1-delete-by-id",
+        ((WORKER, "found = self.provisioner.find_resources(sorted(known))", "found = []"),),
+        ("tests/test_review_round1.py::test_r1_untagged_vm_with_lost_state_blocks_deletion",),
+    ),
+    Mutation(
+        "r2-stranded-recovery",
+        ((WORKER, "        if self._has_stranded_jobs():", "        if False:"),),
+        ("tests/test_review_round1.py::test_r2_persistent_contention_recovers_without_replay",),
+    ),
+    Mutation(
+        "r2-write-retry",
+        ((WORKER, "        delays = [*self.write_retry_delays, None]", "        delays = [None]"),),
+        ("tests/test_review_round1.py::test_r2_transient_contention_is_retried",),
+    ),
+    Mutation(
+        "r4-ready-needs-worker",
+        (("api/app.py", "ready = ready and recent and healthy", "ready = ready"),),
+        ("tests/test_review_round1.py::test_r4_not_ready_without_worker",),
+    ),
+    Mutation(
+        "r4-health-gate",
+        (
+            (
+                WORKER,
+                "if self._self_check_due() and not self.self_check():\n            return False\n"
+                "        if not self._healthy:\n            return False",
+                "if self._self_check_due():\n            self.self_check()",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r4_unhealthy_worker_takes_no_jobs",),
+    ),
+    Mutation(
+        "r4-role-identity",
+        (
+            (
+                "provisioning/aws.py",
+                "if account != self._settings.aws_account_id or not "
+                "caller.startswith(expected_prefix):",
+                "if False:",
+            ),
+        ),
+        ("tests/test_review_round1.py::test_r4_role_identity_verification",),
+    ),
+    Mutation(
+        "r5-connection-ready",
+        ((WORKER, "int(readiness.ready),", "1,"),),
+        (
+            "tests/test_review_round1.py::"
+            "test_r5_infrastructure_success_is_distinct_from_connection_readiness",
+        ),
+    ),
+    Mutation(
+        "r5-exact-ssm-identity",
+        (("provisioning/aws.py", 'if item.get("InstanceId") == instance_id', "if True"),),
+        (
+            "tests/test_review_round1.py::"
+            "test_r5_connection_readiness_reads_ec2_checks_and_exact_ssm_identity",
+        ),
     ),
     Mutation(
         "policy-imdsv2",

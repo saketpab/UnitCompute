@@ -178,6 +178,15 @@ class FakeAws:
     def resolve_ami(self, creds: TemporaryCredentials) -> str:
         return "ami-0123456789abcdef0"
 
+    def verify_role_identity(self, role: str) -> dict[str, str]:
+        return {"account": "****9012", "role": f"unitcompute-{role}"}
+
+    def owned_resources(self, deployment_id: str, creds: TemporaryCredentials) -> list[Any]:
+        return []
+
+    def find_resources(self, ids: list[str], creds: TemporaryCredentials) -> list[Any]:
+        return []
+
 
 SPEC = DeploymentSpec(
     "dep_0123456789abcdef0123456789abcdef", "0123456789abcdef", "demo", 8, "us-east-1", "t3.micro"

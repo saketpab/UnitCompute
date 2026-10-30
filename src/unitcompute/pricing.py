@@ -12,7 +12,8 @@ from unitcompute.schemas import CostEstimate, CostLine
 class PriceSnapshot:
     version: str
     region: str
-    recorded_on: str
+    basis: str
+    verified_against_aws_on: str | None
     hours_per_month: int
     t3_micro_hourly: Decimal
     public_ipv4_hourly: Decimal
@@ -20,10 +21,14 @@ class PriceSnapshot:
     sources: tuple[str, ...]
 
 
+# Illustrative list prices taken from the project specification. They have NOT been checked
+# against current AWS pricing; an operator must verify them (and bump the version and
+# verification date) before relying on them for budgeting.
 PRICE_SNAPSHOT = PriceSnapshot(
-    version="us-east-1/2026-10-29.1",
+    version="us-east-1/illustrative-spec-baseline.1",
     region="us-east-1",
-    recorded_on="2026-10-29",
+    basis="illustrative baseline from the UnitCompute specification",
+    verified_against_aws_on=None,
     hours_per_month=730,
     t3_micro_hourly=Decimal("0.0104"),
     public_ipv4_hourly=Decimal("0.005"),
@@ -44,9 +49,9 @@ EXCLUDED = [
 ]
 
 DISCLAIMER = (
-    "Estimate from a recorded on-demand price snapshot for a full 730-hour month; actual "
-    "charges vary. No Free Tier eligibility is assumed or guaranteed. AWS budget alerts "
-    "notify but do not cap spending."
+    "Illustrative estimate for a full 730-hour month from unverified baseline list prices; "
+    "this is not a quote and actual charges vary. No Free Tier eligibility is assumed or "
+    "guaranteed. AWS budget alerts notify but do not cap spending."
 )
 
 _CENT = Decimal("0.01")
@@ -84,7 +89,8 @@ def estimate_monthly_cost(disk_gib: int, snapshot: PriceSnapshot = PRICE_SNAPSHO
         price_snapshot={
             "version": snapshot.version,
             "region": snapshot.region,
-            "recorded_on": snapshot.recorded_on,
+            "basis": snapshot.basis,
+            "verified_against_aws_on": snapshot.verified_against_aws_on,
             "sources": list(snapshot.sources),
             "live_quote": False,
         },

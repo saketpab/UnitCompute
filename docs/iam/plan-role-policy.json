@@ -7,6 +7,7 @@
       "Action": [
         "ec2:DescribeImages",
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
         "ec2:DescribeInstanceAttribute",
         "ec2:DescribeInstanceCreditSpecifications",
         "ec2:DescribeInstanceTypes",
@@ -20,7 +21,11 @@
         "ssm:DescribeInstanceInformation"
       ],
       "Resource": "*",
-      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
     },
     {
       "Sid": "ResolveOfficialAmazonLinuxAmi",
@@ -33,19 +38,44 @@
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::${state_bucket}",
-      "Condition": {"StringLike": {"s3:prefix": ["deployments/*"]}}
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "deployments/*"
+          ]
+        }
+      }
     },
     {
-      "Sid": "DeploymentStateAndLockFiles",
+      "Sid": "DeploymentStateRead",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*"
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
+    },
+    {
+      "Sid": "DeploymentStateLockFiles",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate.tflock"
     },
     {
       "Sid": "NeverTouchBootstrapState",
       "Effect": "Deny",
       "Action": "s3:*",
       "Resource": "arn:aws:s3:::${state_bucket}/bootstrap/*"
+    },
+    {
+      "Sid": "PlanningNeverWritesOrDeletesState",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
     }
   ]
 }

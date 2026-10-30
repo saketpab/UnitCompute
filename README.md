@@ -63,7 +63,9 @@ uv run python examples/offline_client.py
 
 Development mode uses `Authorization: Bearer dev:<name>` tokens. They only work when
 `UNITCOMPUTE_ENVIRONMENT=development` and `UNITCOMPUTE_AUTH_MODE=dev`, and the API refuses to
-bind dev auth to a non-loopback address. With no configuration, provisioning is
+bind dev auth to a non-loopback address. Dev auth can never be combined with
+`UNITCOMPUTE_PROVISIONER=terraform`: real provisioning always requires verified JWT team
+authentication. With no configuration, provisioning is
 **disabled**: `POST /deployments` returns `503 provisioning_disabled`.
 
 Settings are `UNITCOMPUTE_*` environment variables (see `src/unitcompute/config.py`).

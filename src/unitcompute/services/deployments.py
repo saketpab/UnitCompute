@@ -75,6 +75,41 @@ def canonical_hash(payload: Any) -> str:
     ).hexdigest()
 
 
+def execution_binding(settings: Settings, deployment_id: str) -> str:
+    """Hash of everything that decides where and as whom a saved plan executes.
+
+    A plan approved under one account, network, profile, state backend or role set must not
+    run after any of them changes; the saved plan would still target the old values."""
+    return canonical_hash(
+        {
+            "provisioner": settings.provisioner.value,
+            "region": settings.aws_region,
+            "account_id": settings.aws_account_id,
+            "vpc_id": settings.vpc_id,
+            "subnet_id": settings.subnet_id,
+            "instance_profile_name": settings.instance_profile_name,
+            "state_bucket": settings.state_bucket,
+            "state_key": state_key(deployment_id),
+            "plan_role_arn": settings.plan_role_arn,
+            "apply_role_arn": settings.apply_role_arn,
+        }
+    )
+
+
+def binding_problem(settings: Settings, plan: sqlite3.Row) -> str | None:
+    if not plan["execution_hash"] or not hmac.compare_digest(
+        plan["execution_hash"], execution_binding(settings, plan["deployment_id"])
+    ):
+        return "The AWS account, network, profile, state backend or roles changed since this plan."
+    if plan["state_key"] != state_key(plan["deployment_id"]):
+        return "The plan's state backend key does not belong to this deployment."
+    if settings.provisioner is ProvisionerKind.TERRAFORM and (
+        plan["account_id"] != settings.aws_account_id
+    ):
+        return "The plan was produced in a different AWS account."
+    return None
+
+
 def expected_versions(provisioner: str) -> dict[str, Any]:
     """Versions a plan must have been produced with to be approvable/applicable now."""
     if provisioner == ProvisionerKind.SIMULATED:
@@ -482,6 +517,9 @@ class DeploymentService:
                         "request a fresh preview.",
                         code="plan_stale",
                     )
+                binding = binding_problem(self._settings, plan)
+                if binding:
+                    raise Conflict(f"{binding} Request a fresh preview.", code="plan_stale")
                 if deployment["status"] != APPROVABLE_STATUS[plan["kind"]]:
                     raise Conflict(
                         "The deployment is not waiting for this approval.", code="invalid_state"
@@ -644,22 +682,36 @@ class DeploymentService:
             resources = {
                 "instance_id": row["instance_id"],
                 "security_group_id": row["security_group_id"],
-                "ssm_ping_status": row["ssm_ping_status"],
+                "root_volume_id": row["root_volume_id"],
+                "connection": {
+                    "ready": bool(row["connection_ready"]),
+                    "ec2_status_checks": row["ec2_status"],
+                    "ssm_ping_status": row["ssm_ping_status"],
+                    "checked_at": row["readiness_checked_at"],
+                },
             }
             simulated = row["provisioner"] == ProvisionerKind.SIMULATED
             command = (
                 f"aws ssm start-session --target {row['instance_id']} --region {row['region']}"
             )
-            access = AccessInstructions(
-                command=None if simulated else command,
-                requirements=["Simulated deployment: there is no real VM to connect to."]
+            ready = bool(row["connection_ready"])
+            requirements = (
+                ["Simulated deployment: there is no real VM to connect to."]
                 if simulated
                 else [
                     "An AWS IAM identity allowed to call ssm:StartSession on this instance; "
                     "a UnitCompute login alone is not sufficient.",
                     "AWS CLI v2 with the Session Manager plugin installed.",
                     "No inbound ports are open, so SSH and other direct access are unavailable.",
-                ],
+                ]
+            )
+            if not ready:
+                requirements.append(
+                    "Not ready yet: sessions fail until EC2 status checks pass and SSM reports "
+                    "the instance Online (see resources.connection)."
+                )
+            access = AccessInstructions(
+                ready=ready, command=None if simulated else command, requirements=requirements
             )
         return DeploymentDetail(
             id=row["id"],

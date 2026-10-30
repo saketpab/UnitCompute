@@ -79,6 +79,18 @@ class OwnedResource:
     state: str
 
 
+@dataclass(frozen=True)
+class Readiness:
+    """Connection readiness, separate from whether infrastructure was applied."""
+
+    ec2_status: str | None  # "ok" once both EC2 status checks pass
+    ssm_status: str | None  # SSM PingStatus for this exact EC2 instance, e.g. "Online"
+
+    @property
+    def ready(self) -> bool:
+        return self.ec2_status == "ok" and self.ssm_status in {"Online", "Online (simulated)"}
+
+
 class ProvisioningError(Exception):
     """A failure whose ``safe_message`` may be shown to the resource owner."""
 
@@ -108,9 +120,22 @@ class Provisioner(Protocol):
 
     def apply(self, spec: DeploymentSpec, workdir: Path, plan_path: Path) -> ApplyResult: ...
 
-    def owned_resources(self, deployment_id: str) -> list[OwnedResource]: ...
+    def owned_resources(self, deployment_id: str) -> list[OwnedResource]:
+        """Resources currently carrying this deployment's tag."""
+        ...
 
-    def ssm_ping_status(self, instance_id: str) -> str | None: ...
+    def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
+        """Look up known instance/volume/security-group IDs directly, regardless of tags.
+
+        Returns those that still exist (instances that are not terminated). Raises
+        ProvisioningError when existence cannot be established."""
+        ...
+
+    def connection_readiness(self, instance_id: str) -> Readiness: ...
+
+    def self_check(self) -> dict[str, Any]:
+        """Verify tool versions and execution identities; raise ProvisioningError if not."""
+        ...
 
 
 def template_dir() -> Path:

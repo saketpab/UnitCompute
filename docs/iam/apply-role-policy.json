@@ -7,6 +7,7 @@
       "Action": [
         "ec2:DescribeImages",
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
         "ec2:DescribeInstanceAttribute",
         "ec2:DescribeInstanceCreditSpecifications",
         "ec2:DescribeInstanceTypes",
@@ -19,7 +20,11 @@
         "ec2:DescribeVpcs"
       ],
       "Resource": "*",
-      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
     },
     {
       "Sid": "LaunchOnlyTaggedSmallImdsV2Instances",
@@ -40,9 +45,16 @@
       "Action": "ec2:RunInstances",
       "Resource": "arn:aws:ec2:us-east-1:${account_id}:volume/*",
       "Condition": {
-        "Bool": {"ec2:Encrypted": "true"},
-        "StringEquals": {"ec2:VolumeType": "gp3", "aws:RequestTag/ManagedBy": "unitcompute"},
-        "NumericLessThanEquals": {"ec2:VolumeSize": "30"}
+        "Bool": {
+          "ec2:Encrypted": "true"
+        },
+        "StringEquals": {
+          "ec2:VolumeType": "gp3",
+          "aws:RequestTag/ManagedBy": "unitcompute"
+        },
+        "NumericLessThanEquals": {
+          "ec2:VolumeSize": "30"
+        }
       }
     },
     {
@@ -71,7 +83,11 @@
         "arn:aws:ec2:us-east-1:${account_id}:vpc/${vpc_id}",
         "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
       ],
-      "Condition": {"StringEqualsIfExists": {"aws:RequestTag/ManagedBy": "unitcompute"}}
+      "Condition": {
+        "StringEqualsIfExists": {
+          "aws:RequestTag/ManagedBy": "unitcompute"
+        }
+      }
     },
     {
       "Sid": "TagOnlyAtCreation",
@@ -82,7 +98,14 @@
         "arn:aws:ec2:us-east-1:${account_id}:volume/*",
         "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
       ],
-      "Condition": {"StringEquals": {"ec2:CreateAction": ["RunInstances", "CreateSecurityGroup"]}}
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "RunInstances",
+            "CreateSecurityGroup"
+          ]
+        }
+      }
     },
     {
       "Sid": "ManageOnlyUnitComputeResources",
@@ -100,27 +123,54 @@
         "arn:aws:ec2:us-east-1:${account_id}:instance/*",
         "arn:aws:ec2:us-east-1:${account_id}:security-group/*"
       ],
-      "Condition": {"StringEquals": {"ec2:ResourceTag/ManagedBy": "unitcompute"}}
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "unitcompute"
+        }
+      }
     },
     {
       "Sid": "PassOnlyTheSsmInstanceRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
       "Resource": "${ssm_instance_role_arn}",
-      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      }
     },
     {
       "Sid": "ListDeploymentStatePrefixOnly",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::${state_bucket}",
-      "Condition": {"StringLike": {"s3:prefix": ["deployments/*"]}}
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "deployments/*"
+          ]
+        }
+      }
     },
     {
-      "Sid": "DeploymentStateAndLockFiles",
+      "Sid": "DeploymentStateReadWrite",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*"
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
+    },
+    {
+      "Sid": "DeploymentStateLockFiles",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate.tflock"
     },
     {
       "Sid": "NeverTouchBootstrapState",
@@ -131,8 +181,16 @@
     {
       "Sid": "NoIamChanges",
       "Effect": "Deny",
-      "NotAction": ["iam:PassRole"],
+      "NotAction": [
+        "iam:PassRole"
+      ],
       "Resource": "arn:aws:iam::*:*"
+    },
+    {
+      "Sid": "NeverDeleteDeploymentState",
+      "Effect": "Deny",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::${state_bucket}/deployments/*/terraform.tfstate"
     }
   ]
 }

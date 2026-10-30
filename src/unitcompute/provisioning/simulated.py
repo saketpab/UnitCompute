@@ -22,11 +22,18 @@ from unitcompute.provisioning.base import (
     PlanKind,
     PlanResult,
     ProvisioningError,
+    Readiness,
     RuntimeVersions,
     sha256_file,
     template_hash,
 )
-from unitcompute.provisioning.policy import AWS_PROVIDER, expected_tags
+from unitcompute.provisioning.policy import (
+    AWS_PROVIDER,
+    CONFIGURED_ARGUMENTS,
+    DEDICATED_GROUP_REFERENCES,
+    INSTANCE_CREATE_VALUES,
+    expected_tags,
+)
 
 SIMULATED_AMI = "ami-0000000000000000a"
 SIMULATED_TARGETS = NetworkTargets(
@@ -45,6 +52,15 @@ def _write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
+
+
+def _expressions(address: str) -> dict[str, Any]:
+    expressions: dict[str, Any] = {
+        name: {"constant_value": "simulated"} for name in CONFIGURED_ARGUMENTS[address]
+    }
+    if address == "aws_instance.vm":
+        expressions["vpc_security_group_ids"] = {"references": DEDICATED_GROUP_REFERENCES}
+    return expressions
 
 
 class SimulatedProvisioner:
@@ -81,6 +97,10 @@ class SimulatedProvisioner:
         return {
             "aws_security_group.vm": {
                 "id": _sim_id("sg", spec.deployment_id),
+                "name": f"unitcompute-{spec.deployment_id}",
+                "description": "UnitCompute (simulated)",
+                "revoke_rules_on_delete": False,
+                "timeouts": None,
                 "vpc_id": t.vpc_id,
                 "region": spec.region,
                 "ingress": [],
@@ -107,8 +127,8 @@ class SimulatedProvisioner:
                 "region": spec.region,
                 "iam_instance_profile": t.instance_profile_name,
                 "associate_public_ip_address": True,
-                "user_data": None,
-                "launch_template": [],
+                "vpc_security_group_ids": [_sim_id("sg", spec.deployment_id)],
+                **INSTANCE_CREATE_VALUES,
                 "metadata_options": [
                     {
                         "http_endpoint": "enabled",
@@ -131,6 +151,26 @@ class SimulatedProvisioner:
             },
         }
 
+    @staticmethod
+    def _planned_create(
+        values: dict[str, Any], current: dict[str, dict[str, Any]]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Mirror Terraform: computed IDs are unknown until apply."""
+        after = {k: v for k, v in values.items() if k not in {"id", "vpc_security_group_ids"}}
+        after["tags_all"] = after["tags"]
+        unknown: dict[str, Any] = {"id": True}
+        if "root_block_device" in after:
+            after["root_block_device"] = [
+                {k: v for k, v in device.items() if k != "volume_id"}
+                for device in after["root_block_device"]
+            ]
+            group = current.get("aws_security_group.vm")
+            if group is None:
+                unknown["vpc_security_group_ids"] = True
+            else:
+                after["vpc_security_group_ids"] = [group["id"]]
+        return after, unknown
+
     def plan(
         self, spec: DeploymentSpec, kind: PlanKind, workdir: Path, frozen_ami_id: str | None
     ) -> PlanResult:
@@ -146,7 +186,8 @@ class SimulatedProvisioner:
                     continue
                 actions, after = ["delete"], None
             elif before is None:
-                actions, after = ["create"], {k: v for k, v in values.items() if k != "id"}
+                actions = ["create"]
+                after, unknown = self._planned_create(values, current)
             else:
                 actions, after = ["no-op"], before
             changes.append(
@@ -156,7 +197,12 @@ class SimulatedProvisioner:
                     "type": address.split(".")[0],
                     "name": "vm",
                     "provider_name": AWS_PROVIDER,
-                    "change": {"actions": actions, "before": before, "after": after},
+                    "change": {
+                        "actions": actions,
+                        "before": before,
+                        "after": after,
+                        "after_unknown": unknown if actions == ["create"] else {},
+                    },
                 }
             )
         t = SIMULATED_TARGETS
@@ -193,8 +239,15 @@ class SimulatedProvisioner:
                 },
                 "root_module": {
                     "resources": [
-                        {"address": "aws_instance.vm"},
-                        {"address": "aws_security_group.vm"},
+                        {
+                            "address": address,
+                            "mode": "managed",
+                            "type": address.split(".")[0],
+                            "name": "vm",
+                            "provider_config_key": "aws",
+                            "expressions": _expressions(address),
+                        }
+                        for address in CONFIGURED_ARGUMENTS
                     ]
                 },
             },
@@ -258,5 +311,17 @@ class SimulatedProvisioner:
             )
         return found
 
-    def ssm_ping_status(self, instance_id: str) -> str | None:
-        return "Online (simulated)"
+    def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
+        wanted = set(resource_ids)
+        found: list[OwnedResource] = []
+        for path in sorted(self._state_dir.glob("dep_*.json")):
+            for resource in self.owned_resources(path.stem):
+                if resource.resource_id in wanted:
+                    found.append(resource)
+        return found
+
+    def connection_readiness(self, instance_id: str) -> Readiness:
+        return Readiness(ec2_status="ok", ssm_status="Online (simulated)")
+
+    def self_check(self) -> dict[str, Any]:
+        return {"provisioner": "simulated", "aws": "not contacted"}

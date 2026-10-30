@@ -20,6 +20,7 @@ from unitcompute.provisioning.base import (
     PlanKind,
     PlanResult,
     ProvisioningError,
+    Readiness,
     RuntimeVersions,
     lock_provider_versions,
     sha256_file,
@@ -237,6 +238,25 @@ class TerraformProvisioner:
         creds = self._aws.credentials("plan", f"uc-inventory-{deployment_id[4:20]}")
         return self._aws.owned_resources(deployment_id, creds)
 
-    def ssm_ping_status(self, instance_id: str) -> str | None:
-        creds = self._aws.credentials("plan", "uc-ssm-status")
-        return self._aws.ssm_ping_status(instance_id, creds)
+    def find_resources(self, resource_ids: list[str]) -> list[OwnedResource]:
+        creds = self._aws.credentials("plan", "uc-verify-ids")
+        return self._aws.find_resources(resource_ids, creds)
+
+    def connection_readiness(self, instance_id: str) -> Readiness:
+        creds = self._aws.credentials("plan", "uc-readiness")
+        return self._aws.connection_readiness(instance_id, creds)
+
+    def self_check(self) -> dict[str, Any]:
+        versions = self.runtime_versions()
+        plan_identity = self._aws.verify_role_identity("plan")
+        apply_identity = self._aws.verify_role_identity("apply")
+        if plan_identity["role"] == apply_identity["role"]:
+            raise ProvisioningError("aws_identity_mismatch", "Plan and apply roles are the same.")
+        ami_id = self._aws.resolve_ami(self._aws.credentials("plan", "uc-selfcheck-ami"))
+        return {
+            "terraform_version": versions.terraform_version,
+            "provider_versions": versions.provider_versions,
+            "plan_role": plan_identity,
+            "apply_role": apply_identity,
+            "base_image": ami_id,
+        }

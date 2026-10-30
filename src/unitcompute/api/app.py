@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -17,7 +18,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from unitcompute.agent.service import AgentService, build_model_factory
 from unitcompute.auth import Authenticator, Principal, build_authenticator
-from unitcompute.config import Settings
+from unitcompute.config import ProvisionerKind, Settings
 from unitcompute.db.database import LATEST_SCHEMA_VERSION, Database, from_db_time, utcnow
 from unitcompute.errors import AppError, InvalidInput
 from unitcompute.logging_setup import request_id_var
@@ -196,9 +197,9 @@ def build_router() -> APIRouter:
         summary="Chat with the configuration assistant",
     )
     async def agent_message(
-        body: AgentMessageRequest, principal: PrincipalDep, request: Request
+        body: AgentMessageRequest, principal: PrincipalDep, key: IdempotencyDep, request: Request
     ) -> AgentReply:
-        return await _container(request).agent.handle(principal, body, request_id_var.get())
+        return await _container(request).agent.handle(principal, body, request_id_var.get(), key)
 
     @router.post(
         "/deployments",
@@ -304,7 +305,8 @@ def build_router() -> APIRouter:
     @router.get("/readyz", tags=["ops"], include_in_schema=False)
     def readyz(request: Request) -> JSONResponse:
         container = _container(request)
-        checks: dict[str, Any] = {"provisioner": container.settings.provisioner.value}
+        settings = container.settings
+        checks: dict[str, Any] = {"provisioner": settings.provisioner.value}
         ready = True
         try:
             version = container.db.schema_version()
@@ -312,13 +314,26 @@ def build_router() -> APIRouter:
             ready = version == LATEST_SCHEMA_VERSION
             with container.db.read() as conn:
                 row = conn.execute(
-                    "SELECT MAX(heartbeat_at) AS hb FROM worker_heartbeats"
+                    "SELECT heartbeat_at, healthy, checks_json FROM worker_heartbeats "
+                    "ORDER BY heartbeat_at DESC LIMIT 1"
                 ).fetchone()
-            last = row["hb"] if row else None
-            checks["worker_last_heartbeat"] = last
-            checks["worker_recent"] = bool(
-                last and (utcnow() - from_db_time(last)).total_seconds() < 120
+            last = row["heartbeat_at"] if row else None
+            recent = bool(
+                last
+                and (utcnow() - from_db_time(last)).total_seconds() < settings.worker_stale_seconds
             )
+            healthy = bool(row and row["healthy"])
+            checks.update(
+                worker_last_heartbeat=last, worker_recent=recent, worker_self_check_ok=healthy
+            )
+            if row and not healthy:
+                problem = json.loads(row["checks_json"] or "{}")
+                checks["worker_self_check"] = {
+                    k: problem.get(k) for k in ("code", "message") if k in problem
+                }
+            if settings.provisioner is not ProvisionerKind.DISABLED:
+                # Jobs only progress with a live worker whose self-check passed.
+                ready = ready and recent and healthy
         except Exception:
             log.warning("readiness check failed", exc_info=True)
             ready = False

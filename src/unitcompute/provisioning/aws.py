@@ -18,12 +18,22 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from unitcompute.config import AL2023_AMI_PARAMETER, Settings
-from unitcompute.provisioning.base import TAG_DEPLOYMENT, OwnedResource, ProvisioningError
+from unitcompute.provisioning.base import (
+    TAG_DEPLOYMENT,
+    OwnedResource,
+    ProvisioningError,
+    Readiness,
+)
 
 _AMI = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _BOTO_CONFIG = Config(
     retries={"max_attempts": 4, "mode": "standard"}, connect_timeout=10, read_timeout=30
 )
+_NOT_FOUND = {
+    "InvalidInstanceID.NotFound",
+    "InvalidVolume.NotFound",
+    "InvalidGroup.NotFound",
+}
 LIVE_INSTANCE_STATES = ["pending", "running", "shutting-down", "stopping", "stopped"]
 
 
@@ -160,11 +170,103 @@ class AwsEnvironment:
             ) from exc
         return found
 
-    def ssm_ping_status(self, instance_id: str, creds: TemporaryCredentials) -> str | None:
+    def verify_role_identity(self, role: Literal["plan", "apply"]) -> dict[str, str]:
+        """Assume the role and prove, via STS, which account and role the credentials are."""
+        arn = self._settings.plan_role_arn if role == "plan" else self._settings.apply_role_arn
+        creds = self.credentials(role, f"uc-selfcheck-{role}")
+        try:
+            identity = self._client("sts", creds).get_caller_identity()
+        except (ClientError, BotoCoreError) as exc:
+            raise ProvisioningError(
+                "aws_identity_unverified", f"Could not verify the {role} role identity."
+            ) from exc
+        account = str(identity.get("Account"))
+        caller = str(identity.get("Arn", ""))
+        role_name = (arn or "").rsplit("/", 1)[-1]
+        expected_prefix = f"arn:aws:sts::{account}:assumed-role/{role_name}/"
+        if account != self._settings.aws_account_id or not caller.startswith(expected_prefix):
+            raise ProvisioningError(
+                "aws_identity_mismatch",
+                f"The {role} credentials are not the configured role in the configured account.",
+            )
+        return {"account": f"****{account[-4:]}", "role": role_name}
+
+    def find_resources(
+        self, resource_ids: list[str], creds: TemporaryCredentials
+    ) -> list[OwnedResource]:
+        """Direct lookups by ID; tags are not trusted for deletion verification."""
+        found: list[OwnedResource] = []
+        ec2 = self._client("ec2", creds)
+        for resource_id in sorted(set(resource_ids)):
+            try:
+                if resource_id.startswith("i-"):
+                    reservations = ec2.describe_instances(InstanceIds=[resource_id])["Reservations"]
+                    for reservation in reservations:
+                        for instance in reservation["Instances"]:
+                            state = instance["State"]["Name"]
+                            if state != "terminated":
+                                found.append(OwnedResource("instance", resource_id, state))
+                elif resource_id.startswith("vol-"):
+                    for volume in ec2.describe_volumes(VolumeIds=[resource_id])["Volumes"]:
+                        found.append(OwnedResource("volume", resource_id, volume["State"]))
+                elif resource_id.startswith("sg-"):
+                    ec2.describe_security_groups(GroupIds=[resource_id])
+                    found.append(OwnedResource("security_group", resource_id, "exists"))
+                else:
+                    raise ProvisioningError(
+                        "resource_identity_unknown", f"Cannot verify resource {resource_id}."
+                    )
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in _NOT_FOUND:
+                    continue
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not verify whether {resource_id} still exists."
+                ) from exc
+            except BotoCoreError as exc:
+                raise ProvisioningError(
+                    "aws_unavailable", f"Could not verify whether {resource_id} still exists."
+                ) from exc
+        return found
+
+    def connection_readiness(self, instance_id: str, creds: TemporaryCredentials) -> Readiness:
+        """EC2 status checks plus SSM registration of this exact EC2 instance."""
+        try:
+            statuses = self._client("ec2", creds).describe_instance_status(
+                InstanceIds=[instance_id], IncludeAllInstances=True
+            )["InstanceStatuses"]
+        except (ClientError, BotoCoreError):
+            ec2_status = None
+        else:
+            if not statuses:
+                ec2_status = "unknown"
+            else:
+                status = statuses[0]
+                checks = {
+                    status.get("InstanceStatus", {}).get("Status"),
+                    status.get("SystemStatus", {}).get("Status"),
+                }
+                state = status.get("InstanceState", {}).get("Name")
+                if state != "running":
+                    ec2_status = str(state)
+                elif checks == {"ok"}:
+                    ec2_status = "ok"
+                elif "impaired" in checks:
+                    ec2_status = "impaired"
+                else:
+                    ec2_status = "initializing"
         try:
             info = self._client("ssm", creds).describe_instance_information(
                 Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
             )["InstanceInformationList"]
         except (ClientError, BotoCoreError):
-            return None
-        return str(info[0]["PingStatus"]) if info else "NotRegistered"
+            ssm_status = None
+        else:
+            matching = [
+                item
+                for item in info
+                if item.get("InstanceId") == instance_id
+                and item.get("ResourceType", "EC2Instance") == "EC2Instance"
+            ]
+            ssm_status = str(matching[0].get("PingStatus")) if matching else "NotRegistered"
+        return Readiness(ec2_status=ec2_status, ssm_status=ssm_status)

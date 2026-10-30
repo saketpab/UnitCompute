@@ -20,6 +20,31 @@ mode), per-plan Terraform work directories and logs. Everything is created with 
 permissions. Back it up with `sqlite3 data/unitcompute.sqlite3 ".backup <file>"`.
 Terraform state is not stored here; it lives in S3.
 
+### Worker self-check and readiness
+
+At start-up, and every `UNITCOMPUTE_WORKER_SELF_CHECK_SECONDS` (default 300), the worker
+verifies:
+
+- the pinned Terraform version;
+- that each execution role can be assumed;
+- that STS reports each role as `assumed-role/<configured role name>` in the configured
+  account;
+- that the two roles are distinct;
+- that the official AL2023 AMI resolves.
+
+A worker that fails its self-check takes no jobs. `/readyz` returns `503` unless the
+schema is current and, whenever provisioning is enabled, the newest worker heartbeat is
+younger than `UNITCOMPUTE_WORKER_STALE_SECONDS` (default 120) and its self-check passed. The
+failing check's code is included in the response. Only the last four digits of the account
+are reported.
+
+### Database contention
+
+The worker retries acquiring the write lock for terminal job updates with bounded backoff.
+If an update still cannot be written, the worker recovers that job the next time it is idle,
+while it still holds the worker lock: a plan becomes `failed`, and an apply becomes
+`recovery_required`. An apply is never replayed.
+
 ## Production configuration
 
 Production refuses to start unless all of the following are set. Unknown `UNITCOMPUTE_*`
@@ -30,7 +55,7 @@ variables are also rejected.
 | `UNITCOMPUTE_ENVIRONMENT=production` | Enables fail-closed validation |
 | `UNITCOMPUTE_AUTH_MODE=jwt`, `_AUTH_ISSUER`, `_AUTH_AUDIENCE`, `_AUTH_JWKS_URL` (https) | Token verification |
 | `UNITCOMPUTE_AUTH_REQUIRED_GROUP`, optional `_AUTH_GROUPS_CLAIM` (default `groups`) | Team membership |
-| `UNITCOMPUTE_PROVISIONER=terraform` | The simulator and the disabled mode are refused in production |
+| `UNITCOMPUTE_PROVISIONER=terraform` | The simulator and the disabled mode are refused in production. In any environment, Terraform provisioning requires `auth_mode=jwt` with a team group, so development identities can never drive real infrastructure. |
 | `UNITCOMPUTE_AWS_ACCOUNT_ID`, `_VPC_ID`, `_SUBNET_ID`, `_INSTANCE_PROFILE_NAME` | Approved bootstrap network and SSM profile |
 | `UNITCOMPUTE_STATE_BUCKET` | Bucket for per-deployment state |
 | `UNITCOMPUTE_PLAN_ROLE_ARN`, `UNITCOMPUTE_APPLY_ROLE_ARN` | Two distinct execution roles |
@@ -64,8 +89,10 @@ access to that prefix, and nothing in this repository applies them.
 4. **Runtime roles.** Use [docs/iam/plan-role-policy.json](iam/plan-role-policy.json) and
    [docs/iam/apply-role-policy.json](iam/apply-role-policy.json) as starting points. Replace
    the `${…}` placeholders, then review the policies and test them with IAM Access Analyzer
-   policy validation before use. The plan role is read-only for infrastructure, but even
-   read-only planning needs state `GetObject` and lock-object `PutObject`/`DeleteObject`.
+   policy validation before use. The plan role is read-only for infrastructure. It may
+   only read `terraform.tfstate` (writes and deletes are explicitly denied), but planning
+   still needs `GetObject`/`PutObject`/`DeleteObject` on the separate `.tflock` objects.
+   The apply role may read and write state but never delete it.
    The apply role can only launch tagged `t3.micro` instances with IMDSv2 and encrypted gp3
    disks of 30 GiB or less in the approved subnet, manage resources tagged
    `ManagedBy=unitcompute`, and pass only the SSM instance role. Both roles must trust only
@@ -92,13 +119,30 @@ access to that prefix, and nothing in this repository applies them.
    expected actions, attribute values and ownership tags. It rejects extra resources, data
    sources, modules, provider arguments, replacements and untracked tagged resources
    (orphans).
-3. The binary plan is stored read-only, together with its SHA-256, template, Terraform and
-   provider versions, account, region, AMI, state key, cost snapshot and a 15-minute expiry.
+   It also rejects provisioners, unreviewed arguments or meta-arguments, and any
+   instance-to-security-group attachment other than the deployment's own group. For newly
+   created resources, attributes outside the reviewed set (for example `key_name`,
+   `tenancy`, extra network interfaces, or custom IOPS or throughput) are rejected.
+3. The binary plan is stored read-only, together with:
+   - its SHA-256;
+   - the template, Terraform and provider versions;
+   - account, region, AMI and state key;
+   - an execution-binding hash over the account, VPC, subnet, instance profile, state bucket
+     and key, and both role ARNs;
+   - the resource IDs in prior state;
+   - the cost snapshot and a 15-minute expiry.
 4. Approval, and the worker again just before applying, re-check owner, plan type, expiry,
-   hash, versions and job state. Apply runs exactly `terraform apply -input=false tfplan`
-   with apply-role credentials.
-5. A create is marked `active` only after the instance is found by its tags. A deletion is
-   marked `deleted` only after no tagged instance, volume or security group remains.
+   hash, versions, execution binding and job state. Apply runs exactly
+   `terraform apply -input=false tfplan` with apply-role credentials.
+5. A create is marked `active` only after the instance is found by its tags and by direct
+   ID lookup. Its instance, security group and root volume IDs are recorded. Connection
+   readiness (both EC2 status checks plus SSM `Online` for that exact instance) is then
+   observed for up to `UNITCOMPUTE_READINESS_TIMEOUT_SECONDS` and refreshed every
+   `UNITCOMPUTE_READINESS_REFRESH_SECONDS`.
+6. A deletion is marked `deleted` only after no tagged resource remains and every recorded
+   or state-known instance, volume and security group ID is confirmed gone by direct
+   lookup. If existence cannot be established, the deployment stays `recovery_required`
+   and keeps its quota slot.
 
 Terraform runs with a fixed argument list (`shell=False`), a minimal environment (no
 inherited variables, no shared AWS config files, no IMDS), a separate process group, and a

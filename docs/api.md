@@ -47,7 +47,18 @@ Other statuses:
   operator must reconcile them.
 
 Your VM slot stays reserved until a deletion is verified, including while a deployment is in
-`plan_failed` or `recovery_required`.
+`plan_failed` or `recovery_required`. A deletion is verified only when every resource ever
+recorded for the deployment (instance, root volume and security group IDs, plus the IDs in
+Terraform state) is confirmed gone by direct lookup, and nothing tagged for it remains. If
+that cannot be established, the deployment stays `recovery_required`.
+
+### Connection readiness
+
+`active` means the infrastructure was applied and the VM was verified to exist. It does not
+mean you can connect yet. `resources.connection` shows the latest EC2 status checks
+(`ec2_status_checks`), SSM registration of this exact instance (`ssm_ping_status`) and when
+they were checked. `access.ready` is `true` only when both checks pass. The worker
+observes readiness for a bounded time after launch and then refreshes it periodically.
 
 ### Plans and approval
 
@@ -61,7 +72,9 @@ minutes of the preview being created. The server rejects approval if the plan:
 - was already approved or applied (`409 plan_not_approvable`)
 - has expired (`409 plan_expired`)
 - has a different hash (`409 plan_hash_mismatch`)
-- was produced by a different template, Terraform or provider version (`409 plan_stale`)
+- was produced by a different template, Terraform or provider version, or under a different
+  AWS account, VPC, subnet, instance profile, state bucket or key, or execution role
+  (`409 plan_stale`)
 - is the wrong plan type for the deployment's state (`409 invalid_state`)
 
 The worker repeats these checks, and re-hashes the plan file, immediately before running
@@ -81,10 +94,10 @@ All errors share one shape:
 | 401 | Missing, invalid or expired token (`WWW-Authenticate: Bearer`) |
 | 403 | Valid token, but not a member of the team group |
 | 404 | Not found **or not yours**; the two cases are indistinguishable by design |
-| 409 | Conflict: `quota_exceeded`, `job_in_progress`, `invalid_state`, `idempotency_key_reused`, plan errors above, `session_turn_limit` |
+| 409 | Conflict: `quota_exceeded`, `job_in_progress`, `invalid_state`, `idempotency_key_reused`, `idempotency_in_progress`, plan errors above, `session_turn_limit` |
 | 413 | Body larger than `UNITCOMPUTE_MAX_REQUEST_BYTES` (default 16 KiB) |
 | 422 | Invalid input, including unknown fields. Input values are not echoed back. |
-| 429 | `rate_limited`: assistant daily message cap per user (`UNITCOMPUTE_AGENT_MAX_MESSAGES_PER_DAY`) |
+| 429 | `rate_limited`: assistant daily cap per user (`UNITCOMPUTE_AGENT_MAX_MESSAGES_PER_DAY`). Every model attempt counts, including failed, timed-out and cancelled ones. |
 | 503 | `provisioning_disabled`, `agent_unavailable`, `agent_timeout`, `database_busy` (retry) |
 
 Every response carries `X-Request-ID`. Quote it when reporting a problem.
@@ -97,16 +110,23 @@ Mutating routes accept an optional `Idempotency-Key` header: 8–128 characters 
 - The same key with the same body returns the original status and body without repeating
   the action.
 - The same key with a different body returns `409 idempotency_key_reused`.
+- For `POST /agent/messages`, a repeat while the first request is still running returns
+  `409 idempotency_in_progress`, and the model is never called twice for one key. If the first
+  attempt failed, the key is released for a retry, but the failed attempt still counts
+  toward your daily assistant limit.
 
 Idempotency makes retries of *requests* safe. It does not make AWS execution exactly-once.
 
 ## Costs
 
-Previews include an estimate from a versioned price snapshot (`price_snapshot.version`,
-`recorded_on` and `sources`). It is not a live quote. The baseline for a 730-hour month is
-EC2 t3.micro $7.59 + public IPv4 $3.65 + 8 GiB gp3 $0.64 = **$11.88**, and disk cost scales
-with size. Taxes, data transfer, snapshots and control-plane usage are excluded. No Free
-Tier eligibility is assumed. AWS budget alerts notify you but do not cap spending.
+Previews include an illustrative estimate from a versioned price snapshot
+(`price_snapshot.version`, `basis`, `verified_against_aws_on` and `sources`). The current
+snapshot uses the baseline list prices from the project specification. It has **not** been
+checked against current AWS pricing (`verified_against_aws_on` is `null`), and it is never a
+quote. The baseline for a 730-hour month is EC2 t3.micro $7.59 + public IPv4 $3.65 + 8 GiB
+gp3 $0.64 = **$11.88**, and disk cost scales with size. Taxes, data transfer, snapshots and
+control-plane usage are excluded. No Free Tier eligibility is assumed. AWS budget alerts
+notify you but do not cap spending.
 
 ## Client walkthrough
 

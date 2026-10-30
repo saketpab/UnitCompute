@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     plan_ttl_seconds: int = Field(default=900, ge=60, le=900)
     workdir_retention_days: int = Field(default=7, ge=1, le=90)
     worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=60)
+    worker_stale_seconds: int = Field(default=120, ge=30, le=3600)
+    worker_self_check_seconds: int = Field(default=300, ge=30, le=86400)
+    readiness_timeout_seconds: float = Field(default=300, ge=0, le=1800)
+    readiness_poll_seconds: float = Field(default=15, ge=0, le=300)
+    readiness_refresh_seconds: int = Field(default=300, ge=30, le=86400)
 
     agent_model: str | None = None
     agent_timeout_seconds: float = Field(default=45, ge=1, le=120)
@@ -131,6 +136,11 @@ class Settings(BaseSettings):
             problems.append(f"aws_region must be {SUPPORTED_REGION}")
         if production and self.auth_mode is not AuthMode.JWT:
             problems.append("production requires auth_mode=jwt")
+        if self.provisioner is ProvisionerKind.TERRAFORM and (
+            self.auth_mode is not AuthMode.JWT or not self.auth_required_group
+        ):
+            # Real infrastructure is never driven by forgeable development identities.
+            problems.append("provisioner=terraform requires auth_mode=jwt with auth_required_group")
         if self.auth_mode is AuthMode.JWT:
             for field in ("auth_issuer", "auth_audience", "auth_jwks_url"):
                 if not getattr(self, field):

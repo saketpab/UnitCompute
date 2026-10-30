@@ -18,7 +18,10 @@ import signal
 import socket
 import sqlite3
 import threading
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import FrameType
@@ -26,20 +29,25 @@ from typing import Any
 
 from unitcompute.config import ProvisionerKind, Settings, load_settings
 from unitcompute.db.database import Database, from_db_time, to_db_time, utcnow
+from unitcompute.errors import ServiceUnavailable
 from unitcompute.logging_setup import configure_logging, redact, secure_process_defaults
 from unitcompute.pricing import estimate_monthly_cost
 from unitcompute.provisioning.base import (
     DeploymentSpec,
+    OwnedResource,
     PlanKind,
     Provisioner,
     ProvisioningError,
+    Readiness,
     owner_tag,
     sha256_file,
 )
 from unitcompute.provisioning.factory import build_provisioner
-from unitcompute.provisioning.policy import evaluate_plan
+from unitcompute.provisioning.policy import evaluate_plan, prior_resource_ids
 from unitcompute.services.deployments import (
     Clock,
+    binding_problem,
+    execution_binding,
     expected_versions,
     plan_expiry,
     plan_versions,
@@ -49,6 +57,7 @@ from unitcompute.services.deployments import (
 log = logging.getLogger(__name__)
 ACTOR = "system:worker"
 HEARTBEAT_SECONDS = 15
+WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
 _ID = re.compile(r"^(dep|plan)_[0-9a-f]{32}$")
 
 
@@ -104,6 +113,10 @@ class Worker:
         self.clock = clock
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self._stop = threading.Event()
+        self._healthy = False
+        self._checked_at: float | None = None
+        self._registered = False
+        self.write_retry_delays: tuple[float, ...] = WRITE_RETRY_DELAYS
 
     # ------------------------------------------------------------ lifecycle
 
@@ -112,18 +125,73 @@ class Worker:
 
     def register(self) -> None:
         now = to_db_time(self.clock())
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO worker_heartbeats (worker_id, started_at, heartbeat_at) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO worker_heartbeats (worker_id, started_at, heartbeat_at, "
+                "healthy, checks_json) VALUES (?, ?, ?, 0, '{}')",
                 (self.worker_id, now, now),
             )
+        self._registered = True
+
+    def _self_check_due(self) -> bool:
+        return self._checked_at is None or (
+            time.monotonic() - self._checked_at >= self.settings.worker_self_check_seconds
+        )
+
+    def self_check(self) -> bool:
+        """Verify Terraform and the AWS execution identities before taking work."""
+        try:
+            checks: dict[str, Any] = {"ok": True, **self.provisioner.self_check()}
+        except ProvisioningError as exc:
+            checks = {"ok": False, "code": exc.code, "message": exc.safe_message}
+        except Exception:
+            log.exception("worker self-check crashed")
+            checks = {"ok": False, "code": "internal_error", "message": "Self-check failed."}
+        self._healthy = bool(checks["ok"])
+        self._checked_at = time.monotonic()
+        if not self._registered:
+            self.register()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE worker_heartbeats SET healthy = ?, checks_json = ?, heartbeat_at = ? "
+                "WHERE worker_id = ?",
+                (
+                    int(self._healthy),
+                    json.dumps(checks, default=str),
+                    to_db_time(self.clock()),
+                    self.worker_id,
+                ),
+            )
+        if not self._healthy:
+            log.error("worker self-check failed; not taking jobs", extra={"fields": checks})
+        return self._healthy
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """Write transaction that retries lock acquisition before giving up."""
+        delays = [*self.write_retry_delays, None]
+        for delay in delays:
+            context = self.db.transaction()
+            try:
+                conn = context.__enter__()
+            except ServiceUnavailable:
+                if delay is None:
+                    raise
+                time.sleep(delay)
+                continue
+            break
+        try:
+            yield conn
+        except BaseException as exc:
+            context.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        context.__exit__(None, None, None)
 
     def recover_interrupted(self) -> list[str]:
         """Call only while holding the worker lock: any 'running' job is orphaned."""
         now = to_db_time(self.clock())
         recovered: list[str] = []
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
                 "ON plans.id = jobs.plan_id WHERE jobs.status = 'running'"
@@ -183,7 +251,7 @@ class Worker:
 
     def claim(self) -> sqlite3.Row | None:
         now = to_db_time(self.clock())
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             job = conn.execute(
                 "SELECT * FROM jobs WHERE status = 'queued' ORDER BY rowid LIMIT 1"
             ).fetchone()
@@ -202,6 +270,15 @@ class Worker:
             return row
 
     def run_once(self) -> bool:
+        # While this worker holds the lock and is between jobs, any 'running' job is
+        # stranded (for example its completion could not be persisted). Recover it before
+        # taking new work; it is never re-applied.
+        if self._has_stranded_jobs():
+            self.recover_interrupted()
+        if self._self_check_due() and not self.self_check():
+            return False
+        if not self._healthy:
+            return False
         job = self.claim()
         if job is None:
             return False
@@ -224,13 +301,20 @@ class Worker:
             beat.join(timeout=5)
         return True
 
+    def _has_stranded_jobs(self) -> bool:
+        with self.db.read() as conn:
+            return (
+                conn.execute("SELECT 1 FROM jobs WHERE status = 'running' LIMIT 1").fetchone()
+                is not None
+            )
+
     def _finish_crashed(self, job: sqlite3.Row) -> None:
         with self.db.read() as conn:
             current = conn.execute("SELECT status FROM jobs WHERE id = ?", (job["id"],)).fetchone()
         if current is None or current["status"] != "running":
             return
         if job["kind"] == "plan":
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 self._finish_plan_failure(
                     conn,
                     job,
@@ -359,17 +443,17 @@ class Worker:
                 inventory=inventory,
             )
         except JobFailure as exc:
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 self._finish_plan_failure(conn, job, exc.code, exc.message)
             return
         except ProvisioningError as exc:
             log.warning("plan failed", extra={"fields": {"job_id": job["id"], "code": exc.code}})
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 self._finish_plan_failure(conn, job, exc.code, exc.safe_message)
             return
         except Exception:
             log.exception("unexpected planning failure", extra={"fields": {"job_id": job["id"]}})
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 self._finish_plan_failure(
                     conn,
                     job,
@@ -380,7 +464,7 @@ class Worker:
 
         now_dt = self.clock()
         now = to_db_time(now_dt)
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             if not policy.allowed:
                 self._finish_plan_failure(
                     conn,
@@ -400,7 +484,8 @@ class Worker:
                 "UPDATE plans SET status = 'ready', plan_hash = ?, plan_path = ?, "
                 "preview_json = ?, cost_json = ?, template_hash = ?, terraform_version = ?, "
                 "provider_versions_json = ?, account_id = ?, ami_id = ?, ready_at = ?, "
-                "expires_at = ? WHERE id = ? AND status = 'pending'",
+                "expires_at = ?, execution_hash = ?, prior_resource_ids_json = ? "
+                "WHERE id = ? AND status = 'pending'",
                 (
                     result.plan_hash,
                     str(result.plan_path),
@@ -413,6 +498,8 @@ class Worker:
                     result.ami_id,
                     now,
                     to_db_time(plan_expiry(now_dt, self.settings)),
+                    execution_binding(self.settings, deployment["id"]),
+                    json.dumps(sorted(prior_resource_ids(result.plan_json))),
                     plan["id"],
                 ),
             ).rowcount
@@ -476,6 +563,9 @@ class Worker:
         }
         if plan_versions(plan) != expected or actual != expected:
             raise JobFailure("plan_stale", "Tool or template versions changed since approval.")
+        binding = binding_problem(self.settings, plan)
+        if binding:
+            raise JobFailure("plan_stale", binding)
         workdir = self.workdir(deployment["id"], plan["id"])
         plan_path = Path(plan["plan_path"] or "")
         if plan_path.resolve() != (workdir / "tfplan").resolve() or not plan_path.is_file():
@@ -492,11 +582,11 @@ class Worker:
         except (JobFailure, ProvisioningError) as exc:
             code = exc.code
             message = exc.message if isinstance(exc, JobFailure) else exc.safe_message
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 self._finish_plan_failure(conn, job, code, message)
             return
 
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "UPDATE deployments SET apply_attempted = 1, "
                 "ami_id = COALESCE(?, ami_id), updated_at = ? WHERE id = ?",
@@ -531,34 +621,50 @@ class Worker:
         result: dict[str, Any] = {"plan_id": plan["id"], "kind": plan["kind"]}
         if plan["kind"] == "create":
             instance_id = outcome.outputs.get("instance_id")
-            if not instance_id or not any(r.resource_id == instance_id for r in inventory):
+            try:
+                found = self.provisioner.find_resources([instance_id]) if instance_id else []
+            except ProvisioningError as exc:
+                self._recovery_required(job, exc.code, exc.safe_message)
+                return
+            if (
+                not instance_id
+                or not any(r.resource_id == instance_id for r in inventory)
+                or not any(r.resource_id == instance_id for r in found)
+            ):
                 self._recovery_required(
                     job, "verification_failed", "Apply finished but the VM could not be verified."
                 )
                 return
-            try:
-                ssm = self.provisioner.ssm_ping_status(instance_id)
-            except Exception:  # best-effort status only; never fails a verified apply
-                log.warning("ssm status lookup failed", exc_info=True)
-                ssm = None
             result.update(instance_id=instance_id)
-            with self.db.transaction() as conn:
+            with self._tx() as conn:
                 conn.execute(
                     "UPDATE deployments SET status = 'active', status_reason = NULL, "
-                    "instance_id = ?, security_group_id = ?, ssm_ping_status = ?, "
-                    "updated_at = ? WHERE id = ?",
+                    "instance_id = ?, security_group_id = ?, root_volume_id = ?, "
+                    "connection_ready = 0, ec2_status = NULL, ssm_ping_status = NULL, "
+                    "readiness_checked_at = NULL, updated_at = ? WHERE id = ?",
                     (
                         instance_id,
                         outcome.outputs.get("security_group_id"),
-                        ssm,
+                        outcome.outputs.get("root_volume_id"),
                         now,
                         deployment["id"],
                     ),
                 )
                 self._finish_apply_success(conn, job, plan, result, "deployment.active")
+            # Infrastructure is applied and verified; connection readiness is observed
+            # separately (bounded here, then refreshed by housekeeping).
+            self.observe_readiness(deployment["id"], instance_id, wait=True)
             return
 
-        remaining = [f"{r.resource_type}:{r.resource_id}" for r in inventory]
+        remaining = self._remaining_after_delete(deployment, plan, inventory)
+        if remaining is None:
+            self._recovery_required(
+                job,
+                "verification_failed",
+                "Delete ran but it could not be verified that the VM, disk and security group "
+                "are gone.",
+            )
+            return
         if remaining:
             self._recovery_required(
                 job,
@@ -566,13 +672,35 @@ class Worker:
                 "Delete ran but owned resources still exist: " + ", ".join(remaining),
             )
             return
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "UPDATE deployments SET status = 'deleted', status_reason = NULL, "
-                "ssm_ping_status = NULL, updated_at = ? WHERE id = ?",
+                "connection_ready = 0, ssm_ping_status = NULL, ec2_status = NULL, "
+                "updated_at = ? WHERE id = ?",
                 (now, deployment["id"]),
             )
             self._finish_apply_success(conn, job, plan, result, "deployment.deleted")
+
+    def _remaining_after_delete(
+        self, deployment: sqlite3.Row, plan: sqlite3.Row, inventory: list[OwnedResource]
+    ) -> list[str] | None:
+        """Every identity we ever knew must be gone, checked by ID, not just by tag.
+
+        Returns None if existence could not be established (keep recovery and quota)."""
+        known = {
+            deployment["instance_id"],
+            deployment["security_group_id"],
+            deployment["root_volume_id"],
+            *json.loads(plan["prior_resource_ids_json"] or "[]"),
+        }
+        known.discard(None)
+        try:
+            found = self.provisioner.find_resources(sorted(known))
+        except ProvisioningError:
+            log.warning("deletion verification failed", exc_info=True)
+            return None
+        remaining = {f"{r.resource_type}:{r.resource_id}" for r in [*inventory, *found]}
+        return sorted(remaining)
 
     def _finish_apply_success(
         self,
@@ -604,7 +732,7 @@ class Worker:
             f"{message} AWS may hold partially changed resources; request a new preview "
             "to reconcile. Resources that cannot be reconciled need an operator."
         )
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "UPDATE jobs SET status = 'recovery_required', finished_at = ?, error_code = ?, "
                 "error_message = ? WHERE id = ?",
@@ -630,12 +758,56 @@ class Worker:
                 detail={"code": code},
             )
 
+    # ------------------------------------------------------------ readiness
+
+    def observe_readiness(self, deployment_id: str, instance_id: str, *, wait: bool) -> bool:
+        """Record EC2 status checks and SSM registration; optionally poll, bounded."""
+        deadline = time.monotonic() + (self.settings.readiness_timeout_seconds if wait else 0)
+        while True:
+            try:
+                readiness = self.provisioner.connection_readiness(instance_id)
+            except Exception:
+                log.warning("readiness lookup failed", exc_info=True)
+                readiness = Readiness(ec2_status=None, ssm_status=None)
+            with self._tx() as conn:
+                conn.execute(
+                    "UPDATE deployments SET ec2_status = ?, ssm_ping_status = ?, "
+                    "connection_ready = ?, readiness_checked_at = ? "
+                    "WHERE id = ? AND instance_id = ? AND status = 'active'",
+                    (
+                        readiness.ec2_status,
+                        readiness.ssm_status,
+                        int(readiness.ready),
+                        to_db_time(self.clock()),
+                        deployment_id,
+                        instance_id,
+                    ),
+                )
+            if readiness.ready or time.monotonic() >= deadline or self._stop.is_set():
+                return readiness.ready
+            self._stop.wait(self.settings.readiness_poll_seconds)
+
+    def refresh_readiness(self, limit: int = 5) -> int:
+        cutoff = to_db_time(
+            self.clock() - timedelta(seconds=self.settings.readiness_refresh_seconds)
+        )
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT id, instance_id FROM deployments WHERE status = 'active' "
+                "AND instance_id IS NOT NULL AND (readiness_checked_at IS NULL "
+                "OR readiness_checked_at <= ?) ORDER BY readiness_checked_at LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        for row in rows:
+            self.observe_readiness(row["id"], row["instance_id"], wait=False)
+        return len(rows)
+
     # ---------------------------------------------------------- housekeeping
 
     def housekeeping(self) -> None:
         now_dt = self.clock()
         now = to_db_time(now_dt)
-        with self.db.transaction() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "UPDATE plans SET status = 'expired' WHERE status = 'ready' AND expires_at <= ?",
                 (now,),
@@ -644,6 +816,10 @@ class Worker:
                 "UPDATE worker_heartbeats SET heartbeat_at = ? WHERE worker_id = ?",
                 (now, self.worker_id),
             )
+        if self._self_check_due():
+            self.self_check()
+        if self._healthy:
+            self.refresh_readiness()
         cutoff = to_db_time(now_dt - timedelta(days=self.settings.workdir_retention_days))
         with self.db.read() as conn:
             rows = conn.execute(

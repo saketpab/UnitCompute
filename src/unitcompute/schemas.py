@@ -119,6 +119,9 @@ class JobSummary(BaseModel):
 
 class AccessInstructions(BaseModel):
     method: Literal["ssm-session-manager"] = "ssm-session-manager"
+    ready: bool = Field(
+        description="True once EC2 status checks pass and SSM reports this instance Online."
+    )
     command: str | None
     requirements: list[str]
 

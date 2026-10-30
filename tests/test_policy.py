@@ -68,6 +68,7 @@ def as_destroy(plan: dict[str, Any]) -> dict[str, Any]:
         values["id"] = "i-0abc" if c["type"] == "aws_instance" else "sg-0abc"
         if c["type"] == "aws_instance":
             values["root_block_device"][0]["volume_id"] = "vol-0abc"
+            values["vpc_security_group_ids"] = ["sg-0abc"]
         c["change"] = {"actions": ["delete"], "before": values, "after": None}
         resources.append({"address": c["address"], "values": values})
     destroy["prior_state"] = {"values": {"root_module": {"resources": resources}}}

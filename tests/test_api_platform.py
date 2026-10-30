@@ -118,9 +118,14 @@ def test_openapi_documents_contract(harness: Harness) -> None:
 
 
 def test_readiness(harness: Harness) -> None:
-    ready = harness.client.get("/readyz").json()
+    worker = Worker(harness.settings, harness.db, SimulatedProvisioner(harness.settings.data_dir))
+    assert worker.self_check()
+    response = harness.client.get("/readyz")
+    ready = response.json()
+    assert response.status_code == 200
     assert ready["ready"] is True
     assert ready["checks"]["schema_version"] == LATEST_SCHEMA_VERSION
+    assert ready["checks"]["worker_self_check_ok"] is True
     assert harness.client.get("/healthz").json() == {"status": "ok"}
 
 
@@ -132,7 +137,7 @@ def test_api_refuses_unmigrated_database(tmp_path: Path) -> None:
 
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
     db = Database(make_settings(tmp_path).database_path)
-    assert db.migrate() == [1]
+    assert db.migrate() == [1, 2]
     assert db.migrate() == []
     assert db.schema_version() == LATEST_SCHEMA_VERSION
 

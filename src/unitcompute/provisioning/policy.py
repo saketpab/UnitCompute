@@ -42,6 +42,91 @@ EXPECTED_EGRESS = {
     "security_groups": [],
     "self": False,
 }
+# Attributes Terraform reports as known for a newly created resource of the reviewed
+# template. Anything else in ``after`` means the configuration set an unreviewed argument
+# (for example key_name, tenancy, extra network interfaces or custom IOPS).
+INSTANCE_CREATE_VALUES: dict[str, Any] = {
+    "force_destroy": False,
+    "get_password_data": False,
+    "hibernation": None,
+    "launch_template": [],
+    "monitoring": False,
+    "source_dest_check": True,
+    "timeouts": None,
+    "user_data": None,
+    "user_data_replace_on_change": False,
+    "volume_tags": None,
+}
+INSTANCE_CREATE_FIELDS = set(INSTANCE_CREATE_VALUES) | {
+    "ami",
+    "associate_public_ip_address",
+    "credit_specification",
+    "iam_instance_profile",
+    "instance_type",
+    "metadata_options",
+    "region",
+    "root_block_device",
+    "subnet_id",
+    "tags",
+    "tags_all",
+}
+ROOT_CREATE_FIELDS = {"delete_on_termination", "encrypted", "tags", "volume_size", "volume_type"}
+SECURITY_GROUP_CREATE_FIELDS = {
+    "description",
+    "egress",
+    "ingress",
+    "name",
+    "region",
+    "revoke_rules_on_delete",
+    "tags",
+    "tags_all",
+    "timeouts",
+    "vpc_id",
+}
+# Arguments the reviewed template sets, per resource, in ``configuration``.
+CONFIGURED_ARGUMENTS = {
+    INSTANCE: {
+        "ami",
+        "associate_public_ip_address",
+        "credit_specification",
+        "iam_instance_profile",
+        "instance_type",
+        "metadata_options",
+        "monitoring",
+        "root_block_device",
+        "subnet_id",
+        "tags",
+        "vpc_security_group_ids",
+    },
+    SECURITY_GROUP: {"description", "egress", "ingress", "name", "tags", "vpc_id"},
+}
+CONFIGURED_BLOCK_ARGUMENTS = {
+    "root_block_device": {
+        "volume_type",
+        "volume_size",
+        "encrypted",
+        "delete_on_termination",
+        "tags",
+    },
+    "metadata_options": {
+        "http_endpoint",
+        "http_tokens",
+        "http_put_response_hop_limit",
+        "instance_metadata_tags",
+    },
+    "credit_specification": {"cpu_credits"},
+}
+CONFIGURATION_RESOURCE_KEYS = {
+    "address",
+    "expressions",
+    "mode",
+    "name",
+    "provider_config_key",
+    "schema_version",
+    "type",
+}
+DEDICATED_GROUP_REFERENCES = ["aws_security_group.vm.id", "aws_security_group.vm"]
+
 DATA_LOSS_WARNING = (
     "Deleting terminates the VM and permanently deletes its root disk. Data on the disk "
     "cannot be recovered and no snapshot is taken."
@@ -96,10 +181,44 @@ def _owned_by_deployment(values: dict[str, Any], spec: DeploymentSpec) -> bool:
     )
 
 
+def _check_instance_create_fields(
+    after: dict[str, Any], after_unknown: dict[str, Any], group_id: str | None
+) -> list[str]:
+    v: list[str] = []
+    extra = sorted(set(after) - INSTANCE_CREATE_FIELDS - {"vpc_security_group_ids"})
+    if extra:
+        v.append(f"instance sets unreviewed attributes: {', '.join(extra)}")
+    for key, value in INSTANCE_CREATE_VALUES.items():
+        _check(v, after.get(key) == value, f"instance attribute {key} has an unreviewed value")
+    _check(v, after.get("tags_all") == after.get("tags"), "instance has unexpected default tags")
+    extra_root = sorted(set(_first(after.get("root_block_device"))) - ROOT_CREATE_FIELDS)
+    if extra_root:
+        v.append(f"root volume sets unreviewed attributes: {', '.join(extra_root)}")
+    v.extend(_check_group_attachment(after, after_unknown, group_id))
+    return v
+
+
+def _check_group_attachment(
+    values: dict[str, Any], unknown: dict[str, Any], group_id: str | None
+) -> list[str]:
+    """The VM must be attached to exactly this deployment's dedicated security group."""
+    groups = values.get("vpc_security_group_ids")
+    if groups is None and unknown.get("vpc_security_group_ids") is True and group_id is None:
+        return []  # created together; the configuration check pins the reference
+    if group_id is not None and groups == [group_id]:
+        return []
+    return ["instance must be attached only to its dedicated security group"]
+
+
 def _check_instance(
     after: dict[str, Any], spec: DeploymentSpec, targets: NetworkTargets, ami_id: str | None
 ) -> list[str]:
     v: list[str] = []
+    _check(v, not after.get("key_name"), "SSH key pairs are not allowed")
+    _check(v, after.get("tenancy") in (None, "default"), "only default tenancy is allowed")
+    _check(
+        v, after.get("network_interface") in (None, []), "extra network interfaces are not allowed"
+    )
     _check(
         v, ami_id is not None and after.get("ami") == ami_id, "instance AMI is not the frozen AMI"
     )
@@ -194,10 +313,43 @@ def _check_configuration(plan: dict[str, Any]) -> list[str]:
     root = configuration.get("root_module") or {}
     if root.get("module_calls"):
         v.append("plan calls modules outside the reviewed template")
-    addresses = {r.get("address") for r in root.get("resources") or []}
+    resources = root.get("resources") or []
+    addresses = {r.get("address") for r in resources}
     if not addresses <= set(EXPECTED_TYPES):
         v.append("plan configuration declares unexpected resources or data sources")
+    for resource in resources:
+        address = resource.get("address")
+        if resource.get("provisioners"):
+            v.append(f"{address} declares provisioners, which are not allowed")
+        if not set(resource) <= CONFIGURATION_RESOURCE_KEYS:
+            v.append(f"{address} uses unreviewed meta-arguments")
+        expressions = resource.get("expressions") or {}
+        allowed = CONFIGURED_ARGUMENTS.get(address, set())
+        if set(expressions) != allowed:
+            v.append(f"{address} configures unreviewed arguments")
+        for block, keys in CONFIGURED_BLOCK_ARGUMENTS.items():
+            for entry in expressions.get(block) or []:
+                if isinstance(entry, dict) and not set(entry) <= keys:
+                    v.append(f"{address} {block} configures unreviewed arguments")
+        if address == INSTANCE:
+            refs = (expressions.get("vpc_security_group_ids") or {}).get("references")
+            if refs != DEDICATED_GROUP_REFERENCES:
+                v.append("instance must reference only its dedicated security group")
     return v
+
+
+def _prior_group_id(plan: dict[str, Any]) -> str | None:
+    root = plan.get("prior_state", {}).get("values", {}).get("root_module", {})
+    for resource in root.get("resources", []) or []:
+        if resource.get("address") == SECURITY_GROUP:
+            group = (resource.get("values") or {}).get("id")
+            return group if isinstance(group, str) else None
+    return None
+
+
+def prior_resource_ids(plan: dict[str, Any]) -> set[str]:
+    """IDs Terraform state knows for this deployment (instance, root volume, group)."""
+    return _prior_resource_ids(plan)
 
 
 def _prior_resource_ids(plan: dict[str, Any]) -> set[str]:
@@ -253,6 +405,7 @@ def evaluate_plan(
 
     v.extend(_check_configuration(plan))
 
+    group_id = _prior_group_id(plan)
     seen: dict[str, tuple[str, ...]] = {}
     for change in plan.get("resource_changes") or []:
         address = change.get("address")
@@ -274,13 +427,25 @@ def evaluate_plan(
         body = change.get("change") or {}
         before = body.get("before") or {}
         after = body.get("after") or {}
+        unknown = body.get("after_unknown") or {}
         if actions == ("create",):
             if address == INSTANCE:
                 v.extend(_check_instance(after, spec, targets, ami_id))
+                v.extend(_check_instance_create_fields(after, unknown, group_id))
             else:
+                extra = sorted(set(after) - SECURITY_GROUP_CREATE_FIELDS)
+                if extra:
+                    v.append(f"security group sets unreviewed attributes: {', '.join(extra)}")
                 v.extend(_check_security_group(after, spec, targets))
         elif not _owned_by_deployment(before, spec):
             v.append(f"{address} is not tagged as owned by this deployment")
+        elif actions == ("no-op",):
+            # Existing resources must still match the reviewed shape, not just be owned.
+            if address == INSTANCE:
+                v.extend(_check_instance(after, spec, targets, ami_id))
+                v.extend(_check_group_attachment(after, {}, group_id))
+            else:
+                v.extend(_check_security_group(after, spec, targets))
         if actions != ("no-op",):
             values = before if actions == ("delete",) else after
             result.changes.append(

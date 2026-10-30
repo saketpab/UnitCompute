@@ -24,7 +24,7 @@ JWT_SETTINGS: dict[str, Any] = {
     "auth_jwks_url": "https://login.example.test/.well-known/jwks.json",
     "auth_required_group": "unitcompute-team",
 }
-TERRAFORM_SETTINGS: dict[str, Any] = {
+AWS_TERRAFORM: dict[str, Any] = {
     "provisioner": "terraform",
     "aws_account_id": "123456789012",
     "vpc_id": "vpc-0123456789abcdef0",
@@ -34,6 +34,8 @@ TERRAFORM_SETTINGS: dict[str, Any] = {
     "plan_role_arn": "arn:aws:iam::123456789012:role/unitcompute-plan",
     "apply_role_arn": "arn:aws:iam::123456789012:role/unitcompute-apply",
 }
+# Real provisioning always requires verified team authentication.
+TERRAFORM_SETTINGS: dict[str, Any] = {**JWT_SETTINGS, **AWS_TERRAFORM}
 
 
 def test_development_defaults_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -45,9 +47,7 @@ def test_development_defaults_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_valid_production_configuration(tmp_path: Path) -> None:
-    settings = make_settings(
-        tmp_path, environment="production", **JWT_SETTINGS, **TERRAFORM_SETTINGS
-    )
+    settings = make_settings(tmp_path, environment="production", **TERRAFORM_SETTINGS)
     assert isinstance(build_authenticator(settings), JwtAuthenticator)
 
 
@@ -71,7 +71,7 @@ def test_valid_production_configuration(tmp_path: Path) -> None:
     ],
 )
 def test_production_fails_closed(tmp_path: Path, override: dict[str, Any], message: str) -> None:
-    values = {"environment": "production", **JWT_SETTINGS, **TERRAFORM_SETTINGS, **override}
+    values = {"environment": "production", **TERRAFORM_SETTINGS, **override}
     with pytest.raises(ValidationError, match=message):
         make_settings(tmp_path, **values)
 
@@ -90,7 +90,7 @@ def test_env_parsing_of_lists(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_dev_authenticator_cannot_exist_in_production(tmp_path: Path) -> None:
-    prod = make_settings(tmp_path, environment="production", **JWT_SETTINGS, **TERRAFORM_SETTINGS)
+    prod = make_settings(tmp_path, environment="production", **TERRAFORM_SETTINGS)
     with pytest.raises(RuntimeError):
         DevAuthenticator(prod)
 
@@ -205,9 +205,7 @@ def test_production_app_rejects_dev_tokens(tmp_path: Path) -> None:
     from unitcompute.api.app import create_app
     from unitcompute.db.database import Database
 
-    settings: Settings = make_settings(
-        tmp_path, environment="production", **JWT_SETTINGS, **TERRAFORM_SETTINGS
-    )
+    settings: Settings = make_settings(tmp_path, environment="production", **TERRAFORM_SETTINGS)
     Database(settings.database_path).migrate()
     with TestClient(create_app(settings)) as client:
         response = client.get("/deployments", headers={"Authorization": "Bearer dev:alice"})

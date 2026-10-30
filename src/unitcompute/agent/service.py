@@ -9,6 +9,7 @@ free model text, and a chat "yes" is not an approval.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -48,7 +49,12 @@ from unitcompute.schemas import (
     DeploymentRequest,
     Proposal,
 )
-from unitcompute.services.deployments import DeploymentService, new_id, record_audit
+from unitcompute.services.deployments import (
+    DeploymentService,
+    canonical_hash,
+    new_id,
+    record_audit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -303,21 +309,49 @@ class AgentService:
     def model_label(self) -> str:
         return self._settings.agent_model or "unconfigured"
 
-    def _session(
-        self, conn: sqlite3.Connection, principal: Principal, session_id: str | None
-    ) -> str:
+    def _reserve(
+        self,
+        conn: sqlite3.Connection,
+        principal: Principal,
+        request: AgentMessageRequest,
+        idempotency_key: str | None,
+        payload_hash: str,
+    ) -> tuple[str, int] | AgentReply:
+        """Atomically admit one model invocation, or replay an earlier idempotent result.
+
+        Runs under BEGIN IMMEDIATE, so concurrent requests are serialised. The attempt and
+        the session turn are counted here, before the provider is called, and stay counted
+        whatever happens to the call."""
         now = to_db_time(utcnow())
+        if idempotency_key is not None:
+            prior = conn.execute(
+                "SELECT status, payload_hash, response_json FROM agent_attempts "
+                "WHERE owner_id = ? AND idempotency_key = ?",
+                (principal.subject, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if not hmac.compare_digest(prior["payload_hash"], payload_hash):
+                    raise Conflict(
+                        "This Idempotency-Key was already used with a different request.",
+                        code="idempotency_key_reused",
+                    )
+                if prior["status"] == "succeeded":
+                    return AgentReply.model_validate_json(prior["response_json"])
+                raise Conflict(
+                    "A request with this Idempotency-Key is still in progress.",
+                    code="idempotency_in_progress",
+                )
         since = to_db_time(utcnow() - timedelta(days=1))
-        recent = conn.execute(
-            "SELECT COUNT(*) FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id "
-            "WHERE s.owner_id = ? AND m.role = 'user' AND m.created_at > ?",
+        attempts = conn.execute(
+            "SELECT COUNT(*) FROM agent_attempts WHERE owner_id = ? AND created_at > ?",
             (principal.subject, since),
         ).fetchone()[0]
-        if recent >= self._settings.agent_max_messages_per_day:
+        if attempts >= self._settings.agent_max_messages_per_day:
             raise RateLimited(
                 "You reached the assistant's daily message limit; the REST workflow remains "
                 "available."
             )
+        session_id = request.session_id
         if session_id is None:
             session_id = new_id("chat")
             conn.execute(
@@ -325,22 +359,64 @@ class AgentService:
                 "VALUES (?, ?, 0, ?, ?)",
                 (session_id, principal.subject, now, now),
             )
-            return session_id
-        row = conn.execute(
-            "SELECT turns FROM chat_sessions WHERE id = ? AND owner_id = ?",
-            (session_id, principal.subject),
-        ).fetchone()
-        if row is None:
-            raise NotFound("Chat session not found.")
-        if row["turns"] >= self._settings.agent_max_session_turns:
-            raise Conflict(
-                "This chat session reached its turn limit; start a new session.",
-                code="session_turn_limit",
-            )
-        return session_id
+        else:
+            row = conn.execute(
+                "SELECT turns FROM chat_sessions WHERE id = ? AND owner_id = ?",
+                (session_id, principal.subject),
+            ).fetchone()
+            if row is None:
+                raise NotFound("Chat session not found.")
+            if row["turns"] >= self._settings.agent_max_session_turns:
+                raise Conflict(
+                    "This chat session reached its turn limit; start a new session.",
+                    code="session_turn_limit",
+                )
+        conn.execute(
+            "UPDATE chat_sessions SET turns = turns + 1, updated_at = ? WHERE id = ?",
+            (now, session_id),
+        )
+        cursor = conn.execute(
+            "INSERT INTO agent_attempts (owner_id, session_id, status, idempotency_key, "
+            "payload_hash, created_at) VALUES (?, ?, 'reserved', ?, ?, ?)",
+            (principal.subject, session_id, idempotency_key, payload_hash, now),
+        )
+        return session_id, int(cursor.lastrowid or 0)
+
+    def _history(self, session_id: str) -> list[BaseMessage]:
+        limit = self._settings.agent_history_messages
+        if not limit:
+            return []
+        with self._db.read() as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM chat_messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        return [
+            HumanMessage(content=r["content"])
+            if r["role"] == "user"
+            else AIMessage(content=r["content"])
+            for r in reversed(rows)
+        ]
+
+    def _mark_failed(self, attempt_id: int) -> None:
+        # The attempt stays counted; only the idempotency key is released for a retry.
+        try:
+            with self._db.transaction() as conn:
+                conn.execute(
+                    "UPDATE agent_attempts SET status = 'failed', idempotency_key = NULL, "
+                    "finished_at = ? WHERE id = ?",
+                    (to_db_time(utcnow()), attempt_id),
+                )
+        except Exception:
+            log.warning("could not record failed assistant attempt", exc_info=True)
 
     async def handle(
-        self, principal: Principal, request: AgentMessageRequest, request_id: str | None
+        self,
+        principal: Principal,
+        request: AgentMessageRequest,
+        request_id: str | None,
+        idempotency_key: str | None = None,
     ) -> AgentReply:
         if len(request.message) > self._settings.agent_max_message_chars:
             raise InvalidInput(
@@ -352,26 +428,31 @@ class AgentService:
                 code="agent_unavailable",
             )
         model = self._model_factory()
-
+        payload_hash = canonical_hash(
+            {"session_id": request.session_id, "message": request.message}
+        )
         with self._db.transaction() as conn:
-            session_id = self._session(conn, principal, request.session_id)
-            limit = self._settings.agent_history_messages
-            rows = (
-                conn.execute(
-                    "SELECT role, content FROM chat_messages WHERE session_id = ? "
-                    "ORDER BY id DESC LIMIT ?",
-                    (session_id, limit),
-                ).fetchall()
-                if limit
-                else []
-            )
-        history: list[BaseMessage] = [
-            HumanMessage(content=r["content"])
-            if r["role"] == "user"
-            else AIMessage(content=r["content"])
-            for r in reversed(rows)
-        ]
+            reserved = self._reserve(conn, principal, request, idempotency_key, payload_hash)
+        if isinstance(reserved, AgentReply):
+            return reserved
+        session_id, attempt_id = reserved
+        try:
+            reply = await self._run(principal, model, session_id, request, attempt_id, request_id)
+        except BaseException:
+            self._mark_failed(attempt_id)
+            raise
+        return reply
 
+    async def _run(
+        self,
+        principal: Principal,
+        model: BaseChatModel,
+        session_id: str,
+        request: AgentMessageRequest,
+        attempt_id: int,
+        request_id: str | None,
+    ) -> AgentReply:
+        history = self._history(session_id)
         ctx = _RunContext()
         middleware: list[Any] = [
             ModelCallLimitMiddleware(
@@ -420,6 +501,15 @@ class AgentService:
             if final
             else ("I could not produce an answer within my limits. Please rephrase.")
         )
+        response = AgentReply(
+            session_id=session_id,
+            reply=reply,
+            model=self.model_label,
+            proposal=ctx.proposal,
+            clarifications=ctx.clarifications,
+            tool_calls=ctx.tool_calls,
+            approval_note=APPROVAL_NOTE,
+        )
         with self._db.transaction() as conn:
             now = to_db_time(utcnow())
             conn.executemany(
@@ -428,8 +518,9 @@ class AgentService:
                 [(session_id, "user", request.message, now), (session_id, "assistant", reply, now)],
             )
             conn.execute(
-                "UPDATE chat_sessions SET turns = turns + 1, updated_at = ? WHERE id = ?",
-                (now, session_id),
+                "UPDATE agent_attempts SET status = 'succeeded', response_json = ?, "
+                "finished_at = ? WHERE id = ?",
+                (response.model_dump_json(), now, attempt_id),
             )
             record_audit(
                 conn,
@@ -442,12 +533,4 @@ class AgentService:
                     "proposal": ctx.proposal is not None,
                 },
             )
-        return AgentReply(
-            session_id=session_id,
-            reply=reply,
-            model=self.model_label,
-            proposal=ctx.proposal,
-            clarifications=ctx.clarifications,
-            tool_calls=ctx.tool_calls,
-            approval_note=APPROVAL_NOTE,
-        )
+        return response
