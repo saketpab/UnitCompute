@@ -10,7 +10,7 @@ delete.
 
 It is one FastAPI service, with a LangChain assistant inside it, plus a single worker
 process that runs a pinned Terraform CLI against a reviewed template. Both processes share
-a SQLite database on persistent local disk.
+a PostgreSQL database, with durable local storage for worker evidence and plans.
 
 | Fixed by the server | Chosen by the user |
 |---|---|
@@ -37,7 +37,7 @@ src/unitcompute/
   agent/          LangChain assistant: read/validate tools only, offline scripted fake model
   provisioning/   Terraform runner and provisioner, plan policy, AWS reads, simulator
     templates/ec2_vm_v1/   Reviewed Terraform template, provider lock file, module tests
-  db/             SQLite access and versioned SQL migrations
+  db/             PostgreSQL access and versioned SQL migrations
   worker.py       Single job worker (plan/apply), recovery and housekeeping
   admin.py        Operator CLI: migrate, check-config, recovery-report
 docs/             API guide, operations and bootstrap prerequisites, example IAM policies
@@ -55,6 +55,7 @@ the published `SHA256SUMS`).
 uv sync --locked --all-extras        # Python 3.13 venv from uv.lock
 export UNITCOMPUTE_PROVISIONER=simulated  # labelled simulator; never touches AWS
 export UNITCOMPUTE_AGENT_MODEL=fake:offline   # optional; labelled offline fake model
+export UNITCOMPUTE_DATABASE_URL=postgresql:///unitcompute  # existing local PostgreSQL
 uv run unitcompute-admin migrate
 uv run unitcompute-worker &          # one worker per data directory (file-locked)
 uv run unitcompute-api               # http://127.0.0.1:8000/docs

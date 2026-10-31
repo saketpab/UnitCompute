@@ -184,7 +184,9 @@ def unresolved_create_obligation(conn: Connection, owner_id: str) -> str | None:
     row = conn.execute(
         "SELECT o.deployment_id FROM recovery_obligations o "
         "JOIN deployments d ON d.id = o.deployment_id WHERE d.owner_id = %s "
-        "AND o.discharged_at IS NULL AND o.evidence = 'uncaptured' ORDER BY o.id LIMIT 1",
+        "AND (o.evidence = 'uncaptured' OR NOT recovery_obligation_valid(o.deployment_id, "
+        "o.job_id,o.plan_id,o.evidence,o.discharged_at,o.discharged_by_job_id)) "
+        "ORDER BY o.id LIMIT 1",
         (owner_id,),
     ).fetchone()
     return None if row is None else str(row["deployment_id"])

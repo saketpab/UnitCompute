@@ -743,7 +743,7 @@ def test_r6_2_failed_launch_then_noop_success_is_not_launch_provenance(
         replacement,
         [("1", "apply_failed", "recovery_required", _LAUNCH), ("2", "applied", "succeeded", [])],
     )
-    assert db.migrate() == [5, 6, 7, 8, 9, 10]
+    assert db.migrate() == [5, 6, 7, 8, 9, 10, 11]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -782,7 +782,7 @@ def test_r6_2_failed_repair_after_a_successful_launch_is_not_launch_provenance(
         replacement,
         [("1", "applied", "succeeded", _LAUNCH), ("2", "apply_failed", "recovery_required", [])],
     )
-    assert db.migrate() == [5, 6, 7, 8, 9, 10]
+    assert db.migrate() == [5, 6, 7, 8, 9, 10, 11]
     with db.transaction() as c:
         IdentityLedger(settings.workdir_root).import_evidence(c, _DEP)
     with db.read() as c:
@@ -841,12 +841,17 @@ def _failed_destroy_upgrade(
         conn.execute("UPDATE deployments SET status='recovery_required' WHERE id=%s", (dep,))
         conn.execute("DROP TABLE recovery_obligations")
         conn.execute("DROP FUNCTION enforce_recovery_bindings()")
+        conn.execute(
+            "DROP FUNCTION recovery_obligation_valid(TEXT,TEXT,TEXT,TEXT,TIMESTAMPTZ,TEXT)"
+        )
         conn.execute("DROP FUNCTION recovery_links_valid(TEXT,TEXT,TEXT,TEXT)")
+        conn.execute("ALTER TABLE agent_attempts DROP CONSTRAINT completed_assistant_reply")
+        conn.execute("DROP FUNCTION assistant_reply_readable(JSONB)")
         conn.execute("ALTER TABLE plans DROP CONSTRAINT plans_id_deployment")
         conn.execute("ALTER TABLE jobs DROP CONSTRAINT jobs_id_deployment")
         conn.execute("ALTER TABLE jobs DROP CONSTRAINT jobs_id_deployment_plan")
-        conn.execute("DELETE FROM schema_migrations WHERE version IN (5, 6, 10)")
-    assert h.db.migrate() == [5, 6, 10]
+        conn.execute("DELETE FROM schema_migrations WHERE version IN (5, 6, 10, 11)")
+    assert h.db.migrate() == [5, 6, 10, 11]
     return dep, pending
 
 

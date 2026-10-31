@@ -1098,7 +1098,8 @@ class Worker:
             return list(
                 conn.execute(
                     "SELECT * FROM recovery_obligations WHERE deployment_id = %s "
-                    "AND discharged_at IS NULL AND evidence = 'uncaptured' ORDER BY id",
+                    "AND (evidence = 'uncaptured' OR NOT recovery_obligation_valid(deployment_id, "
+                    "job_id,plan_id,evidence,discharged_at,discharged_by_job_id)) ORDER BY id",
                     (deployment_id,),
                 ).fetchall()
             )
@@ -1106,6 +1107,11 @@ class Worker:
     def _retry_uncaptured(self, deployment_id: str) -> None:
         """Try again to capture evidence for open obligations (e.g. migrated ones)."""
         for obligation in self._uncaptured_obligations(deployment_id):
+            if (
+                obligation["discharged_at"] is not None
+                or obligation["discharged_by_job_id"] is not None
+            ):
+                continue
             if not obligation["job_id"]:
                 continue  # e.g. a corrupt evidence file: nothing to capture from
             with self.db.read() as conn:
@@ -1253,9 +1259,11 @@ class Worker:
                 "SELECT plans.id, plans.deployment_id FROM plans WHERE plans.created_at < %s AND ("
                 "plans.status IN ('superseded', 'expired', 'rejected', 'failed', 'applied') "
                 "OR (plans.status = 'apply_failed' "
-                "  AND EXISTS (SELECT 1 FROM recovery_obligations o WHERE o.plan_id = plans.id) "
+                "  AND EXISTS (SELECT 1 FROM recovery_obligations o WHERE o.plan_id = plans.id))) "
                 "  AND NOT EXISTS (SELECT 1 FROM recovery_obligations o "
-                "    WHERE o.plan_id = plans.id AND o.discharged_at IS NULL)))",
+                "    WHERE o.plan_id = plans.id AND (o.discharged_at IS NULL OR NOT "
+                "recovery_obligation_valid(o.deployment_id,o.job_id,o.plan_id,o.evidence,"
+                "o.discharged_at,o.discharged_by_job_id)))",
                 (cutoff,),
             ).fetchall()
         for row in rows:

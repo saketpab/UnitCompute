@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,6 @@ from conftest import Harness, auth, create_and_plan, make_settings
 from unitcompute.auth import Principal
 from unitcompute.db import database
 from unitcompute.db.database import Database
-from unitcompute.db.import_sqlite import import_snapshot
 
 
 def test_fresh_repeated_concurrent_migrations(tmp_path: Path) -> None:
@@ -21,7 +19,7 @@ def test_fresh_repeated_concurrent_migrations(tmp_path: Path) -> None:
     db = Database(settings.database_url, settings.database_schema)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda _: db.migrate(), range(4)))
-    assert sorted(len(r) for r in results) == [0, 0, 0, 10]
+    assert sorted(len(r) for r in results) == [0, 0, 0, 11]
     assert db.migrate() == []
 
 
@@ -32,13 +30,13 @@ def test_failed_migration_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         database,
         "_migration_files",
-        lambda: [*files, (11, "CREATE TABLE rollback_probe (id int); SELECT nonexistent_column;")],
+        lambda: [*files, (12, "CREATE TABLE rollback_probe (id int); SELECT nonexistent_column;")],
     )
     with pytest.raises(psycopg.errors.UndefinedColumn):
         db.migrate()
     assert db.schema_version() is None
     monkeypatch.setattr(database, "_migration_files", lambda: files)
-    assert db.migrate() == list(range(1, 11))
+    assert db.migrate() == list(range(1, 12))
 
 
 def test_migration_checksum_rejects_rewrite(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -202,88 +200,6 @@ def test_resource_owner_and_history_constraints(db: Database) -> None:
         conn.execute("DELETE FROM users WHERE owner_id='dev:alice'")
 
 
-def legacy_fixture(path: Path) -> None:
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        for p in sorted((Path(__file__).parent / "fixtures/legacy_sqlite").glob("*.sql")):
-            conn.executescript(p.read_text())
-            conn.execute(
-                "INSERT INTO schema_migrations VALUES (?,?)",
-                (int(p.name[:4]), "2026-10-30T00:00:00+00:00"),
-            )
-        conn.execute(
-            "INSERT INTO chat_sessions VALUES "
-            "('chat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dev:alice',1,'2026-10-30T00:00:00+00:00','2026-10-30T00:00:00+00:00')"
-        )
-        conn.execute(
-            "INSERT INTO chat_messages(session_id,role,content,created_at) "
-            "VALUES ('chat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','user','preserved',"
-            "'2026-10-30T00:00:00+00:00')"
-        )
-
-        conn.executescript((Path(__file__).parent / "fixtures/legacy_history.sql").read_text())
-
-
-def empty_target(db: Database) -> None:
-    with db.transaction() as conn:
-        conn.execute("DELETE FROM users")
-
-
-def test_offline_import_restart_idempotence_and_ordering(db: Database, tmp_path: Path) -> None:
-    source = tmp_path / "legacy.sqlite3"
-    legacy_fixture(source)
-    empty_target(db)
-    counts = import_snapshot(db, source, issuer="https://old.test")
-    assert counts["chat_messages"] == 1
-    assert import_snapshot(Database(db.dsn, db.schema), source, issuer="https://old.test") == counts
-    with db.read() as conn:
-        assert (
-            conn.execute("SELECT content FROM chat_messages ORDER BY id").fetchone()[0]
-            == "preserved"
-        )
-        assert conn.execute("SELECT user_id FROM chat_sessions").fetchone()[0] is not None
-        dep = conn.execute(
-            "SELECT owner_id,cloud_owner_id,current_plan_id FROM deployments"
-        ).fetchone()
-        assert dep["owner_id"] == Principal("legacy-subject", "jwt", "https://old.test").owner_id
-        assert dep["cloud_owner_id"] == "legacy-subject"
-        assert dep["current_plan_id"] == "plan_" + "c" * 32
-        assert [r[0] for r in conn.execute("SELECT payload_hash FROM jobs ORDER BY sequence")] == [
-            "exact-payload-hash",
-            "second-payload-hash",
-        ]
-        assert conn.execute("SELECT config_hash,plan_hash FROM plans").fetchone() == {
-            "config_hash": "exact-config-hash",
-            "plan_hash": "exact-plan-hash",
-        }
-        assert [
-            r[0] for r in conn.execute("SELECT source FROM deployment_resources ORDER BY source")
-        ] == ["launch_output", "terraform_state"]
-        assert [
-            r[0] for r in conn.execute("SELECT evidence FROM recovery_obligations ORDER BY id")
-        ] == ["uncaptured", "captured"]
-        assert conn.execute("SELECT actor FROM audit_events").fetchone()[0] == "legacy-subject"
-        assert (
-            conn.execute("SELECT payload_hash FROM agent_attempts").fetchone()[0]
-            == "exact-chat-hash"
-        )
-
-
-def test_offline_import_unknown_data_rollback(db: Database, tmp_path: Path) -> None:
-    source = tmp_path / "legacy.sqlite3"
-    legacy_fixture(source)
-    empty_target(db)
-    with sqlite3.connect(source) as conn:
-        conn.execute("CREATE TABLE unknown_data(value TEXT)")
-    with pytest.raises(ValueError, match="unknown"):
-        import_snapshot(db, source, issuer="https://old.test")
-    with db.read() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM offline_imports").fetchone()[0] == 0
-
-
 def test_transaction_survives_connection_restart(db: Database) -> None:
     principal = Principal("restart-subject", "jwt", "https://restart.test")
     with db.transaction(principal.owner_id) as conn:
@@ -343,23 +259,6 @@ def test_unknown_recovery_state_cannot_be_stored(harness: Harness) -> None:
         assert conn.execute("SELECT count(*) FROM recovery_obligations").fetchone()[0] == 0
 
 
-def test_import_partial_failure_is_atomic_and_retryable(db: Database, tmp_path: Path) -> None:
-    source = tmp_path / "legacy.sqlite3"
-    legacy_fixture(source)
-    empty_target(db)
-    with sqlite3.connect(source) as conn:
-        conn.execute("UPDATE chat_messages SET created_at='unknown-time'")
-    with pytest.raises(ValueError, match="Invalid isoformat"):
-        import_snapshot(db, source, issuer="https://old.test")
-    with db.read() as conn:
-        assert conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM deployments").fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM offline_imports").fetchone()[0] == 0
-    with sqlite3.connect(source) as conn:
-        conn.execute("UPDATE chat_messages SET created_at='2026-10-30T00:00:00+00:00'")
-    assert import_snapshot(db, source, issuer="https://old.test")["deployments"] == 1
-
-
 def test_message_history_redacts_legacy_credentials(harness: Harness) -> None:
     from conftest import FAKE_AWS_KEY_ID
 
@@ -373,39 +272,3 @@ def test_message_history_redacts_legacy_credentials(harness: Harness) -> None:
     response = harness.client.get("/chats/" + chat["id"] + "/messages", headers=auth())
     assert response.status_code == 200
     assert FAKE_AWS_KEY_ID not in response.text
-
-
-def test_import_rejects_unredacted_source_without_rewriting_history(
-    db: Database, tmp_path: Path
-) -> None:
-    from conftest import FAKE_AWS_KEY_ID
-
-    source = tmp_path / "legacy.sqlite3"
-    legacy_fixture(source)
-    empty_target(db)
-    with sqlite3.connect(source) as conn:
-        conn.execute("UPDATE chat_messages SET content=?", (FAKE_AWS_KEY_ID,))
-    with pytest.raises(ValueError, match="unredacted sensitive source data"):
-        import_snapshot(db, source, issuer="https://old.test")
-    with db.read() as conn:
-        assert conn.execute("SELECT count(*) FROM chat_messages").fetchone()[0] == 0
-    with sqlite3.connect(source) as conn:
-        assert conn.execute("SELECT content FROM chat_messages").fetchone()[0] == FAKE_AWS_KEY_ID
-
-
-def test_offline_import_restores_real_backend_identity_after_plan_history(
-    db: Database, tmp_path: Path
-) -> None:
-    source = tmp_path / "legacy.sqlite3"
-    legacy_fixture(source)
-    empty_target(db)
-    with sqlite3.connect(source) as conn:
-        conn.execute("UPDATE deployments SET provisioner='terraform'")
-        conn.execute("UPDATE plans SET provisioner='terraform',account_id='123456789012'")
-    assert import_snapshot(db, source, issuer="https://old.test")["deployments"] == 1
-    with db.read() as conn:
-        row = conn.execute("SELECT account_scope,provider_resource_id FROM resources").fetchone()
-        assert row == {
-            "account_scope": "123456789012",
-            "provider_resource_id": "i-0123456789abcdef0",
-        }

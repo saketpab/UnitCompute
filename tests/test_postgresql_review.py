@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -13,12 +12,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from conftest import Harness, auth, create_and_plan, make_settings
-from test_postgresql import empty_target, legacy_fixture
+from pg_history import seed_history
 from unitcompute.api.app import build_container, create_app
 from unitcompute.auth import JwtAuthenticator, Principal
 from unitcompute.db.database import Database
-from unitcompute.db.import_sqlite import import_snapshot
-from unitcompute.errors import NotFound
 from unitcompute.provisioning.base import NetworkTargets, owner_tag
 from unitcompute.provisioning.terraform import build_tfvars
 from unitcompute.services.catalog import CatalogService
@@ -30,26 +27,11 @@ PLAN = "plan_" + "c" * 32
 ISSUER = "https://old.test"
 
 
-def source(db: Database, tmp_path: Path) -> Path:
-    path = tmp_path / "source.sqlite3"
-    legacy_fixture(path)
-    empty_target(db)
-    return path
-
-
-def native_source(path: Path) -> None:
-    with sqlite3.connect(path) as c:
-        c.execute("UPDATE deployments SET provisioner='terraform',status='active'")
-        c.execute("UPDATE plans SET provisioner='terraform',account_id='123456789012'")
-
-
 @pytest.mark.parametrize("kind", ["create", "destroy"])
 def test_native_resource_replan_preserves_identity_and_approval(
     db: Database, tmp_path: Path, kind: str
 ) -> None:
-    path = source(db, tmp_path)
-    native_source(path)
-    import_snapshot(db, path, issuer=ISSUER)
+    seed_history(db, native=True)
     settings = make_settings(
         tmp_path,
         provisioner="terraform",
@@ -106,24 +88,24 @@ def test_native_resource_replan_preserves_identity_and_approval(
 
 
 @pytest.mark.parametrize("status", ["pending", "ready", "failed"])
-def test_native_import_with_unapproved_current_plan(
+def test_native_projection_with_unapproved_current_plan(
     db: Database, tmp_path: Path, status: str
 ) -> None:
-    path = source(db, tmp_path)
-    native_source(path)
+    seed_history(db, native=True)
+    principal = Principal("legacy-subject", "jwt", ISSUER)
     pending = "plan_" + "f" * 32
-    with sqlite3.connect(path) as c:
-        c.execute("UPDATE deployments SET current_plan_id=?", (pending,))
+    with db.transaction() as c:
         c.execute(
-            (
-                "INSERT INTO plans(id,deployment_id,owner_id,kind,status,provisioner,config_"
-                "hash,region,state_key,template_version,created_at) SELECT ?,deployment_id,o"
-                "wner_id,kind,?,provisioner,config_hash,region,state_key,template_version,cr"
-                "eated_at FROM plans"
-            ),
-            (pending, status),
+            "INSERT INTO plans(id,deployment_id,owner_id,kind,status,provisioner,config_hash,"
+            "region,state_key,template_version,created_at) SELECT %s,deployment_id,owner_id,"
+            "kind,%s,provisioner,config_hash,region,state_key,template_version,created_at "
+            "FROM plans WHERE id=%s",
+            (pending, status, PLAN),
         )
-    import_snapshot(db, path, issuer=ISSUER)
+        c.execute(
+            "UPDATE deployments SET current_plan_id=%s WHERE owner_id=%s",
+            (pending, principal.owner_id),
+        )
     with db.read() as c:
         row = c.execute(
             "SELECT account_scope,provider_resource_id,approved_config FROM resources"
@@ -133,9 +115,8 @@ def test_native_import_with_unapproved_current_plan(
         assert json.loads(row["approved_config"])["plan_id"] == PLAN
 
 
-def test_imported_worker_tfvars_use_original_cloud_marker(db: Database, tmp_path: Path) -> None:
-    path = source(db, tmp_path)
-    import_snapshot(db, path, issuer=ISSUER)
+def test_worker_tfvars_use_immutable_cloud_marker(db: Database, tmp_path: Path) -> None:
+    seed_history(db, native=True)
     with db.read() as c:
         row = c.execute("SELECT * FROM deployments").fetchone()
     spec = Worker._spec(row)
@@ -146,86 +127,21 @@ def test_imported_worker_tfvars_use_original_cloud_marker(db: Database, tmp_path
     )["owner_tag"] == owner_tag("legacy-subject")
 
 
-@pytest.mark.parametrize("source_auth", ["jwt", "development"])
-def test_import_owner_assignment_uses_explicit_source_auth(
-    db: Database, tmp_path: Path, source_auth: str
-) -> None:
-    path = source(db, tmp_path)
-    with sqlite3.connect(path) as c:
-        for table in ("deployments", "plans", "jobs", "idempotency_records"):
-            c.execute(f"UPDATE {table} SET owner_id='dev:carol' WHERE owner_id='legacy-subject'")  # noqa: S608 - fixed table list
-        c.execute("UPDATE plans SET approved_by='dev:carol',preview_json='{\"changes\":[]}'")
-    import_snapshot(db, path, issuer=ISSUER, source_auth=source_auth)
-    jwt = Principal("dev:carol", "jwt", ISSUER)
-    dev = Principal("dev:carol", "dev")
-    svc = DeploymentService(db, make_settings(tmp_path))
-    allowed, denied = (jwt, dev) if source_auth == "jwt" else (dev, jwt)
-    assert svc.get_deployment(allowed, DEP).id == DEP
-    with pytest.raises(NotFound):
-        svc.get_deployment(denied, DEP)
-    with pytest.raises(ValueError, match="different snapshot"):
-        import_snapshot(
-            db, path, issuer=ISSUER, source_auth="development" if source_auth == "jwt" else "jwt"
-        )
-
-
-def test_import_cross_owner_plan_rejected_atomically(db: Database, tmp_path: Path) -> None:
-    path = source(db, tmp_path)
-    with sqlite3.connect(path) as c:
-        c.execute(
-            (
-                "INSERT INTO deployments(id,owner_id,name,disk_gib,region,instance_type,prov"
-                "isioner,status,current_plan_id,created_at,updated_at) VALUES(?, 'victim','v"
-                "ictim',8,'us-east-1','t3.micro','simulated','deleted',?,?,?)"
-            ),
-            (
-                "dep_" + "1" * 32,
-                "plan_" + "2" * 32,
-                "2026-10-30T00:00:00+00:00",
-                "2026-10-30T00:00:00+00:00",
-            ),
-        )
-        c.execute(
-            (
-                "INSERT INTO plans(id,deployment_id,owner_id,kind,status,provisioner,config_"
-                "hash,region,state_key,template_version,created_at,preview_json,plan_hash,ap"
-                "proved_at) VALUES(?,?,'victim','create','ready','simulated','victim-config'"
-                ",'us-east-1','victim-key','ec2-vm/v1',?,'{\"changes\":[],\"warnings\":[\"victim "
-                "private preview\"]}','victim-plan-hash',?)"
-            ),
-            (
-                "plan_" + "2" * 32,
-                "dep_" + "1" * 32,
-                "2026-10-30T00:00:00+00:00",
-                "2026-10-30T00:00:00+00:00",
-            ),
-        )
-        c.execute("UPDATE deployments SET current_plan_id=? WHERE id=?", ("plan_" + "2" * 32, DEP))
-        assert c.execute("PRAGMA foreign_key_check").fetchall() == []
-    with pytest.raises(psycopg.errors.ForeignKeyViolation, match="deployments_owned_current_plan"):
-        import_snapshot(db, path, issuer=ISSUER)
-    with db.read() as c:
-        for table in ("users", "deployments", "plans", "resources", "offline_imports"):
-            assert c.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0  # noqa: S608 - fixed table list
-    with sqlite3.connect(path) as c:
-        c.execute("UPDATE deployments SET current_plan_id=? WHERE id=?", (PLAN, DEP))
-    assert import_snapshot(db, path, issuer=ISSUER)["deployments"] == 2
-
-
-def test_current_plan_constraint_rejects_same_owner_other_deployment(harness: Harness) -> None:
+@pytest.mark.parametrize("user", ["alice", "bob"])
+def test_current_plan_constraint_rejects_other_deployment(harness: Harness, user: str) -> None:
     first = create_and_plan(harness)
     with harness.db.transaction() as c:
         c.execute("UPDATE deployments SET status='deleted' WHERE id=%s", (first["id"],))
-    second = create_and_plan(harness)
+    second = create_and_plan(harness, user=user)
     with pytest.raises(psycopg.errors.ForeignKeyViolation), harness.db.transaction() as c:
         c.execute(
             "UPDATE deployments SET current_plan_id=%s WHERE id=%s",
             (first["current_plan"]["plan_id"], second["id"]),
         )
     assert (
-        harness.client.get(f"/deployments/{second['id']}", headers=auth()).json()["current_plan"][
-            "plan_id"
-        ]
+        harness.client.get(f"/deployments/{second['id']}", headers=auth(user)).json()[
+            "current_plan"
+        ]["plan_id"]
         == second["current_plan"]["plan_id"]
     )
 
@@ -253,28 +169,6 @@ def test_provider_required_structure(db: Database, config: dict[str, Any]) -> No
             ),
             (user, json.dumps(config)),
         )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        r'{"pass\u0077ord":"synthetic-review-only"}',
-        r'{"nested":[{"name":"pass\u0077ord=synthetic-review-only"}]}',
-    ],
-)
-def test_import_decoded_json_credentials_rejected(
-    db: Database, tmp_path: Path, payload: str
-) -> None:
-    path = source(db, tmp_path)
-    with sqlite3.connect(path) as c:
-        c.execute("UPDATE jobs SET result_json=?", (payload,))
-    original = path.read_bytes()
-    with pytest.raises(ValueError, match=r"unredacted sensitive source data: jobs\.result_json"):
-        import_snapshot(db, path, issuer=ISSUER)
-    assert path.read_bytes() == original
-    with db.read() as c:
-        assert c.execute("SELECT count(*) FROM offline_imports").fetchone()[0] == 0
-        assert c.execute("SELECT count(*) FROM deployments").fetchone()[0] == 0
 
 
 def test_job_and_resource_reads_redact_structured_values(harness: Harness) -> None:
@@ -345,25 +239,6 @@ def test_patch_cors_preflight_and_authenticated_updates(db: Database, tmp_path: 
         )
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"format_version": "1.2", "planned_values": {}},
-        {"terraform_version": "1.17.1", "serial": 1, "lineage": "synthetic-review"},
-    ],
-)
-def test_import_rejects_raw_terraform_documents(
-    db: Database, tmp_path: Path, payload: dict[str, Any]
-) -> None:
-    path = source(db, tmp_path)
-    with sqlite3.connect(path) as c:
-        c.execute("UPDATE jobs SET result_json=?", (json.dumps(payload),))
-    with pytest.raises(ValueError, match="raw Terraform plan/state"):
-        import_snapshot(db, path, issuer=ISSUER)
-    with db.read() as c:
-        assert c.execute("SELECT count(*) FROM offline_imports").fetchone()[0] == 0
-
-
 def test_upgrade_from_published_eight_preserves_history_and_checksums(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -376,9 +251,7 @@ def test_upgrade_from_published_eight_preserves_history_and_checksums(
         old.setattr(database, "_migration_files", lambda: files[:8])
         old.setattr(database, "LATEST_SCHEMA_VERSION", 8)
         db.migrate()
-        path = source(db, tmp_path)
-        native_source(path)
-        import_snapshot(db, path, issuer=ISSUER)
+        seed_history(db, native=True)
         with db.read() as c:
             checksums = c.execute(
                 "SELECT version,checksum FROM schema_migrations ORDER BY version"
@@ -387,7 +260,7 @@ def test_upgrade_from_published_eight_preserves_history_and_checksums(
                 "SELECT * FROM deployment_resources ORDER BY resource_id,source,parent_id"
             ).fetchall()
             obligations = c.execute("SELECT * FROM recovery_obligations ORDER BY id").fetchall()
-    assert db.migrate() == [9, 10]
+    assert db.migrate() == [9, 10, 11]
     assert db.migrate() == []
     with db.read() as c:
         assert (

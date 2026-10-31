@@ -366,32 +366,33 @@ run this once against the real bootstrap. No such run has been recorded yet.
    the bootstrap network, roles and bucket are unchanged, and that the state object and
    audit trail remain.
 
-## Offline SQLite import
+## PostgreSQL persistence
 
-For an existing schema-v7 database, stop all API/worker writers and preserve a backup plus
-its work/evidence directory. Create and migrate a new empty PostgreSQL schema. Then run:
+PostgreSQL is the sole supported database. There is no SQLite runtime, fallback or
+packaged cutover utility. Historical importer sources remain in Git history; retiring
+that utility does not remove existing data or receipts. Published migration checksums
+and the `offline_imports` table remain intact. Never reset a database to perform an upgrade.
+A contradictory completion makes migration fail atomically; retain the database and
+evidence for investigation. A corrupt completed assistant reply returns
+`503 stored_reply_invalid` without invoking the model or inventing a replacement reply.
 
-```sh
-uv run python -m unitcompute.db.import_sqlite /absolute/path/to/snapshot.sqlite3 --issuer https://verified-original-issuer.example/
-```
+Integration contract for the Terraform lifecycle successor:
 
-The importer opens the snapshot read-only, checks integrity, schema version, tables and
-columns, and rejects unknown, invalid or recognizably unredacted sensitive data, including
-decoded JSON credentials and raw Terraform documents. By default **every** historical subject
-is treated as JWT ownership under the supplied verified issuer, including subjects beginning
-`dev:`. This selects source-owner assignment; it does not bypass authentication.
-`JwtAuthenticator` rejects reserved `dev:` subjects, so verify usable source identities
-before cutover. Use `--source-auth development` only for a verified, entirely development-authenticated
-source; mixed or unknown authentication provenance requires an explicit offline identity
-mapping before import. Subject spelling never selects authentication mode. Ownership is remapped from
-subject to issuer+subject while prefixed API IDs, historical actors and all stored hashes
-are retained. Source timestamps must include timezone information. Every row and the
-source fingerprint receipt commit together; retrying the same snapshot returns that
-receipt, while a different snapshot or nonempty target is refused. Sequence values retain
-source ordering. The receipt does not substitute for backing up/restoring recovery files.
-Verify imported counts, identity history, obligations, approval binding and readiness before
-cutover; keep the old backup for rollback. Older snapshots must first be upgraded with the
-original release's offline migrations. No runtime fallback or dual-write is provided.
+- PostgreSQL migrations 0001–0011 are published history; append later migrations and
+  preserve existing rows, hashes, receipts and evidence. Do not bring SQLite migrations,
+  PRAGMAs, fallback databases or compatibility fixtures into the PostgreSQL runtime/tests.
+- Use `Database.transaction(principal.owner_id)` for owned requests, `%s` parameters,
+  and mapping rows. JSONB currently crosses the domain boundary as JSON text. Keep the
+  shared schema/exclusive owner lock ordering and exclusive unscoped worker writes.
+- Known recovery source/discharge jobs belong to the same deployment/owner and source
+  plan; a known discharge job must be a later successful apply by persisted sequence.
+  Uncaptured evidence cannot have discharge metadata. Captured/open evidence can be
+  reconciled by an approved repair. Discharge and job success commit together under
+  deferred checks. New lifecycle actions must not silently broaden discharge semantics.
+- Preserve issuer+subject authorization, immutable cloud ownership, exact approval,
+  one active operation, owner-wide historical obligations and file-first evidence.
+  Keep cloud/model/subprocess work outside transactions and the final dispatch expiry
+  check after STS preparation. Integrate only an explicitly frozen lifecycle commit.
 
 Resource UUIDs coexist with legacy deployment/chat aliases. User identity is issuer+subject,
 never email. Resource/chat/user links enforce ownership through composite foreign keys.

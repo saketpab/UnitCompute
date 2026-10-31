@@ -62,8 +62,10 @@ def main(argv: list[str] | None = None) -> int:
             "FROM deployments d LEFT JOIN jobs j ON j.id = ("
             "  SELECT id FROM jobs WHERE deployment_id = d.id ORDER BY sequence DESC LIMIT 1) "
             "WHERE d.status = 'recovery_required' OR EXISTS (SELECT 1 FROM "
-            "recovery_obligations o WHERE o.deployment_id = d.id AND o.discharged_at IS NULL "
-            "AND o.evidence = 'uncaptured') ORDER BY d.updated_at"
+            "recovery_obligations o WHERE o.deployment_id = d.id "
+            "AND (o.evidence = 'uncaptured' OR NOT "
+            "recovery_obligation_valid(o.deployment_id,o.job_id,o.plan_id,o.evidence,"
+            "o.discharged_at,o.discharged_by_job_id))) ORDER BY d.updated_at"
         ).fetchall()
     provisioner = build_provisioner(settings) if args.inventory else None
     for row in rows:
@@ -72,7 +74,9 @@ def main(argv: list[str] | None = None) -> int:
             known = IdentityLedger.known(conn, row["id"])
             obligations = conn.execute(
                 "SELECT job_id, plan_id, reason, evidence, created_at FROM recovery_obligations "
-                "WHERE deployment_id = %s AND discharged_at IS NULL ORDER BY id",
+                "WHERE deployment_id = %s AND (discharged_at IS NULL OR NOT "
+                "recovery_obligation_valid(deployment_id,job_id,plan_id,evidence,discharged_at,"
+                "discharged_by_job_id)) ORDER BY id",
                 (row["id"],),
             ).fetchall()
         entry["open_recovery_obligations"] = [dict(o) for o in obligations]

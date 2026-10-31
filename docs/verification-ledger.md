@@ -669,3 +669,62 @@ worker exclusion and deletion passed against PostgreSQL with simulated cloud.
 Exact committed-SHA process and CI evidence are recorded in the successor handoff. No clean independent successor review, live AWS lifecycle,
 SDK parity or lifecycle/orphan-cleanup video is established here. The frozen `4f601eee`
 owner-wide obligation and post-STS dispatch-expiry invariants remain required.
+
+
+## PostgreSQL-only scope and completion integrity (parent `e5c43959`)
+
+Independent review `582ed0f3-d39d-4992-bf73-c93e582874ae` found the parent NOT CLEAN,
+despite 583 passing tests (including nine classifier controls), zero skips, 154 qualified
+mutants and exact-SHA CI success. Its JSON-logged SQL false-kill finding was closed; its
+new discharge contradiction and SQL-NULL completed-reply findings remained open.
+
+At 00:55 UTC the user approved a clean PostgreSQL-only deliverable. The optional offline
+SQLite importer/CLI and active synthetic SQLite fixture set are retired. Import-specific
+reproductions are retired scope, not claimed repaired. Source remains in Git history and
+existing review/artifact directories; no actual database, receipt, work/evidence file or
+published migration is deleted or reset. The original SPEC chose SQLite for an undeployed
+foundation, but the later explicit PostgreSQL requirement supersedes that runtime choice.
+No concrete real SQLite cutover requirement was established by the available evidence.
+
+Mixed-purpose native API, ownership, approval projection, worker, evidence, JSON result
+and PostgreSQL upgrade tests remain, using direct PostgreSQL history. Import-only cases
+are explicitly removed; the successor handoff records the node inventory difference.
+The historical verification entries above describe their original candidates and are not
+rewritten as current acceptance. The stale README runtime wording is corrected.
+
+Forward migration 0011 validates evidence/discharge consistency and known job ordering,
+including direct writes and later job updates, without rewriting migrations 0001–0010.
+An invalid upgrade rolls back its pending schema changes and retains original history.
+Unknown references and valid historical discharges remain supported. API/worker owner
+safety gates, operator reporting and housekeeping independently treat contradictory
+completion as unresolved; a timestamp alone is not evidence of safe completion.
+
+Completed assistant attempts require a readable reply in PostgreSQL; reserved/failed
+attempts may retain SQL NULL. Corrupt completed replay returns a controlled
+`503 stored_reply_invalid` before model creation, without inventing a response or changing
+history. Valid capture, approved repair, deferred discharge/job-success and restart paths
+are covered by real PostgreSQL/API/worker regressions. The guard inventory retains the
+154 prior mutants (one admin SQL target mechanically follows its changed query) and adds
+three focused completion/reply mutants. Frozen successor results belong in its handoff.
+
+Lifecycle integration, fresh independent exact-SHA review, actual AWS access and the
+create/inspect-edit/stop-start/delete/final orphan-cleanup video remain pending. No PR,
+live cloud, credentials, image build, deployment or merge is authorized by these results.
+
+
+Successor local verification: 578 tests passed, zero skipped, one existing fork-related
+DeprecationWarning on real PostgreSQL 15.19 with offline Terraform cases required.
+The test inventory changes from 583 are explicit: 536 unchanged node IDs, 36 retired
+import-only cases, 11 old cases replaced by 13 PostgreSQL cases, and 29 new completion
+cases. The nine classifier controls are included in the 578 aggregate, and also retained
+in a focused diagnostic run. No skip substitution was used.
+
+All 157 configured guard mutants qualified: the original 154 plus three new completion
+mutants. Retained reports have call-phase failures and zero skips; SQL diagnostics are
+limited to the five deliberate lock-timeout cases and the explicitly expected quota-index
+UniqueViolation. Format, lint, strict types (36 source files), lock consistency, dependency
+audit and staged secret scanning pass. Actual API/worker subprocess create, inspect,
+approval, simulated apply/delete, worker exclusion and durable restart pass on PostgreSQL.
+Exact committed-SHA process/CI results, preservation evidence and the precise port contract
+are recorded in the successor handoff; these results do not establish a clean independent
+review or live lifecycle/video completion.

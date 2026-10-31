@@ -180,11 +180,21 @@ def sanitize_reply(reply: AgentReply) -> AgentReply:
     )
 
 
-def _stored_reply(response_json: str) -> AgentReply:
+def _stored_reply(response_json: str | None) -> AgentReply:
     """Load a stored reply without trusting its proposal to satisfy current validation."""
-    raw = json.loads(response_json)
-    proposal = raw.pop("proposal", None) if isinstance(raw, dict) else None
-    reply = AgentReply.model_validate({**raw, "proposal": None})
+    try:
+        if response_json is None:
+            raise ValueError("completed reply is missing")
+        raw = json.loads(response_json)
+        if not isinstance(raw, dict):
+            raise TypeError("completed reply is not an object")
+        reply = AgentReply.model_validate({**raw, "proposal": None})
+    except (ValueError, TypeError) as exc:
+        raise ServiceUnavailable(
+            "The stored completed reply is invalid; operator investigation is required.",
+            code="stored_reply_invalid",
+        ) from exc
+    proposal = raw.get("proposal")
     if proposal is not None:
         try:
             reply = reply.model_copy(update={"proposal": Proposal.model_validate(proposal)})

@@ -499,7 +499,7 @@ def test_r5_2_migration_backfills_obligations_for_earlier_failures(
                     "'succeeded', 'h', %s)",
                     ("job_ok" + dep[4:], owner, dep, "plan_ok" + dep[4:], now),
                 )
-    assert db.migrate() == [5, 6, 7, 8, 9, 10]
+    assert db.migrate() == [5, 6, 7, 8, 9, 10, 11]
     with db.read() as conn:
         rows = sorted(
             (r["deployment_id"], r["reason"], r["evidence"], r["discharged_at"] is not None)

@@ -93,7 +93,7 @@ class JsonFormatter(logging.Formatter):
 
 
 def secure_process_defaults() -> None:
-    """Owner-only permissions for everything the process creates (SQLite WAL/SHM files,
+    """Owner-only permissions for everything the process creates (worker evidence files,
     Terraform work directories, logs)."""
     os.umask(0o077)
 

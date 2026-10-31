@@ -771,8 +771,8 @@ MUTATIONS = [
         (
             (
                 "admin.py",
-                "WHERE deployment_id = %s AND discharged_at IS NULL ORDER BY id",
-                "WHERE deployment_id = %s AND FALSE ORDER BY id",
+                "WHERE deployment_id = %s AND (discharged_at IS NULL OR NOT ",
+                "WHERE deployment_id = %s AND (FALSE AND ",
             ),
         ),
         (
@@ -1660,6 +1660,38 @@ MUTATIONS = [
             ),
         ),
         ("tests/test_agent.py::test_invalid_values_become_clarifications",),
+    ),
+    Mutation(
+        "pg-uncaptured-completion",
+        (
+            (
+                "db/migrations/0011_completion_integrity.sql",
+                "AND (evidence <> 'uncaptured' OR (discharged_at IS NULL AND discharge_job IS NULL))",
+                "AND TRUE",
+            ),
+            (
+                "db/migrations/0011_completion_integrity.sql",
+                "CHECK (evidence <> 'uncaptured' OR (discharged_at IS NULL AND discharged_by_job_id IS NULL));",
+                "CHECK (TRUE);",
+            ),
+        ),
+        ("tests/test_postgresql_review11.py::test_direct_completion_contradictions_are_atomic",),
+    ),
+    Mutation(
+        "pg-discharge-order",
+        (("db/migrations/0011_completion_integrity.sql", "dst.sequence>src.sequence", "TRUE"),),
+        ("tests/test_postgresql_review11.py::test_direct_completion_contradictions_are_atomic",),
+    ),
+    Mutation(
+        "pg-completed-reply",
+        (
+            (
+                "db/migrations/0011_completion_integrity.sql",
+                "CHECK (status <> 'succeeded' OR assistant_reply_readable(response_json));",
+                "CHECK (TRUE);",
+            ),
+        ),
+        ("tests/test_postgresql_review11.py::test_completed_reply_requires_readable_payload",),
     ),
 ]
 
