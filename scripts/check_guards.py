@@ -1664,12 +1664,30 @@ MUTATIONS = [
 ]
 
 
+def exception_diagnostics(output: str) -> str:
+    diagnostics = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            record = None
+        if (
+            isinstance(record, dict)
+            and {"ts", "level", "logger", "message", "exception"} <= record.keys()
+            and isinstance(record["exception"], str)
+        ):
+            lines = record["exception"].splitlines()
+        else:
+            lines = [line]
+        diagnostics.extend(
+            item for item in lines if item.startswith("E ") or re.match(r"^[\w.]+:", item)
+        )
+    return "\n".join(diagnostics)
+
+
 def broken_errors(output: str) -> set[str]:
-    # Tracebacks print unexecuted source too; only exception diagnostics establish a
-    # broken mutation. PostgreSQL's execute implementation contains raise TypeError.
-    diagnostics = "\n".join(
-        line for line in output.splitlines() if line.startswith("E ") or re.match(r"^[\w.]+:", line)
-    )
+    # Source snippets are not diagnostics. Decode only JsonFormatter's exception field.
+    diagnostics = exception_diagnostics(output)
     return {m.group(1) for m in BROKEN_MUTANT_ERRORS.finditer(diagnostics)} | set(
         re.findall(r"psycopg(?:\.errors)?\.([A-Za-z]+):", diagnostics)
     )
@@ -1741,7 +1759,7 @@ def run(
     failed = [r for r in outcomes if r["outcome"] == "failed"]
     if not failed or any(r["when"] != "call" for r in failed):
         return "BROKEN-TEST-SETUP"
-    diagnostics = output
+    diagnostics = exception_diagnostics(output)
     if mutation.logged_timeout_failure:
         if any(not re.search(mutation.logged_timeout_failure, r["message"]) for r in failed):
             return "WRONG-REASON"
@@ -1749,7 +1767,7 @@ def run(
         # still cannot qualify: the structured failure must be the behavioral assertion.
         diagnostics = "\n".join(
             line
-            for line in output.splitlines()
+            for line in diagnostics.splitlines()
             if not re.fullmatch(
                 r"(?:E\s+)?psycopg\.errors\.LockNotAvailable: canceling statement due to lock timeout",
                 line,

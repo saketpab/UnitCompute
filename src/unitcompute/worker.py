@@ -413,9 +413,13 @@ class Worker:
     def _load(self, job: Row) -> tuple[Row, Row]:
         with self.db.read() as conn:
             deployment = conn.execute(
-                "SELECT * FROM deployments WHERE id = %s", (job["deployment_id"],)
+                "SELECT * FROM deployments WHERE id = %s AND owner_id = %s",
+                (job["deployment_id"], job["owner_id"]),
             ).fetchone()
-            plan = conn.execute("SELECT * FROM plans WHERE id = %s", (job["plan_id"],)).fetchone()
+            plan = conn.execute(
+                "SELECT * FROM plans WHERE id = %s AND deployment_id = %s AND owner_id = %s",
+                (job["plan_id"], job["deployment_id"], job["owner_id"]),
+            ).fetchone()
         if deployment is None or plan is None:
             raise RuntimeError("job references missing deployment or plan")
         return deployment, plan
@@ -974,6 +978,8 @@ class Worker:
         signal, proves nothing by itself. IDs in any state read are recorded as
         observations even when it is not accepted. Otherwise: 'uncaptured' if the plan
         could create resources, else 'not_needed'."""
+        if job["kind"] != "apply":
+            return "uncaptured"
         deployment, plan = self._load(job)
         fallback = "uncaptured" if plan_may_create(plan) else "not_needed"
         workdir = self.settings.workdir_root / deployment["id"] / plan["id"]
@@ -1105,8 +1111,12 @@ class Worker:
             with self.db.read() as conn:
                 job = conn.execute(
                     "SELECT jobs.*, plans.kind AS plan_kind FROM jobs JOIN plans "
-                    "ON plans.id = jobs.plan_id WHERE jobs.id = %s",
-                    (obligation["job_id"],),
+                    "ON plans.id = jobs.plan_id AND plans.deployment_id = jobs.deployment_id "
+                    "AND plans.owner_id = jobs.owner_id JOIN deployments d "
+                    "ON d.id = jobs.deployment_id AND d.owner_id = jobs.owner_id "
+                    "WHERE jobs.id = %s AND jobs.deployment_id = %s AND jobs.plan_id = %s "
+                    "AND jobs.kind = 'apply'",
+                    (obligation["job_id"], obligation["deployment_id"], obligation["plan_id"]),
                 ).fetchone()
             if job is None:
                 continue
@@ -1115,8 +1125,16 @@ class Worker:
                 continue
             with self._tx() as conn:
                 conn.execute(
-                    "UPDATE recovery_obligations SET evidence = %s WHERE id = %s",
-                    (evidence, obligation["id"]),
+                    "UPDATE recovery_obligations SET evidence = %s WHERE id = %s "
+                    "AND deployment_id = %s AND job_id = %s AND plan_id = %s "
+                    "AND evidence = 'uncaptured' AND discharged_at IS NULL",
+                    (
+                        evidence,
+                        obligation["id"],
+                        obligation["deployment_id"],
+                        obligation["job_id"],
+                        obligation["plan_id"],
+                    ),
                 )
 
     def _recovery_required(

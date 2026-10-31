@@ -182,7 +182,7 @@ def test_r8_1_schema4_upgrade_with_a_preexisting_reservation(
             "'2026-10-02T00:00:00+00:00')",
             (job_id, newer, plan_id),
         )
-    assert db.migrate() == [5, 6, 7, 8, 9]
+    assert db.migrate() == [5, 6, 7, 8, 9, 10]
     client, h = _client(settings, db, FakeClock())
     provisioner = SimulatedProvisioner(settings.data_dir)
     with client:

@@ -147,7 +147,7 @@ def test_imported_worker_tfvars_use_original_cloud_marker(db: Database, tmp_path
 
 
 @pytest.mark.parametrize("source_auth", ["jwt", "development"])
-def test_import_authentication_is_explicit_not_subject_prefix(
+def test_import_owner_assignment_uses_explicit_source_auth(
     db: Database, tmp_path: Path, source_auth: str
 ) -> None:
     path = source(db, tmp_path)
@@ -387,7 +387,7 @@ def test_upgrade_from_published_eight_preserves_history_and_checksums(
                 "SELECT * FROM deployment_resources ORDER BY resource_id,source,parent_id"
             ).fetchall()
             obligations = c.execute("SELECT * FROM recovery_obligations ORDER BY id").fetchall()
-    assert db.migrate() == [9]
+    assert db.migrate() == [9, 10]
     assert db.migrate() == []
     with db.read() as c:
         assert (

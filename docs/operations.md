@@ -379,7 +379,9 @@ The importer opens the snapshot read-only, checks integrity, schema version, tab
 columns, and rejects unknown, invalid or recognizably unredacted sensitive data, including
 decoded JSON credentials and raw Terraform documents. By default **every** historical subject
 is treated as JWT ownership under the supplied verified issuer, including subjects beginning
-`dev:`. Use `--source-auth development` only for a verified, entirely development-authenticated
+`dev:`. This selects source-owner assignment; it does not bypass authentication.
+`JwtAuthenticator` rejects reserved `dev:` subjects, so verify usable source identities
+before cutover. Use `--source-auth development` only for a verified, entirely development-authenticated
 source; mixed or unknown authentication provenance requires an explicit offline identity
 mapping before import. Subject spelling never selects authentication mode. Ownership is remapped from
 subject to issuer+subject while prefixed API IDs, historical actors and all stored hashes

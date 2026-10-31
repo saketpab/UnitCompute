@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from psycopg import sql
+from pydantic import TypeAdapter, ValidationError
 
 from unitcompute.auth import Principal
 from unitcompute.config import load_settings
 from unitcompute.db.database import Database
 from unitcompute.logging_setup import redact, redact_structured
+from unitcompute.schemas import AcceptedResponse, AgentReply, CostEstimate, ResourceChange
 
 TABLES = (
     "deployments",
@@ -223,6 +225,77 @@ def validate_source_json(value: Any) -> None:
             validate_source_json(item)
 
 
+def validate_history_links(data: dict[str, list[dict[str, Any]]]) -> None:
+    deployments = {row["id"]: row for row in data["deployments"]}
+    plans = {row["id"]: row for row in data["plans"]}
+    jobs = {row["id"]: row for row in data["jobs"]}
+    for row in data["recovery_obligations"]:
+        deployment = deployments[row["deployment_id"]]
+        plan = plans.get(row["plan_id"]) if row["plan_id"] is not None else None
+        job = jobs.get(row["job_id"]) if row["job_id"] is not None else None
+        discharged = (
+            jobs.get(row["discharged_by_job_id"])
+            if row["discharged_by_job_id"] is not None
+            else None
+        )
+        for field, linked in (
+            ("plan_id", plan),
+            ("job_id", job),
+            ("discharged_by_job_id", discharged),
+        ):
+            if row[field] is None:
+                continue
+            if (
+                linked is None
+                or linked["deployment_id"] != deployment["id"]
+                or linked["owner_id"] != deployment["owner_id"]
+            ):
+                raise ValueError(f"invalid recovery_obligations.{field} ownership")
+        if job is not None and (
+            job["kind"] != "apply"
+            or (row["plan_id"] is not None and job["plan_id"] != row["plan_id"])
+        ):
+            raise ValueError("invalid recovery_obligations.job_id apply/plan binding")
+        if discharged is not None and (
+            discharged["kind"] != "apply"
+            or discharged["status"] != "succeeded"
+            or row["discharged_at"] is None
+        ):
+            raise ValueError("invalid recovery_obligations.discharged_by_job_id apply binding")
+
+
+def validate_json_shape(table: str, name: str, value: Any, row: dict[str, Any]) -> None:
+    try:
+        if value is None and (table, name) in {
+            ("jobs", "result_json"),
+            ("plans", "provider_versions_json"),
+            ("plans", "prior_resource_ids_json"),
+        }:
+            return
+        if table == "plans" and name == "prior_resource_ids_json":
+            TypeAdapter(list[str]).validate_python(value, strict=True)
+            return
+        if not isinstance(value, dict):
+            raise TypeError("expected an object")
+        if table == "plans":
+            if name == "preview_json":
+                TypeAdapter(list[ResourceChange]).validate_python(
+                    value.get("changes", []), strict=True
+                )
+                TypeAdapter(list[str]).validate_python(value.get("warnings", []), strict=True)
+            elif name == "cost_json":
+                CostEstimate.model_validate(value, strict=True)
+            elif name == "provider_versions_json":
+                TypeAdapter(dict[str, str]).validate_python(value, strict=True)
+        elif table == "idempotency_records":
+            AcceptedResponse.model_validate(value, strict=True)
+        elif table == "agent_attempts" and row["status"] == "succeeded":
+            # The historical reader separately validates/withholds old proposals.
+            AgentReply.model_validate({**value, "proposal": None}, strict=True)
+    except (ValueError, TypeError, ValidationError) as exc:
+        raise ValueError(f"invalid historical JSON shape: {table}.{name}") from exc
+
+
 def import_snapshot(
     db: Database, source: Path, *, issuer: str, source_auth: str = "jwt"
 ) -> dict[str, int]:
@@ -276,6 +349,7 @@ def import_snapshot(
                     f'SELECT rowid AS _source_order, * FROM "{table}" ORDER BY rowid'  # noqa: S608 - fixed allowlist
                 )
             ]
+        validate_history_links(data)
         schema = list(
             map(tuple, legacy.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"))
         )
@@ -355,6 +429,7 @@ def import_snapshot(
                                 raise ValueError(
                                     f"unredacted sensitive source data: {table}.{name}: {exc}"
                                 ) from exc
+                            validate_json_shape(table, name, parsed_json, row)
                     names = list(row)
                     conn.execute(
                         sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(

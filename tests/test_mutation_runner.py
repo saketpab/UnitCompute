@@ -83,3 +83,56 @@ def test_contention_allowance_does_not_hide_unrelated_logged_sql_faults(
     output = (tmp_path / mutation.name / "pytest.log").read_text()
     assert "LockNotAvailable: canceling statement due to lock timeout" in output
     assert "assert 'recovery_required' == 'succeeded'" in output
+
+
+def test_actual_json_logged_postgresql_fault_is_not_a_guard_kill(tmp_path: Path) -> None:
+    guards = guards_module()
+    original = (
+        "            spec = self._spec(deployment)\n"
+        '            self._retry_uncaptured(deployment["id"])'
+    )
+    injected = """            try:
+                with self.db.read() as calibration_conn:
+                    calibration_conn.execute("SELECT 1/0")
+            except Exception:
+                from unitcompute.logging_setup import JsonFormatter
+                import sys
+                print(JsonFormatter().format(logging.LogRecord(
+                    "unitcompute.worker", logging.ERROR, __file__, 1,
+                    "SQL failed", (), sys.exc_info())))
+                with self._tx() as conn:
+                    self._finish_plan_failure(conn, job, "internal_error", "Database query failed.")
+                return
+            spec = self._spec(deployment)
+            self._retry_uncaptured(deployment["id"])"""
+    mutation = guards.Mutation(
+        "calibration-actual-json-sql-failure",
+        (("worker.py", original, injected),),
+        ("tests/test_lifecycle_api.py::test_full_lifecycle_create_inspect_delete",),
+    )
+    assert guards.run(mutation, tmp_path) == "BROKEN-MUTANT(DivisionByZero)"
+    output = (tmp_path / mutation.name / "pytest.log").read_text()
+    import json
+
+    record = next(json.loads(line) for line in output.splitlines() if line.startswith('{"ts":'))
+    assert record["logger"] == "unitcompute.worker"
+    assert record["exception"].startswith("Traceback")
+    assert "psycopg.errors.DivisionByZero" in output
+    reports = (tmp_path / mutation.name / "reports.jsonl").read_text()
+    assert "plan_failed" in reports and "awaiting_approval" in reports
+
+
+def test_json_message_or_unexecuted_source_is_not_an_exception_diagnostic() -> None:
+    import json
+
+    guards = guards_module()
+    record = {
+        "ts": "now",
+        "level": "ERROR",
+        "logger": "unitcompute.worker",
+        "message": "psycopg.errors.DivisionByZero: source example",
+    }
+    assert guards.broken_errors(json.dumps(record)) == set()
+    record["exception"] = "psycopg.errors.DivisionByZero: division by zero"
+    assert guards.broken_errors("    print(" + repr(json.dumps(record)) + ")") == set()
+    assert guards.broken_errors(json.dumps(record)) == {"DivisionByZero"}

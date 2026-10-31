@@ -606,3 +606,66 @@ one about expiry). The dispatch check runs in the provisioner immediately before
 not controllable from Python. A different `Provisioner` implementation must call
 `check_dispatch()` at its own spawn boundary; the worker's checks before it remain as the
 backstop. Live AWS behaviour, including real STS latency, remains part of the blocked live gate.
+
+## PostgreSQL candidate review corrections (parent `9e8cd819`)
+
+Independent Sol Medium review `79535099-05c1-4de1-bdfc-3165ec249666` of
+`9e8cd8196a02a887129e1b7969154617085eea47` is **NOT CLEAN**. It independently
+reproduced 541 passing tests, zero skips, one exact-SHA successful CI check and
+154 reported mutant kills. Those totals did not prove recovery-reference integrity,
+historical JSON usability or complete mutation failure classification.
+
+Three required defects were reproduced before editing: a crossed recovery obligation
+was cleared using another deployment's deletion evidence and then permitted a simulated
+apply; an actual PostgreSQL DivisionByZero formatted by the application's JSON logger
+was counted as a guard kill; and imported job/preview arrays committed a success receipt
+but caused authenticated API 500 responses. The earlier blanket claim of 154 valid kills
+on this PostgreSQL candidate is withdrawn. The original logs remain evidence of reported
+outcomes, with the structured-logging counterexample limiting their assurance.
+
+The earlier reserved-subject authentication claim is also corrected. Both reviewed
+revisions reject signed JWT subjects beginning `dev:` in `JwtAuthenticator`. The earlier
+reproducer constructed `Principal` directly; it proved source-owner assignment, not
+successful JWT authentication or an authentication bypass. Explicit importer provenance
+remains useful and unchanged. A signed-JWT API control now checks ordinary `carol`
+acceptance and reserved `dev:carol` rejection.
+
+The successor adds migration 0010 without rewriting migrations 0001–0009. Owned recovery
+plan/job/discharge constraints and deferred apply-operation checks reject inconsistent
+history, including later job updates that would invalidate it. Unknown null references
+remain supported. Upgrade failure leaves corrupt obligations and schema version intact;
+the worker independently scopes recovery evidence to the obligation's deployment, owner,
+plan and apply job, retaining uncertainty on mismatch. Import validates the same source
+relationships before writing history.
+
+Historical JSON is checked against its actual consumers before the atomic success
+receipt: job results, plan previews/cost/provider versions/prior IDs, completed assistant
+replies, idempotent accepted responses, heartbeat checks and audit details. Validation
+preserves source values and hashes; it does not normalize invalid data. The retained
+synthetic history fixture was corrected to contain a complete resource-change preview,
+a complete accepted response and a successful apply discharge job, rather than treating
+those malformed examples as supported history.
+
+Mutation calibration decodes only the known JSON logger's string `exception` field,
+including escaped newlines, then applies the existing exception-diagnostic rules. Source
+snippets and message-only examples are not exception evidence. Deliberate exact lock
+timeouts still require their specified behavioral failure; other SQL errors veto a kill.
+The review's actual formatter/worker/PostgreSQL reproduction is a regression control,
+not one of the configured guard mutants.
+
+Successor local verification: 583 tests passed, zero skipped, with one existing
+fork-related DeprecationWarning on real PostgreSQL 15.19 and required offline Terraform
+checks. The full calibrated guard run qualified 154/154 kills: 150 assertion failures
+and four explicitly expected exception outcomes. All 154 retained reports failed in
+call phase, with zero skipped outcomes; SQL diagnostics were limited to the five
+specified lock-timeout cases and the expected owner-quota unique-index violation.
+Nine separate classifier controls passed, including the actual application JSON-logged
+DivisionByZero rejection. The diagnostic run's recovery-upgrade fixture failure was
+corrected by removing/reapplying the full recovery subsystem; it is not counted as a
+kill. Format, lint, strict types, lock consistency, dependency audit and staged secret
+scan passed. Real API/worker subprocess create/inspect/approval/apply, durable restart,
+worker exclusion and deletion passed against PostgreSQL with simulated cloud.
+
+Exact committed-SHA process and CI evidence are recorded in the successor handoff. No clean independent successor review, live AWS lifecycle,
+SDK parity or lifecycle/orphan-cleanup video is established here. The frozen `4f601eee`
+owner-wide obligation and post-STS dispatch-expiry invariants remain required.
