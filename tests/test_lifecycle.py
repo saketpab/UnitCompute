@@ -10,7 +10,9 @@ import stat
 import subprocess
 from pathlib import Path
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
 from conftest import UBUNTU_MIN_GB, WINDOWS_MIN_GB, Cloud
 
 from unitcompute_vm import (
@@ -148,6 +150,52 @@ def test_out_of_band_changes_are_reported_and_a_vanished_instance_is_not_recreat
         vms.plan_update(vm_id, name="renamed")  # would silently build a different VM
 
 
+def test_inspect_says_so_when_aws_no_longer_knows_the_instance(vms: AwsVMs, cloud: Cloud) -> None:
+    vm_id = create(vms)
+
+    class AgedOut:
+        """A session whose DescribeInstances answers like AWS does for an instance that is gone."""
+
+        def client(self, name: str, **kwargs: object) -> object:
+            client = boto3.Session().client(name, **kwargs)
+            if name == "ec2":
+
+                def not_found(**_: object) -> None:
+                    error = {"Error": {"Code": "InvalidInstanceID.NotFound", "Message": "gone"}}
+                    raise ClientError(error, "DescribeInstances")
+
+                client.describe_instances = not_found
+            return client
+
+    info = AwsVMs(vms.state_root, None, session=AgedOut()).inspect(vm_id)  # type: ignore[arg-type]
+    assert info.status == "active" and info.power_state is None
+    assert not info.consistent and "was not found in AWS" in info.problems[0]
+
+
+def test_repair_after_a_failed_edit_never_recreates_the_instance(
+    vms: AwsVMs, cloud: Cloud, tmp_path: Path
+) -> None:
+    vm_id = create(vms)
+    instance_id = vms.inspect(vm_id).instance_id or ""
+    failing = AwsVMs(vms.state_root, None, terraform=stub(tmp_path, FAIL_APPLY), verify_poll=1)
+    with pytest.raises(ApplyFailed, match="exited with status 1"):
+        failing.apply(failing.plan_update(vm_id, name="renamed"))
+    assert vms.inspect(vm_id).status == "incomplete"
+
+    cloud.ec2().terminate_instances(InstanceIds=[instance_id])
+    with pytest.raises(PlanRejected, match="no longer exists in AWS"):
+        vms.plan_update(vm_id)
+    assert vms.apply(vms.plan_delete(vm_id)).status == "deleted"  # the way out
+    assert tagged(cloud, vm_id) == []
+
+
+def test_a_relative_state_folder_works(cloud: Cloud, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    relative = AwsVMs("vms", cloud.network)  # Terraform runs in another directory (-chdir)
+    plan = relative.plan_create(resolve_request(REQUEST))
+    assert (tmp_path / "vms" / plan.vm_id / "plans" / f"{plan.plan_id}.tfplan").exists()
+
+
 def test_a_failed_create_keeps_state_and_logs_and_can_be_deleted(
     vms: AwsVMs, cloud: Cloud, tmp_path: Path
 ) -> None:
@@ -181,11 +229,28 @@ cat "$OUT"; exit 137
 """
 
 
+FAIL_APPLY = """#!/bin/bash
+# Real terraform, except that an apply fails before changing anything.
+REAL=__REAL__
+if [[ "$2" == apply ]]; then echo "injected apply failure"; exit 1; fi
+exec "$REAL" "$@"
+"""
+
+
+def stub(tmp_path: Path, script: str) -> str:
+    path = tmp_path / f"terraform-stub-{abs(hash(script))}"
+    path.write_text(script.replace("__REAL__", str(shutil.which("terraform"))))
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
 def killed_midway(vms: AwsVMs, cloud: Cloud, tmp_path: Path) -> str:
-    stub = tmp_path / "terraform-killer"
-    stub.write_text(KILL_AFTER_INSTANCE.replace("__REAL__", str(shutil.which("terraform"))))
-    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
-    killer = AwsVMs(vms.state_root, cloud.network, terraform=str(stub), verify_poll=1)
+    killer = AwsVMs(
+        vms.state_root,
+        cloud.network,
+        terraform=stub(tmp_path, KILL_AFTER_INSTANCE),
+        verify_poll=1,
+    )
     plan = killer.plan_create(resolve_request(REQUEST))
     with pytest.raises(ApplyFailed):
         killer.apply(plan)

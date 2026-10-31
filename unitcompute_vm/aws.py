@@ -52,7 +52,9 @@ IMAGE_SSM_PARAMETER = {
 }
 INSTANCE_TYPE = {"small": "t3.micro", "medium": "t3.small", "large": "t3.medium"}
 DEFAULT_MODULE_DIR = Path(__file__).resolve().parent.parent / "terraform" / "aws_vm"
-_RESOURCES = ("aws_instance.vm", "aws_ec2_instance_state.vm")
+_INSTANCE = "aws_instance.vm"
+_STATE = "aws_ec2_instance_state.vm"
+_RESOURCES = frozenset({_INSTANCE, _STATE})
 _EDITABLE_INSTANCE_KEYS = {"tags", "tags_all", "volume_tags", "root_block_device"}
 _GONE = {"terminated"}  # EC2 keeps a terminated instance listed for about an hour
 
@@ -103,10 +105,10 @@ class AwsVMs:
         verify_timeout: float = 180,
         verify_poll: float = 3,
     ) -> None:
-        self.state_root = Path(state_root).expanduser()
+        self.state_root = Path(state_root).expanduser().resolve()  # Terraform runs in -chdir
         self.network = network
         self._terraform = shutil.which(terraform) or terraform
-        self._module_dir = Path(module_dir)
+        self._module_dir = Path(module_dir).resolve()
         self._session = session or boto3.Session()
         self._apply_timeout = apply_timeout
         self._verify_timeout = verify_timeout
@@ -167,6 +169,12 @@ class AwsVMs:
                     "cloud resources tagged for this VM are not in the Terraform state "
                     f"({', '.join(left)}); inspect them, then terminate_orphans() or delete"
                 )
+            creatable: frozenset[str] = frozenset()
+            if repair:
+                # A repair finishes what an interrupted create never reached. Once the state
+                # holds the instance, a missing one is a lost VM, never a resource to build anew.
+                held = self._tf(vm_id).instance(self._vm_dir(vm_id) / "logs" / "repair.log")
+                creatable = frozenset({_STATE} if held else _RESOURCES)
             desired = dict(record["desired"])
             if name is not None:
                 desired["name"] = check_name(name)
@@ -182,7 +190,7 @@ class AwsVMs:
                 if power_state not in ("running", "stopped"):
                     raise InvalidRequest("power_state must be 'running' or 'stopped'")
                 desired["power_state"] = power_state
-            return self._make_plan(vm_id, "update", record, desired, repair=repair)
+            return self._make_plan(vm_id, "update", record, desired, creatable=creatable)
 
     def plan_delete(self, vm_id: str) -> Plan:
         with self._locked(vm_id):
@@ -197,7 +205,7 @@ class AwsVMs:
         record: dict[str, Any],
         after: dict[str, Any],
         *,
-        repair: bool = False,
+        creatable: frozenset[str] = frozenset(),
     ) -> Plan:
         plan_id = f"{datetime.now(UTC):%Y%m%dT%H%M%S}-{operation}-{secrets.token_hex(3)}"
         vm_dir = self._vm_dir(vm_id)
@@ -212,7 +220,7 @@ class AwsVMs:
             shown = tf.show_plan(plan_file, log)
         except TerraformFailed as exc:
             raise VMError(f"{exc}; see {log}") from exc
-        changes = _check_plan(operation, shown, repair)
+        changes = _check_plan(operation, shown, creatable)
         summary = _summary(operation, record["desired"], after, changes)
         sha = _sha256(plan_file)
         _write_json(
@@ -337,6 +345,8 @@ class AwsVMs:
             instance_id = tracked[0] if tracked else None
             if instance_id:
                 live = self._read_instance(record, instance_id)
+                if not live:
+                    problems.append(f"instance {instance_id} was not found in AWS")
             elif record["status"] == "active":
                 problems.append("the Terraform state records no instance")
         if live and record["status"] == "active":
@@ -507,11 +517,13 @@ def _mismatches(desired: dict[str, Any], live: dict[str, Any]) -> list[str]:
     return out
 
 
-def _check_plan(operation: Operation, shown: dict[str, Any], repair: bool) -> list[list[str]]:
+def _check_plan(
+    operation: Operation, shown: dict[str, Any], creatable: frozenset[str]
+) -> list[list[str]]:
     """Reject any plan outside the supported lifecycle; return the (address, action) changes.
 
-    Only a repair of an incomplete VM may create resources inside an update (the ones an
-    interrupted create never made)."""
+    ``creatable`` names the resources an update may create: only those a repair of an
+    interrupted create never reached."""
     changes: list[list[str]] = []
     for rc in shown.get("resource_changes", []):
         address, change = rc["address"], rc["change"]
@@ -521,8 +533,12 @@ def _check_plan(operation: Operation, shown: dict[str, Any], repair: bool) -> li
         if address not in _RESOURCES:
             raise PlanRejected(f"plan touches {address}, which is not part of a VM")
         allowed = {"create": ["create"], "update": ["update"], "delete": ["delete"]}[operation]
-        if actions != allowed and not (repair and actions == ["create"]):
-            raise PlanRejected(f"{operation} plan wants to {'+'.join(actions)} {address}")
+        if actions != allowed and not (actions == ["create"] and address in creatable):
+            gone = " (it no longer exists in AWS; delete this VM and create a new one)"
+            raise PlanRejected(
+                f"{operation} plan wants to {'+'.join(actions)} {address}"
+                + (gone if actions == ["create"] and address == _INSTANCE else "")
+            )
         if operation == "update" and actions == ["update"]:
             _check_update(address, change)
         changes.append([address, actions[0]])
@@ -532,7 +548,7 @@ def _check_plan(operation: Operation, shown: dict[str, Any], repair: bool) -> li
 def _check_update(address: str, change: dict[str, Any]) -> None:
     old, new = change["before"], change["after"]
     changed = {k for k in set(old) | set(new) if old.get(k) != new.get(k)}
-    if address == "aws_ec2_instance_state.vm":
+    if address == _STATE:
         if changed != {"state"} or new.get("force"):
             raise PlanRejected("the power-state resource may only change its state")
         return

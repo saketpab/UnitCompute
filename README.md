@@ -12,14 +12,14 @@ from unitcompute_vm import AwsVMs, Network, resolve_request
 
 vms = AwsVMs("~/.unitcompute/vms", Network("subnet-0abc...", ("sg-0abc...",)))
 
-spec = resolve_request(translator.translate(text))   # raises MissingInputs([...]) if incomplete
-plan = vms.plan_create(spec)          # saves the exact Terraform plan; creates nothing
-print(plan.summary, plan.sha256)      # review it
-info = vms.apply(plan)                # applies that saved plan, then reads EC2 back
+spec = resolve_request(translator.translate(text))  # raises MissingInputs([...]) if incomplete
+plan = vms.plan_create(spec)  # saves the exact Terraform plan; creates nothing
+print(plan.summary, plan.sha256)  # review it
+info = vms.apply(plan)  # applies that saved plan, then reads EC2 back
 
-vms.inspect(info.vm_id)               # recorded config next to what EC2 reports now
+vms.inspect(info.vm_id)  # recorded config next to what EC2 reports now
 vms.apply(vms.plan_update(info.vm_id, name="web-2", disk_gb=20))
-vms.apply(vms.plan_update(info.vm_id, power_state="stopped"))   # and "running" to start
+vms.apply(vms.plan_update(info.vm_id, power_state="stopped"))  # and "running" to start
 vms.apply(vms.plan_delete(info.vm_id))
 ```
 
@@ -47,6 +47,9 @@ image's minimum root size (read from the image) and can be overridden (8-100 GiB
 - A plan that would replace or destroy anything during create/edit (for example a VM that was
   terminated outside this tool), or change anything beyond tags, disk size and power state, is
   rejected before you can approve it.
+  Repair after a failed or killed apply may create only what that apply never reached; once the
+  state holds the instance, a missing one is never rebuilt (delete the VM and create a new one).
+  `inspect` reports an instance AWS no longer knows as a problem, not as consistent.
 - After an apply, EC2 is polled until the instance state, root disk size and Name tag match;
   otherwise `VerificationFailed` is raised and nothing is rolled back.
 - Delete verifies that no instance or volume tagged `UnitComputeVm=<vm_id>` is left.
