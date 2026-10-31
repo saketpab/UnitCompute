@@ -305,7 +305,7 @@ def test_an_apply_killed_midway_is_repaired_by_planning_again(
     assert (info.status, info.power_state, info.consistent) == ("active", "running", True)
 
 
-def test_resources_missing_from_state_are_reported_and_removed_only_on_request(
+def test_resources_missing_from_state_are_only_reported(
     vms: AwsVMs, cloud: Cloud, tmp_path: Path
 ) -> None:
     vm_id = killed_midway(vms, cloud, tmp_path)
@@ -319,7 +319,10 @@ def test_resources_missing_from_state_are_reported_and_removed_only_on_request(
         vms.plan_update(vm_id)  # would build a second VM next to the first
     assert len(tagged(cloud, vm_id)) == 2  # nothing was touched
 
-    assert sorted(vms.terminate_orphans(vm_id)) == sorted(orphans)
+    ec2 = cloud.ec2()  # what the operator does by hand, outside this package
+    instances = [o for o in orphans if o.startswith("i-")]
+    ec2.terminate_instances(InstanceIds=instances)
+    ec2.get_waiter("instance_terminated").wait(InstanceIds=instances)
     assert tagged(cloud, vm_id) == []
     assert vms.apply(vms.plan_delete(vm_id)).status == "deleted"
 

@@ -167,7 +167,8 @@ class AwsVMs:
             if repair and (left := self.find_orphans(vm_id, record)):
                 raise PlanRejected(
                     "cloud resources tagged for this VM are not in the Terraform state "
-                    f"({', '.join(left)}); inspect them, then terminate_orphans() or delete"
+                    f"({', '.join(left)}); restore this VM's state folder, or review them in "
+                    "your AWS account and remove them yourself, then plan again"
                 )
             creatable: frozenset[str] = frozenset()
             if repair:
@@ -445,7 +446,7 @@ class AwsVMs:
     # ------------------------------------------------------------------ orphans
 
     def find_orphans(self, vm_id: str, record: dict[str, Any] | None = None) -> list[str]:
-        """Live instances and volumes tagged for this VM that Terraform state does not track."""
+        """Read-only: live instances/volumes tagged for this VM that the state does not track."""
         record = record or self._load(vm_id)
         known = set(self._tf(vm_id).instance(self._vm_dir(vm_id) / "logs" / "inspect.log") or ())
         ec2 = self._session.client("ec2", region_name=record["region"])
@@ -462,26 +463,6 @@ class AwsVMs:
             if v["State"] not in ("deleting", "deleted")
         ]
         return sorted(set(found) - known)
-
-    def terminate_orphans(self, vm_id: str) -> list[str]:
-        """Explicit cleanup of ``find_orphans``: terminate instances, delete volumes. Only for a
-        VM that is deleted or incomplete, and only resources tagged with this VM's ID."""
-        with self._locked(vm_id):
-            record = self._load(vm_id)
-            self._require(record, {"incomplete", "deleted"}, "cleaned of orphans")
-            ids = self.find_orphans(vm_id, record)
-            ec2 = self._session.client("ec2", region_name=record["region"])
-            instances = [i for i in ids if i.startswith("i-")]
-            if instances:
-                ec2.terminate_instances(InstanceIds=instances)
-                ec2.get_waiter("instance_terminated").wait(InstanceIds=instances)
-            for volume in (v for v in ids if v.startswith("vol-")):
-                try:
-                    ec2.delete_volume(VolumeId=volume)
-                except ClientError as exc:
-                    if exc.response["Error"]["Code"] != "InvalidVolume.NotFound":
-                        raise
-            return ids
 
     # ------------------------------------------------------------------ plumbing
 

@@ -65,8 +65,12 @@ machines: one folder, one machine.
 
 If an apply fails or is killed, the VM is `incomplete` (see `inspect().problems`) and the log
 path is in `ApplyFailed`. Plan again to repair (`plan_update(vm_id)` finishes whatever the
-interrupted run did not) or delete. Resources tagged for the VM but missing from state are listed
-by `find_orphans` and removed only by an explicit `terminate_orphans`.
+interrupted run did not) or delete. Resources tagged `UnitComputeVm=<vm_id>` but missing from the
+state are only **reported** (`find_orphans`, and `inspect().problems`); this package never
+terminates or deletes anything outside a saved Terraform plan. If the state folder is lost, first
+try to restore it from a backup. Otherwise review the reported IDs in the AWS account and region
+yourself (the tag shows which VM they belonged to, not that they are safe to remove) and remove
+them there by hand; until then `plan_update` refuses to build a second VM beside them.
 
 ### Running it
 

@@ -11,12 +11,11 @@ from .provider import (
     VerificationFailed,
     VMError,
     VMInfo,
-    VMProvider,
 )
 from .spec import InvalidRequest, MissingInputs, VMSpec, resolve_request
 
 __all__ = [
     "ApplyFailed", "AwsVMs", "Busy", "InvalidRequest", "MissingInputs", "Network",
-    "OrphansRemain", "Plan", "PlanRejected", "StalePlan", "VMError", "VMInfo", "VMProvider",
+    "OrphansRemain", "Plan", "PlanRejected", "StalePlan", "VMError", "VMInfo",
     "VMSpec", "VerificationFailed", "resolve_request",
 ]  # fmt: skip

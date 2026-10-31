@@ -1,4 +1,4 @@
-"""The callable boundary: what a caller can do to one VM, with no AWS or Terraform in sight.
+"""The values and errors a caller sees when working with one VM, with no AWS or Terraform in sight.
 
 Every change is two calls. A ``plan_*`` call saves an exact plan and returns it for review;
 ``apply`` runs precisely that saved plan (and nothing else), then reads the result back.
@@ -7,9 +7,7 @@ Every change is two calls. A ``plan_*`` call saves an exact plan and returns it 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
-
-from .spec import VMSpec
+from typing import Literal
 
 Operation = Literal["create", "update", "delete"]
 PowerState = Literal["running", "stopped"]
@@ -89,25 +87,3 @@ class VMInfo:
     @property
     def consistent(self) -> bool:
         return not self.problems
-
-
-class VMProvider(Protocol):
-    """Implemented by ``AwsVMs``. A second cloud would implement the same five calls."""
-
-    def plan_create(self, spec: VMSpec) -> Plan: ...
-
-    def plan_update(
-        self,
-        vm_id: str,
-        *,
-        name: str | None = None,
-        purpose: str | None = None,
-        disk_gb: int | None = None,
-        power_state: PowerState | None = None,
-    ) -> Plan: ...
-
-    def plan_delete(self, vm_id: str) -> Plan: ...
-
-    def apply(self, plan: Plan) -> VMInfo: ...
-
-    def inspect(self, vm_id: str) -> VMInfo: ...
