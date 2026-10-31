@@ -48,7 +48,8 @@ image's minimum root size (read from the image) and can be overridden (8-100 GiB
   terminated outside this tool), or change anything beyond tags, disk size and power state, is
   rejected before you can approve it.
   Repair after a failed or killed apply may create only what that apply never reached; once the
-  state holds the instance, a missing one is never rebuilt (delete the VM and create a new one).
+  instance has existed (in state, or remembered in `vm.json` through an interrupted delete), a
+  missing one is never rebuilt: delete the VM and create a new one.
   `inspect` reports an instance AWS no longer knows as a problem, not as consistent.
 - After an apply, EC2 is polled until the instance state, root disk size and Name tag match;
   otherwise `VerificationFailed` is raised and nothing is rolled back.

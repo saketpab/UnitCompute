@@ -189,6 +189,29 @@ def test_repair_after_a_failed_edit_never_recreates_the_instance(
     assert tagged(cloud, vm_id) == []
 
 
+def test_repair_after_an_interrupted_delete_never_builds_a_new_vm(
+    vms: AwsVMs, cloud: Cloud, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vm_id = create(vms)
+
+    def process_died(*_: object, **__: object) -> None:
+        raise RuntimeError("process died after Terraform finished the delete")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(AwsVMs, "_wait_gone", process_died)
+        with pytest.raises(RuntimeError, match="process died"):
+            vms.apply(vms.plan_delete(vm_id))
+    assert tagged(cloud, vm_id) == []  # Terraform really deleted it
+    assert vms.inspect(vm_id).status == "incomplete"  # but the wrapper never finalized
+    assert vms.inspect(vm_id).instance_id is None  # and the state no longer holds an instance
+
+    for edit in ({}, {"name": "renamed"}, {"power_state": "stopped"}):
+        with pytest.raises(PlanRejected, match="no longer exists"):
+            vms.plan_update(vm_id, **edit)  # type: ignore[arg-type]
+    assert vms.apply(vms.plan_delete(vm_id)).status == "deleted"  # recovery is to finish deleting
+    assert tagged(cloud, vm_id) == []
+
+
 def test_a_relative_state_folder_works(cloud: Cloud, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.chdir(tmp_path)
     relative = AwsVMs("vms", cloud.network)  # Terraform runs in another directory (-chdir)

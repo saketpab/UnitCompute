@@ -19,7 +19,7 @@ import secrets
 import shutil
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -171,10 +171,14 @@ class AwsVMs:
                 )
             creatable: frozenset[str] = frozenset()
             if repair:
-                # A repair finishes what an interrupted create never reached. Once the state
-                # holds the instance, a missing one is a lost VM, never a resource to build anew.
-                held = self._tf(vm_id).instance(self._vm_dir(vm_id) / "logs" / "repair.log")
-                creatable = frozenset({_STATE} if held else _RESOURCES)
+                # A repair finishes what an interrupted create never reached. An instance that
+                # was ever created (now in state, or remembered in vm.json from before an
+                # interrupted delete) is never rebuilt: a missing one is a lost VM.
+                held = self._remember_instance(vm_id, record)
+                if held:
+                    creatable = frozenset({_STATE})
+                elif not record.get("instance_id"):
+                    creatable = _RESOURCES
             desired = dict(record["desired"])
             if name is not None:
                 desired["name"] = check_name(name)
@@ -302,7 +306,9 @@ class AwsVMs:
             if tf.state_path.exists():
                 (vm_dir / "state-backups").mkdir(exist_ok=True)
                 shutil.copy2(tf.state_path, vm_dir / "state-backups" / f"{plan.plan_id}.tfstate")
-            # Written before Terraform starts so a crash leaves "incomplete", never "active".
+            # Written before Terraform starts so a crash leaves "incomplete", never "active",
+            # and so the instance is remembered even if this process dies after a delete.
+            self._remember_instance(plan.vm_id, record)
             if plan.operation != "delete":
                 record["desired"] = saved["after"]
             record["status"] = "incomplete"
@@ -315,6 +321,9 @@ class AwsVMs:
             except TerraformFailed as exc:
                 saved["status"] = "interrupted" if exc.interrupted else "failed"
                 _write_json(plan_json, saved)
+                with suppress(TerraformFailed):  # unreadable state must not hide the real failure
+                    self._remember_instance(plan.vm_id, record)
+                _write_json(vm_dir / "vm.json", record)
                 raise ApplyFailed(
                     f"{exc}. State and plan are kept; plan again to repair or delete", str(log)
                 ) from exc
@@ -325,10 +334,21 @@ class AwsVMs:
                 self._wait_gone(plan.vm_id, record)
                 record["status"] = "deleted"
             else:
+                self._remember_instance(plan.vm_id, record)
                 self._wait_matches(plan.vm_id, record)
                 record["status"] = "active"
             _write_json(vm_dir / "vm.json", record)
             return self._inspect(plan.vm_id, record)
+
+    def _remember_instance(self, vm_id: str, record: dict[str, Any]) -> bool:
+        """Note in ``record`` the first time the state holds an instance; True if it does now.
+
+        "Absent from state" cannot tell a VM that was never built from one whose delete was
+        interrupted, so the fact that an instance existed is kept in vm.json (not saved here)."""
+        held = self._tf(vm_id).instance(self._vm_dir(vm_id) / "logs" / "state.log")
+        if held:
+            record["instance_id"] = held[0]
+        return held is not None
 
     # ------------------------------------------------------------------ reading
 
@@ -537,7 +557,7 @@ def _check_plan(
             gone = " (it no longer exists in AWS; delete this VM and create a new one)"
             raise PlanRejected(
                 f"{operation} plan wants to {'+'.join(actions)} {address}"
-                + (gone if actions == ["create"] and address == _INSTANCE else "")
+                + (gone if actions == ["create"] else "")
             )
         if operation == "update" and actions == ["update"]:
             _check_update(address, change)
