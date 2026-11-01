@@ -82,14 +82,19 @@ need EC2 and `ssm:GetParameter` permissions; this package does not create or cha
 
 `pip install -r requirements.txt` then `pytest`. The lifecycle tests run the **real Terraform
 binary** against a local moto server (`AWS_ENDPOINT_URL`), so no AWS account or credentials are
-used. This shows the module, plan checks and state handling work; it does not show that real AWS
-accepts them. **Nothing here has been run against real AWS, and the Ubuntu and Windows image
-mappings have not been launched.** moto is only a stand-in. Two test-fixture adjustments exist because of it (`tests/conftest.py`):
-it will not create the AWS-reserved `/aws/service/...` SSM names through its API, and it reports
-every image's root volume as 15 GiB. They affect no product code. What only real AWS can confirm:
-the public SSM image parameters and root sizes, that `aws_ec2_instance_state` stop/start and
-in-place root-volume growth work (and how long they take) on a real instance, the IAM
-permissions needed, how Windows behaves, and that a growing disk is usable inside the OS.
+used. This shows the module, plan checks and state handling work; moto is only a stand-in. Two
+test-fixture adjustments exist because of it (`tests/conftest.py`): it will not create the
+AWS-reserved `/aws/service/...` SSM names through its API, and it reports every image's root
+volume as 15 GiB. They affect no product code.
+
+**Real AWS.** The Ubuntu lifecycle (create, inspect, rename, grow the root disk 8 to 10 GiB, stop,
+start, delete) was run once against AWS in us-east-2: a `t3.micro` in an existing default-VPC
+subnet and security group, with no instance or volume tagged for the VM left afterwards. That run
+resolved the Ubuntu SSM image parameter (8 GiB root) and confirmed in-place root-volume growth and
+`aws_ec2_instance_state` stop/start on a real instance. Not yet exercised on real AWS: Windows (its
+image mapping has not been launched), growth of the filesystem inside the guest, failure or
+interruption recovery, and the minimal IAM permissions (the run used a broad role). An account
+policy can block a region: in that account an organization policy denied the default us-east-1.
 
 Set `REQUIRE_TERRAFORM_TESTS=1` to fail instead of skip when
 Terraform is missing.
