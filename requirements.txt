@@ -1,4 +1,4 @@
-boto3>=1.35,<2
+boto3[crt]>=1.41,<2
 google-genai>=1.0,<2
 ipykernel>=6.29,<7
 jupyterlab>=4.3,<5
@@ -8,3 +8,4 @@ langgraph>=1,<2
 python-dotenv>=1.0,<2
 pydantic>=2.9,<3
 pytest>=8.3,<9
+moto[server]>=5,<6

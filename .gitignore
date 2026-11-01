@@ -40,3 +40,9 @@ logs/
 data/
 outputs/
 *.log
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
